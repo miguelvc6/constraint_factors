@@ -22,6 +22,8 @@ Constraint-type–specific factor functions can learn reusable validation operat
 3. **Evaluation beyond single-constraint repair:** introduce metrics for secondary regressions and global consistency to measure collateral effects.
 4. **Trade-off analysis:** demonstrate a Pareto frontier between curator fidelity and global constraint satisfaction.
 
+We do not assume that all applicable constraints should be satisfied after every repair. In collaborative knowledge graphs, constraints are soft and repairs are intent-driven: editors typically address one violation at a time, even if other constraints remain unsatisfied. Our goal is therefore not global consistency, but locally improving the graph state without introducing unnecessary regressions.
+
 ---
 
 ## 2) Paper Narrative Summary
@@ -159,6 +161,9 @@ Each factor node is a constraint instance with:
 **Key property:**  
 All factor instances of the same type share parameters → one function per type.
 
+**Behavioral approximiations:**
+Constraint factor functions are not intended to reproduce the exact symbolic semantics of constraints. Instead, they learn a differentiable approximation of how constraint violations manifest in historical repair behavior, enabling the model to reason about constraint pressure during inference.
+
 ---
 
 ## 7) GNN Message Passing and Constraint Execution
@@ -274,6 +279,8 @@ $$
 
 Expected to optimize Global Fix Rate, sacrifice fidelity.
 
+The Global Fix Model is included as a reference point rather than a practical repair system. It illustrates the trade-off between curator fidelity and global constraint satisfaction and serves as an approximate upper bound on achievable global fix rates.
+
 #### M3) Policy Choice Model (Fix 2)
 Predict a strategy class rather than exact edit:
 - Classes: `{delete_focus, delete_conflict, add_mirror, add_required, abstain, ...}`
@@ -336,6 +343,15 @@ Top-1 strategy prediction accuracy vs derived policy labels.
 ---
 
 ## 11) Expected Behaviors and Evaluation Outcomes
+
+| Model      |   Fidelity | Primary Fix | Global Fix |    SRR | Disruption |
+| ---------- | ---------: | ----------: | ---------: | -----: | ---------: |
+| ESWC       |       High |        High |     Medium | Medium |        Low |
+| Main       | Slightly ↓ |      Same/↑ |          ↑ |     ↓↓ |        Low |
+| Global Fix |         ↓↓ |        High |         ↑↑ |      ↓ |         ↑↑ |
+| Policy     |     Medium |      Medium |     Medium | Medium |     Medium |
+| DFB        |        Low | High (some) |   Unstable |   High |       High |
+| CSM        |     Medium |      Medium |     Medium | Medium |        Low |
 
 ### Heuristics
 #### DFB
