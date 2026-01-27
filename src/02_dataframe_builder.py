@@ -190,7 +190,7 @@ def _convert_value(
 def _seed_constraint_factor_tokens(constraints_def: dict[str, dict[str, list[str]]]) -> None:
     """Seed constraint factor tokens into the encoder and reserved list."""
     global FACTOR_TOKEN_STRINGS
-    constraint_ids = sorted(constraints_def.keys(), key=int)
+    constraint_ids = sorted(constraints_def.keys(), key=str)
     FACTOR_TOKEN_STRINGS = tuple(f"{FACTOR_TOKEN_PREFIX}{cid}" for cid in constraint_ids)
     assert len(FACTOR_TOKEN_STRINGS) == len(constraints_def), "Constraint factor token count mismatch."
     for token in FACTOR_TOKEN_STRINGS:
