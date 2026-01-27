@@ -21,7 +21,6 @@ import pandas as pd
 
 
 CONSTRAINT_TYPE_PREDICATE = "<http://www.wikidata.org/entity/P2302>"
-CONSTRAINED_PROPERTY_PREDICATE = "^<http://www.wikidata.org/entity/P2302>"
 
 
 def _load_dataframe_builder() -> Any:
@@ -72,7 +71,9 @@ def build_registry(
         param_predicates: list[str] = []
         param_objects: list[str] = []
         for pred, obj in zip(predicates, objects):
-            if pred in (CONSTRAINT_TYPE_PREDICATE, CONSTRAINED_PROPERTY_PREDICATE):
+            if pred == CONSTRAINT_TYPE_PREDICATE:
+                continue
+            if pred.startswith("^") and obj == constrained_property:
                 continue
             param_predicates.append(_normalize_entity_id(pred))
             param_objects.append(_normalize_entity_id(obj))
