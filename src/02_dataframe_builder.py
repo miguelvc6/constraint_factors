@@ -22,6 +22,7 @@ import csv
 import gc
 import gzip
 import json
+import re
 from collections import Counter, defaultdict
 from http import HTTPStatus
 from pathlib import Path
@@ -51,11 +52,13 @@ RECORD_FREQUENCIES = False
 TOKEN_FREQUENCY: Counter[int] = Counter()
 MIN_OCCURRENCE = 1
 UNKNOWN_TOKEN_ID = 0
+VALIDATE_CONSTRAINTS = True
 
 
-def load_constraint_data() -> dict[str, dict[str, list[str]]]:
+def load_constraint_data() -> tuple[dict[str, dict[str, list[str]]], dict[str, list[str]]]:
     # load the constraints data
     constraints_def: dict[str, dict[str, list[str]]] = {}
+    constraints_by_property: dict[str, list[str]] = defaultdict(list)  # property -> constraint ids
 
     mapping_to_wikidata = {
         "property id": "^<http://www.wikidata.org/entity/P2302>",
@@ -76,6 +79,16 @@ def load_constraint_data() -> dict[str, dict[str, list[str]]]:
         "separator": "<http://www.wikidata.org/entity/P4155>",
         "scope": "<http://www.wikidata.org/entity/P4680>",
     }
+    prop_re = re.compile(r"^P[1-9]\d*$")
+
+    def _normalize_property_id(value: str) -> str | None:
+        raw = value.strip().strip("<>").strip()
+        if raw.startswith("http://www.wikidata.org/entity/"):
+            raw = raw.rsplit("/", 1)[-1]
+        if prop_re.match(raw):
+            return raw
+        return None
+
     with open(RAW_DATA_PATH / "constraints.tsv", newline="") as fp:
         for row in csv.DictReader(fp, dialect="excel-tab"):
             predicates: list[str] = []
@@ -87,12 +100,30 @@ def load_constraint_data() -> dict[str, dict[str, list[str]]]:
                         if v:
                             predicates.append(mapping_to_wikidata[k])
                             objects.append(v)
-            constraints_def[row["constraint id"]] = {
+            constraint_id = row["constraint id"]
+            constrained_property = _normalize_property_id(row["property id"])
+            constraints_def[constraint_id] = {
                 "predicates": predicates,
                 "objects": objects,
             }
+            if constrained_property is not None:
+                constraints_by_property[constrained_property].append(constraint_id)
 
-    return constraints_def
+    constraints_by_property = {
+        prop: sorted(constraint_ids) for prop, constraint_ids in constraints_by_property.items()
+    }
+
+    if VALIDATE_CONSTRAINTS:
+        constraint_ids = set(constraints_def.keys())
+        indexed_ids = [cid for ids in constraints_by_property.values() for cid in ids]
+        indexed_set = set(indexed_ids)
+        assert len(indexed_ids) == len(constraints_def), "Constraint count mismatch in constraints_by_property"
+        assert indexed_set == constraint_ids, "constraints_by_property must index every constraint id exactly once"
+        assert all(prop_re.match(prop) for prop in constraints_by_property), (
+            "Invalid property id in constraints_by_property"
+        )
+
+    return constraints_def, constraints_by_property
 
 
 def _register_token(token_id: int) -> int:
@@ -791,7 +822,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min-occurrence",
         type=int,
-        default=20,
+        default=100,
         help="Minimum number of occurrences in the training split required for a token to keep its ID.",
     )
     args = parser.parse_args()
@@ -807,7 +838,10 @@ if __name__ == "__main__":
     INTERIM_DATA_PATH.mkdir(parents=True, exist_ok=True)
 
     # Build DataFrames
-    constraints_def = load_constraint_data()
+    constraints_def, constraints_by_property = load_constraint_data()
+    print("Number of constrained properties:", len(constraints_by_property))
+    print("Total constraint instances:",
+          sum(len(v) for v in constraints_by_property.values()))
     ENCODER = GlobalIntEncoder()
 
     main()
