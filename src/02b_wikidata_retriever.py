@@ -144,8 +144,8 @@ def _prepare_identifier_sets(
     return unique_ids, literal_texts
 
 
-def _resolve_registry_id(encoder: GlobalIntEncoder, raw_id: str) -> int:
-    """Resolve a registry identifier into an existing global id."""
+def _resolve_registry_id(encoder: GlobalIntEncoder, raw_id: str) -> int | None:
+    """Resolve a registry identifier into an existing global id if present."""
     candidates: list[str] = []
     if raw_id.startswith("http://") or raw_id.startswith("https://"):
         candidates.append(raw_id)
@@ -160,7 +160,7 @@ def _resolve_registry_id(encoder: GlobalIntEncoder, raw_id: str) -> int:
         gid = encoder.encode(candidate, add_new=False)
         if gid:
             return gid
-    raise ValueError(f"Registry id '{raw_id}' not found in the global encoder.")
+    return None
 
 
 def _load_constraint_registry(dataset: str) -> dict[str, dict[str, Any]]:
@@ -179,20 +179,33 @@ def _load_constraint_registry(dataset: str) -> dict[str, dict[str, Any]]:
 def _collect_registry_ids(
     encoder: GlobalIntEncoder,
     registry: dict[str, dict[str, Any]],
-) -> set[int]:
+) -> tuple[set[int], set[str]]:
     registry_ids: set[int] = set()
+    missing_ids: set[str] = set()
     for entry in registry.values():
         constrained_property = entry.get("constrained_property")
         if constrained_property:
-            registry_ids.add(_resolve_registry_id(encoder, constrained_property))
+            resolved = _resolve_registry_id(encoder, constrained_property)
+            if resolved is None:
+                missing_ids.add(constrained_property)
+            else:
+                registry_ids.add(resolved)
 
         for predicate in entry.get("param_predicates", []):
-            registry_ids.add(_resolve_registry_id(encoder, predicate))
+            resolved = _resolve_registry_id(encoder, predicate)
+            if resolved is None:
+                missing_ids.add(predicate)
+            else:
+                registry_ids.add(resolved)
         for obj in entry.get("param_objects", []):
-            registry_ids.add(_resolve_registry_id(encoder, obj))
+            resolved = _resolve_registry_id(encoder, obj)
+            if resolved is None:
+                missing_ids.add(obj)
+            else:
+                registry_ids.add(resolved)
 
     registry_ids.discard(0)
-    return registry_ids
+    return registry_ids, missing_ids
 
 
 def _load_existing_cache(path: Path) -> tuple[dict[CacheKey, CacheEntry], dict[tuple[str, str], CacheEntry]]:
@@ -423,9 +436,17 @@ def main() -> None:
 
     # Merge constraint-registry identifiers needed for factor nodes.
     registry = _load_constraint_registry(args.dataset)
-    registry_ids = _collect_registry_ids(encoder, registry)
+    registry_ids, missing_registry_ids = _collect_registry_ids(encoder, registry)
     pre_merge_count = len(unique_ids)
     unique_ids.update(registry_ids)
+
+    if missing_registry_ids:
+        sample = ", ".join(sorted(missing_registry_ids)[:10])
+        logging.warning(
+            "Skipped %s constraint registry identifiers not present in the global encoder (sample: %s)",
+            len(missing_registry_ids),
+            sample,
+        )
 
     if registry_ids:
         logging.info(
@@ -433,7 +454,10 @@ def main() -> None:
             len(registry_ids),
         )
     else:
-        raise RuntimeError("No constraint registry identifiers were resolved.")
+        raise RuntimeError(
+            "No constraint registry identifiers were resolved. "
+            "The constraint registry may be out of sync with the global encoder."
+        )
     logging.info(
         "Merged %s registry identifiers into the retrieval set",
         len(unique_ids) - pre_merge_count,
