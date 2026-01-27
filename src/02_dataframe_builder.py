@@ -56,6 +56,24 @@ TOKEN_FREQUENCY: Counter[int] = Counter()
 MIN_OCCURRENCE = 1
 UNKNOWN_TOKEN_ID = 0
 VALIDATE_CONSTRAINTS = True
+PROP_RE = re.compile(r"^P[1-9]\d*$")
+
+# Includes the new per-row constraint neighborhood IDs.
+SEQUENCE_FEATURE_KEYS: tuple[str, ...] = SEQUENCE_FEATURES + ("local_constraint_ids",)
+REGISTRY_RESERVED_IDS: set[int] = set()
+
+
+def _normalize_property_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip().strip("<>").strip()
+    if raw.startswith("http://www.wikidata.org/prop/direct/"):
+        raw = raw.rsplit("/", 1)[-1]
+    elif raw.startswith("http://www.wikidata.org/entity/"):
+        raw = raw.rsplit("/", 1)[-1]
+    if PROP_RE.match(raw):
+        return raw
+    return None
 
 
 def load_constraint_data() -> tuple[dict[str, dict[str, list[str]]], dict[str, list[str]]]:
@@ -82,16 +100,6 @@ def load_constraint_data() -> tuple[dict[str, dict[str, list[str]]], dict[str, l
         "separator": "<http://www.wikidata.org/entity/P4155>",
         "scope": "<http://www.wikidata.org/entity/P4680>",
     }
-    prop_re = re.compile(r"^P[1-9]\d*$")
-
-    def _normalize_property_id(value: str) -> str | None:
-        raw = value.strip().strip("<>").strip()
-        if raw.startswith("http://www.wikidata.org/entity/"):
-            raw = raw.rsplit("/", 1)[-1]
-        if prop_re.match(raw):
-            return raw
-        return None
-
     with open(RAW_DATA_PATH / "constraints.tsv", newline="") as fp:
         for row in csv.DictReader(fp, dialect="excel-tab"):
             predicates: list[str] = []
@@ -122,11 +130,34 @@ def load_constraint_data() -> tuple[dict[str, dict[str, list[str]]], dict[str, l
         indexed_set = set(indexed_ids)
         assert len(indexed_ids) == len(constraints_def), "Constraint count mismatch in constraints_by_property"
         assert indexed_set == constraint_ids, "constraints_by_property must index every constraint id exactly once"
-        assert all(prop_re.match(prop) for prop in constraints_by_property), (
+        assert all(PROP_RE.match(prop) for prop in constraints_by_property), (
             "Invalid property id in constraints_by_property"
         )
 
     return constraints_def, constraints_by_property
+
+
+def _encode_constraints_by_property(constraints_by_property: dict[str, list[str]]) -> dict[str, list[int]]:
+    encoded: dict[str, list[int]] = {}
+    for prop, constraint_ids in constraints_by_property.items():
+        encoded_ids = {_convert_value(cid) for cid in constraint_ids}
+        encoded[prop] = sorted(encoded_ids)
+    return encoded
+
+
+def _collect_registry_reserved_ids(
+    constraints_def: dict[str, dict[str, list[str]]],
+    constraints_by_property_raw: dict[str, list[str]],
+) -> set[int]:
+    reserved: set[int] = set()
+    for prop_qid in constraints_by_property_raw.keys():
+        reserved.add(_convert_value(prop_qid))
+    for constraint in constraints_def.values():
+        for predicate in constraint["predicates"]:
+            reserved.add(_convert_value(predicate))
+        for obj in constraint["objects"]:
+            reserved.add(_convert_value(obj))
+    return reserved
 
 
 def _register_token(token_id: int) -> int:
@@ -231,6 +262,7 @@ def _read_entity_desc(line: list[str], desc_position: int) -> dict[str, Any]:
         "entity_predicates": [],
         "entity_objects": [],
         "entity_labels": [],
+        "entity_property_qids": [],
         "http_content": "",
     }
     if not desc:
@@ -258,6 +290,9 @@ def _read_entity_desc(line: list[str], desc_position: int) -> dict[str, Any]:
     elif desc.get("type") == "entity":
         result["entity_labels"].extend(desc.get("labels", {}).values())
         for predicate, objects in desc.get("facts", {}).items():
+            prop_qid = _normalize_property_id(predicate)
+            if prop_qid is not None:
+                result["entity_property_qids"].append(prop_qid)
             for obj in objects:
                 result["entity_predicates"].append(_convert_value(predicate))
                 result["entity_objects"].append(_convert_value(obj))
@@ -316,6 +351,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
         "del_subject": [],
         "del_predicate": [],
         "del_object": [],
+        "local_constraint_ids": [],
     }
     with gzip.open(file_path, "rt", encoding="utf-8") as fp:
         for line_i, line in enumerate(fp):
@@ -334,6 +370,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
             other_subject = _convert_value(elements[5])
             other_predicate = _convert_value(elements[6])
             other_object = _convert_value(elements[7])
+            constraint_id = _convert_value(elements[0])
             add_subject = None
             add_predicate = None
             add_object = None
@@ -383,7 +420,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
 
             # Final append
             dataset["constraint_type"].append(constraint_type)
-            dataset["constraint_id"].append(_convert_value(elements[0]))
+            dataset["constraint_id"].append(constraint_id)
             dataset["constraint_predicates"].append([_convert_value(v) for v in constraint["predicates"]])
             dataset["constraint_objects"].append([_convert_value(v) for v in constraint["objects"]])
             dataset["subject"].append(subject)
@@ -431,6 +468,25 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
             dataset["object_objects"].append(object_desc["entity_objects"])
             dataset["other_entity_predicates"].append(other_entity_desc["entity_predicates"])
             dataset["other_entity_objects"].append(other_entity_desc["entity_objects"])
+
+            # P_local = predicates in the local neighborhood (main/other + entity predicate lists).
+            # C_local = union of constraints_by_property for P_local plus the central constraint_id.
+            p_local: set[str] = set()
+            main_prop = _normalize_property_id(elements[3])
+            if main_prop:
+                p_local.add(main_prop)
+            other_prop = _normalize_property_id(elements[6])
+            if other_prop:
+                p_local.add(other_prop)
+            p_local.update(subject_desc["entity_property_qids"])
+            p_local.update(object_desc["entity_property_qids"])
+            p_local.update(other_entity_desc["entity_property_qids"])
+
+            local_constraint_ids: set[int] = {constraint_id}
+            for prop in p_local:
+                for cid in constraints_by_property.get(prop, []):
+                    local_constraint_ids.add(cid)
+            dataset["local_constraint_ids"].append(sorted(local_constraint_ids))
     return dataset
 
 
@@ -492,7 +548,7 @@ def _remap_dataset_inplace(dataset: dict[str, Any], id_map: dict[int, int]) -> N
         if key in dataset:
             dataset[key] = _remap_scalar_array(dataset[key], id_map)
 
-    for key in SEQUENCE_FEATURES:
+    for key in SEQUENCE_FEATURE_KEYS:
         if key in dataset:
             dataset[key] = _remap_sequence_array(dataset[key], id_map)
 
@@ -510,7 +566,7 @@ def _apply_frequency_filter_inplace(dataset: dict[str, Any], allowed_ids: set[in
         else:
             dataset[key] = np.asarray([v if v in allowed_ids else unknown_id for v in values])
 
-    for key in SEQUENCE_FEATURES:
+    for key in SEQUENCE_FEATURE_KEYS:
         if key not in dataset:
             continue
         sequences = dataset[key]
@@ -627,7 +683,7 @@ def _compute_token_frequency(dataset: dict[str, Any]) -> Counter[int]:
             if int_id != 0:
                 frequency[int_id] += 1
 
-    for key in SEQUENCE_FEATURES:
+    for key in SEQUENCE_FEATURE_KEYS:
         if key not in dataset:
             continue
         sequences = dataset[key]
@@ -721,7 +777,7 @@ def load(kind: str, targets: Union[list[Any], np.ndarray]) -> dict[str, Any]:
     gc.collect()
 
     for k, v in result.items():
-        if k in SEQUENCE_FEATURES:
+        if k in SEQUENCE_FEATURE_KEYS:
             result[k] = np.array(v, dtype=object)
         elif k.endswith("_text") or k == "constraint_type":
             result[k] = np.array(v, dtype=object)
@@ -732,7 +788,7 @@ def load(kind: str, targets: Union[list[Any], np.ndarray]) -> dict[str, Any]:
 
 
 def main():
-    global ALLOW_NEW_TOKENS, RECORD_FREQUENCIES, UNKNOWN_TOKEN_ID, ENCODER
+    global ALLOW_NEW_TOKENS, RECORD_FREQUENCIES, UNKNOWN_TOKEN_ID, ENCODER, REGISTRY_RESERVED_IDS
 
     # Types of contraints
     targets = [
@@ -786,7 +842,9 @@ def main():
 
     allowed_ids: set[int] = {0}
     allowed_ids.update(token for token, count in train_frequency.items() if count >= MIN_OCCURRENCE)
-    allowed_ids.update(_ensure_reserved_tokens())
+    base_reserved_ids = _ensure_reserved_tokens()
+    allowed_ids.update(base_reserved_ids)
+    allowed_ids.update(REGISTRY_RESERVED_IDS)
 
     print("Applying frequency filter to all datasets...")
     for dataset in (train_dataset, val_dataset, test_dataset):
@@ -801,6 +859,13 @@ def main():
     allowed_ids = set(id_map.values())
     print("Frequency filter retained {} token IDs (including unknown)".format(len(allowed_ids)))
     print("Encoder size after pruning: {}".format(len(ENCODER._encoding)))
+    print(
+        "Reserved base tokens: {}, reserved registry tokens: {}, final vocab size: {}".format(
+            len(base_reserved_ids),
+            len(REGISTRY_RESERVED_IDS),
+            len(ENCODER._encoding),
+        )
+    )
 
     # Finalize settings
     ENCODER.freeze()
@@ -868,11 +933,13 @@ if __name__ == "__main__":
     INTERIM_DATA_PATH.mkdir(parents=True, exist_ok=True)
 
     # Build DataFrames
-    constraints_def, constraints_by_property = load_constraint_data()
+    ENCODER = GlobalIntEncoder()
+    constraints_def, constraints_by_property_raw = load_constraint_data()
+    _seed_constraint_factor_tokens(constraints_def)
+    REGISTRY_RESERVED_IDS = _collect_registry_reserved_ids(constraints_def, constraints_by_property_raw)
+    constraints_by_property = _encode_constraints_by_property(constraints_by_property_raw)
     print("Number of constrained properties:", len(constraints_by_property))
     print("Total constraint instances:",
           sum(len(v) for v in constraints_by_property.values()))
-    ENCODER = GlobalIntEncoder()
-    _seed_constraint_factor_tokens(constraints_def)
 
     main()

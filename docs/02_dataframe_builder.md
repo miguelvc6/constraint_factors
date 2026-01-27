@@ -16,9 +16,11 @@
    - `_convert_value()` encodes each string via `GlobalIntEncoder`, also swapping repeated references to the current triple (subject/predicate/object) or its “other” counterparts for reserved placeholders such as `subject` or `other_object`.
    - `_read_entity_desc()` decodes the JSON blobs describing the neighborhood (labels, other facts, HTTP fallback pages) and normalises them into predicate/object lists so they can be appended to the feature arrays.
    - Literal objects are stored in `<feature>_text` columns while entity IDs stay numeric, allowing text-only nodes later in `03_graph.py`.
+   - `local_constraint_ids` are computed per row by taking `P_local` (the set of property QIDs found in the main predicate, `other_predicate`, and all neighborhood predicate lists) and then unioning every constraint in `constraints_by_property[p]` for `p ∈ P_local`, plus the row’s own `constraint_id`. The final list is unique and sorted by integer ID.
 4. **Dataset assembly** – `load()` stitches every constraint-type file into a single dictionary per split, converting Python lists to `numpy` arrays (object dtype for ragged sequences, numeric for scalars).
 5. **Global split** – All raw splits are concatenated and repartitioned via `stratified_train_val_test_split()` to guarantee consistent constraint-type proportions.
 6. **Frequency filtering** – `_compute_token_frequency()` inspects only the training split to decide which IDs survive the `MIN_OCCURRENCE` threshold. `_apply_frequency_filter_inplace()` replaces infrequent IDs with `UNKNOWN_TOKEN_ID`, `_prune_encoder()` and `_reindex_encoder()` compress the vocabulary, and `_remap_dataset_inplace()` updates every split accordingly. Constraint factor tokens are treated as reserved so they survive pruning despite having zero frequency.
+   - Registry-derived tokens are reserved before pruning: all constrained property IDs, constraint parameter predicates, and constraint parameter objects from `constraints.tsv` are encoded into the vocabulary and added to the reserved set so factor definitions remain representable even if their corpus frequency is below `MIN_OCCURRENCE`.
 7. **Persistence** – Each final dictionary becomes a pandas dataframe that is written as `df_train.parquet`, `df_val.parquet`, `df_test.parquet`, and the encoder is saved as `globalintencoder.txt`.
 
 ## Common Pitfalls / Gotchas
@@ -33,3 +35,4 @@
 - `_apply_frequency_filter_inplace()` works on both scalar and sequence features, preserving zero values (used for padding) while masking only the genuinely rare identifiers.
 - Literal overlap heuristics compare subject/object labels against cached HTML snippets, inserting synthetic `pageContainsLabel` edges that graph construction later turns into nodes.
 - By delaying pandas materialisation until after frequency pruning and split creation, the script keeps memory pressure manageable even for the full dataset.
+- The script logs the number of base reserved tokens, registry reserved tokens, and the final vocab size after pruning to make encoder growth visible.
