@@ -427,8 +427,13 @@ def main() -> None:
     pre_merge_count = len(unique_ids)
     unique_ids.update(registry_ids)
 
-    if not registry_ids.issubset(unique_ids):
-        raise RuntimeError("Constraint registry identifiers missing from the retrieval set.")
+    if registry_ids:
+        logging.info(
+            "Resolved %s constraint registry identifiers",
+            len(registry_ids),
+        )
+    else:
+        raise RuntimeError("No constraint registry identifiers were resolved.")
     logging.info(
         "Merged %s registry identifiers into the retrieval set",
         len(unique_ids) - pre_merge_count,
