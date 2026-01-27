@@ -135,7 +135,16 @@ def create_graph(
     unknown_global_id = global_int_encoder.encode("unknown", add_new=False)
     if unknown_global_id == 0:
         unknown_global_id = global_int_encoder.encode("unknown", add_new=True)
+    EDGE_SUBJECT_TO_PREDICATE = 0
+    EDGE_PREDICATE_TO_OBJECT = 1
+    EDGE_FACTOR_TO_PARAM_PREDICATE = 2
+    EDGE_PARAM_PREDICATE_TO_OBJECT = 3
+    EDGE_FACTOR_TO_LOCAL_PREDICATE = 4
+    EDGE_FACTOR_TO_LOCAL_SUBJECT = 5
+    EDGE_FACTOR_TO_LOCAL_OBJECT = 6
+
     edges: List[tuple[int, int]] = []
+    edge_types: List[int] = []
     edges_non_flattened: List[tuple[int, int]] = []
     non_flattened_edge_attributes: List[Any] = []
     resolved_embedding_dtype: np.dtype | None = None
@@ -145,6 +154,23 @@ def create_graph(
     factor_constraint_ids: list[int] = []
     factor_constraint_types: list[str] = []
     primary_factor_index: int = -1
+    pred_global_to_local_triples: dict[int, list[tuple[int, int, int]]] = {}
+
+    def _resolve_registry_id(raw_id: str) -> int | None:
+        candidates: list[str] = []
+        if raw_id.startswith("http://") or raw_id.startswith("https://"):
+            candidates.append(raw_id)
+            candidates.append(f"<{raw_id}>")
+        else:
+            candidates.append(raw_id)
+            if raw_id and raw_id[0] in ("P", "Q") and raw_id[1:].isdigit():
+                candidates.append(f"http://www.wikidata.org/entity/{raw_id}")
+                candidates.append(f"<http://www.wikidata.org/entity/{raw_id}>")
+        for candidate in candidates:
+            gid = global_int_encoder.encode(candidate, add_new=False)
+            if gid:
+                return gid
+        return None
 
     def get_node_attribute(global_node_id: int, node_text: str | None) -> Any:
         """Get the node attribute for a global node ID."""
@@ -240,7 +266,13 @@ def create_graph(
             focus_local_nodes["object"] = object_id
 
         edges.append((subject_id, predicate_id))
+        edge_types.append(EDGE_SUBJECT_TO_PREDICATE)
         edges.append((predicate_id, object_id))
+        edge_types.append(EDGE_PREDICATE_TO_OBJECT)
+
+        pred_global_to_local_triples.setdefault(predicate_global_id, []).append(
+            (subject_id, predicate_id, object_id)
+        )
 
         edges_non_flattened.append((subject_id, object_id))
         non_flattened_edge_attributes.append(predicate_id)
@@ -358,7 +390,9 @@ def create_graph(
         )
 
         edges.append((factor_local_id, predicate_id))
+        edge_types.append(EDGE_FACTOR_TO_PARAM_PREDICATE)
         edges.append((predicate_id, object_id))
+        edge_types.append(EDGE_PARAM_PREDICATE_TO_OBJECT)
 
         edges_non_flattened.append((factor_local_id, object_id))
         non_flattened_edge_attributes.append(predicate_id)
@@ -441,6 +475,20 @@ def create_graph(
         if constraint_id == int(graph["constraint_id"]):
             primary_factor_index = idx
 
+        constrained_property = registry_entry.get("constrained_property")
+        if constrained_property:
+            constrained_gid = _resolve_registry_id(constrained_property)
+            if constrained_gid is not None:
+                for subject_id, predicate_id, object_id in pred_global_to_local_triples.get(
+                    constrained_gid, []
+                ):
+                    edges.append((factor_local_id, predicate_id))
+                    edge_types.append(EDGE_FACTOR_TO_LOCAL_PREDICATE)
+                    edges.append((factor_local_id, subject_id))
+                    edge_types.append(EDGE_FACTOR_TO_LOCAL_SUBJECT)
+                    edges.append((factor_local_id, object_id))
+                    edge_types.append(EDGE_FACTOR_TO_LOCAL_OBJECT)
+
         param_predicates = registry_entry.get("param_predicates") or []
         param_objects = registry_entry.get("param_objects") or []
         assert len(param_predicates) == len(param_objects), (
@@ -500,6 +548,7 @@ def create_graph(
     data_graph = Data(
         x=x_tensor,
         edge_index=torch.tensor(edges, dtype=torch.long).t().contiguous(),
+        edge_type=torch.tensor(edge_types, dtype=torch.long),
         edge_index_non_flattened=torch.tensor(edges_non_flattened, dtype=torch.long)
         .t()
         .contiguous(),
