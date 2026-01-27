@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -162,7 +163,7 @@ def _query_wikidata_labels(
 
     endpoint = "https://query.wikidata.org/sparql"
     headers = {
-        "User-Agent": "kg_repairs/0.1 (+https://github.com/)",
+        "User-Agent": "constraint-factors (miguel.vazquez@wu.ac.at)",
         "Accept": "application/sparql-results+json",
     }
 
@@ -189,6 +190,11 @@ def _query_wikidata_labels(
                 headers=headers,
                 timeout=60,
             )
+            if response.status_code == 403:
+                logger.warning(
+                    "Wikidata query blocked (HTTP 403). "
+                    "Check robots policy and rate limits; ensure User-Agent is set."
+                )
             response.raise_for_status()
             payload = response.json()
         except requests.Timeout:
@@ -208,6 +214,8 @@ def _query_wikidata_labels(
         except (requests.RequestException, ValueError) as exc:
             logger.warning("Error querying Wikidata for IDs %s: %s", current, exc)
             continue
+        finally:
+            time.sleep(1)
 
         bindings = payload.get("results", {}).get("bindings", [])
         results.extend(bindings)
