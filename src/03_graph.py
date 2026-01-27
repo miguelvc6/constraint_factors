@@ -328,6 +328,11 @@ def create_graph(
         predicate_global_id: int,
         object_global_id: int,
     ) -> None:
+        if predicate_global_id == 0:
+            predicate_global_id = unknown_global_id
+        if object_global_id == 0:
+            object_global_id = unknown_global_id
+
         predicate_name = None
         object_name = None
         if store_node_names:
@@ -400,19 +405,25 @@ def create_graph(
         factor_ids = [int(graph["constraint_id"])]
 
     for idx, constraint_id in enumerate(factor_ids):
-        registry_key = str(constraint_id)
-        assert registry_key in constraint_registry, (
-            f"Missing constraint_id={constraint_id} in constraint registry."
+        constraint_token = global_int_encoder._decoding.get(constraint_id)
+        if constraint_token in (None, "", "unknown") or constraint_id == unknown_global_id:
+            raise AssertionError(
+                "Constraint id token is unknown; rebuild interim data with constraint ids preserved."
+            )
+        registry_entry = constraint_registry.get(constraint_token)
+        if registry_entry is None:
+            registry_entry = constraint_registry.get(constraint_token.strip("<>"))
+        assert registry_entry is not None, (
+            f"Missing constraint_id={constraint_token} in constraint registry."
         )
-        registry_entry = constraint_registry[registry_key]
 
         try:
             factor_gid = global_int_encoder.encode(
-                f"constraint_factor::{constraint_id}", add_new=False
+                f"constraint_factor::{constraint_token}", add_new=False
             )
         except Exception as exc:
             raise AssertionError(
-                f"Missing factor token for constraint_id={constraint_id} in encoder."
+                f"Missing factor token for constraint_id={constraint_token} in encoder."
             ) from exc
         assert factor_gid != 0, (
             f"Invalid factor global id for constraint_id={constraint_id}."
@@ -421,7 +432,7 @@ def create_graph(
         factor_local_id = global_to_local_id_encoder.store(
             factor_gid,
             get_node_attribute(factor_gid, None),
-            name=f"constraint_factor::{constraint_id}" if store_node_names else None,
+            name=f"constraint_factor::{constraint_token}" if store_node_names else None,
             force_create=True,
         )
 
@@ -960,7 +971,8 @@ if __name__ == "__main__":
             raise TypeError(
                 f"Unexpected registry_json payload type: {type(registry_payload)}"
             )
-        constraint_registry.update(registry_payload)
+        for key, value in registry_payload.items():
+            constraint_registry[str(key)] = value
 
     # Graph
     LITERAL_ID = encoder.encode("LITERAL_OBJECT", add_new=False)

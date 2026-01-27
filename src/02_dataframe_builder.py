@@ -48,6 +48,7 @@ RESERVED_TOKEN_STRINGS: tuple[str, ...] = (
 )
 FACTOR_TOKEN_PREFIX = "constraint_factor::"
 FACTOR_TOKEN_STRINGS: tuple[str, ...] = ()
+CONSTRAINT_ID_TOKENS: tuple[str, ...] = ()
 
 ALLOW_NEW_TOKENS = True
 RECORD_FREQUENCIES = False
@@ -190,7 +191,9 @@ def _convert_value(
 def _seed_constraint_factor_tokens(constraints_def: dict[str, dict[str, list[str]]]) -> None:
     """Seed constraint factor tokens into the encoder and reserved list."""
     global FACTOR_TOKEN_STRINGS
+    global CONSTRAINT_ID_TOKENS
     constraint_ids = sorted(constraints_def.keys(), key=str)
+    CONSTRAINT_ID_TOKENS = tuple(constraint_ids)
     FACTOR_TOKEN_STRINGS = tuple(f"{FACTOR_TOKEN_PREFIX}{cid}" for cid in constraint_ids)
     assert len(FACTOR_TOKEN_STRINGS) == len(constraints_def), "Constraint factor token count mismatch."
     for token in FACTOR_TOKEN_STRINGS:
@@ -434,7 +437,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
 def _ensure_reserved_tokens() -> set[int]:
     global UNKNOWN_TOKEN_ID
     reserved_ids: set[int] = set()
-    for token in RESERVED_TOKEN_STRINGS + FACTOR_TOKEN_STRINGS:
+    for token in RESERVED_TOKEN_STRINGS + FACTOR_TOKEN_STRINGS + CONSTRAINT_ID_TOKENS:
         reserved_ids.add(ENCODER.encode(token, add_new=True))
     UNKNOWN_TOKEN_ID = ENCODER.encode(UNKNOWN_TOKEN_STRING, add_new=True)
     return reserved_ids

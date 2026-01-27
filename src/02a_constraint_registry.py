@@ -40,6 +40,14 @@ def _normalize_entity_id(value: str) -> str:
     return raw
 
 
+def _normalize_token(value: str) -> str:
+    """Normalize tokens to match the encoder's string form."""
+    raw = value.strip()
+    if raw.startswith("http://www.wikidata.org/prop/direct/"):
+        raw = raw.replace("http://www.wikidata.org/prop/direct/", "http://www.wikidata.org/entity/")
+    return raw
+
+
 def build_registry(
     constraints_def: dict[str, dict[str, list[str]]],
     constraints_by_property: dict[str, list[str]],
@@ -66,7 +74,7 @@ def build_registry(
             raise ValueError(
                 f"Constraint {constraint_id} has {len(type_objects)} type objects; expected 1."
             )
-        constraint_type = _normalize_entity_id(type_objects[0])
+        constraint_type = _normalize_token(type_objects[0])
 
         constrained_property = constraint_to_property.get(constraint_id)
         if constrained_property is None:
@@ -77,10 +85,10 @@ def build_registry(
         for pred, obj in zip(predicates, objects):
             if pred == CONSTRAINT_TYPE_PREDICATE:
                 continue
-            if pred.startswith("^") and obj == constrained_property:
+            if pred.startswith("^") and _normalize_entity_id(obj) == constrained_property:
                 continue
-            param_predicates.append(_normalize_entity_id(pred))
-            param_objects.append(_normalize_entity_id(obj))
+            param_predicates.append(_normalize_token(pred))
+            param_objects.append(_normalize_token(obj))
 
         registry[constraint_id] = {
             "constraint_type": constraint_type,
