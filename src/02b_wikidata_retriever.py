@@ -163,8 +163,8 @@ def _resolve_registry_id(encoder: GlobalIntEncoder, raw_id: str) -> int:
     raise ValueError(f"Registry id '{raw_id}' not found in the global encoder.")
 
 
-def _load_constraint_registry(interim_root: Path) -> dict[str, dict[str, Any]]:
-    registry_path = interim_root / "constraint_registry.parquet"
+def _load_constraint_registry(dataset: str) -> dict[str, dict[str, Any]]:
+    registry_path = Path("data/interim") / f"constraint_registry_{dataset}.parquet"
     if not registry_path.exists():
         raise FileNotFoundError(
             f"Constraint registry not found at {registry_path}. "
@@ -422,7 +422,7 @@ def main() -> None:
     unique_ids, literal_texts = _prepare_identifier_sets(encoder, interim_root)
 
     # Merge constraint-registry identifiers needed for factor nodes.
-    registry = _load_constraint_registry(interim_root)
+    registry = _load_constraint_registry(args.dataset)
     registry_ids = _collect_registry_ids(encoder, registry)
     pre_merge_count = len(unique_ids)
     unique_ids.update(registry_ids)

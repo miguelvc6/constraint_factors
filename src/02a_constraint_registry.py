@@ -6,7 +6,7 @@ Build a standalone constraint registry from constraints.tsv.
 
 Usage
 -----
-python src/02a_constraint_registry.py --dataset {sample,full} --min-occurrence N
+python src/02a_constraint_registry.py --dataset {sample,full}
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from typing import Any
 
 import pandas as pd
 
-from modules.data_encoders import dataset_variant_name
 
 CONSTRAINT_TYPE_PREDICATE = "<http://www.wikidata.org/entity/P2302>"
 CONSTRAINED_PROPERTY_PREDICATE = "^<http://www.wikidata.org/entity/P2302>"
@@ -133,18 +132,11 @@ def main() -> None:
         required=True,
         help="Which dataset to read constraints.tsv from.",
     )
-    parser.add_argument(
-        "--min-occurrence",
-        type=int,
-        default=1,
-        help="Min-occurrence suffix used to select the output variant directory.",
-    )
     args = parser.parse_args()
 
-    dataset_variant = dataset_variant_name(args.dataset, max(1, args.min_occurrence))
     raw_data_path = Path("data/raw") / args.dataset
-    interim_data_path = Path("data/interim") / dataset_variant
-    interim_data_path.mkdir(parents=True, exist_ok=True)
+    interim_root = Path("data/interim")
+    interim_root.mkdir(parents=True, exist_ok=True)
 
     builder = _load_dataframe_builder()
     builder.RAW_DATA_PATH = raw_data_path
@@ -154,7 +146,7 @@ def main() -> None:
     validate_registry(registry, constraints_def, constraints_by_property)
 
     registry_json = json.dumps(registry, sort_keys=True)
-    output_path = interim_data_path / "constraint_registry.parquet"
+    output_path = interim_root / f"constraint_registry_{args.dataset}.parquet"
     pd.DataFrame({"registry_json": [registry_json]}).to_parquet(output_path)
 
     print(f"Wrote constraint registry with {len(registry)} entries to {output_path}")
