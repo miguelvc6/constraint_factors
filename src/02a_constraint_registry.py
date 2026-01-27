@@ -68,6 +68,10 @@ def build_registry(
             )
         constraint_type = _normalize_entity_id(type_objects[0])
 
+        constrained_property = constraint_to_property.get(constraint_id)
+        if constrained_property is None:
+            raise ValueError(f"Constraint {constraint_id} missing constrained property.")
+
         param_predicates: list[str] = []
         param_objects: list[str] = []
         for pred, obj in zip(predicates, objects):
@@ -77,10 +81,6 @@ def build_registry(
                 continue
             param_predicates.append(_normalize_entity_id(pred))
             param_objects.append(_normalize_entity_id(obj))
-
-        constrained_property = constraint_to_property.get(constraint_id)
-        if constrained_property is None:
-            raise ValueError(f"Constraint {constraint_id} missing constrained property.")
 
         registry[constraint_id] = {
             "constraint_type": constraint_type,
