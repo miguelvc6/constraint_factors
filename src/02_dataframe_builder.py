@@ -46,6 +46,8 @@ RESERVED_TOKEN_STRINGS: tuple[str, ...] = (
     "LITERAL_OBJECT",
     UNKNOWN_TOKEN_STRING,
 )
+FACTOR_TOKEN_PREFIX = "constraint_factor::"
+FACTOR_TOKEN_STRINGS: tuple[str, ...] = ()
 
 ALLOW_NEW_TOKENS = True
 RECORD_FREQUENCIES = False
@@ -183,6 +185,16 @@ def _convert_value(
         return _register_token(ENCODER.encode("other_object", add_new=ALLOW_NEW_TOKENS))
 
     return _register_token(encoded_value)
+
+
+def _seed_constraint_factor_tokens(constraints_def: dict[str, dict[str, list[str]]]) -> None:
+    """Seed constraint factor tokens into the encoder and reserved list."""
+    global FACTOR_TOKEN_STRINGS
+    constraint_ids = sorted(constraints_def.keys(), key=int)
+    FACTOR_TOKEN_STRINGS = tuple(f"{FACTOR_TOKEN_PREFIX}{cid}" for cid in constraint_ids)
+    assert len(FACTOR_TOKEN_STRINGS) == len(constraints_def), "Constraint factor token count mismatch."
+    for token in FACTOR_TOKEN_STRINGS:
+        ENCODER.encode(token, add_new=True)
 
 
 def _read_entity_desc(line: list[str], desc_position: int) -> dict[str, Any]:
@@ -422,7 +434,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
 def _ensure_reserved_tokens() -> set[int]:
     global UNKNOWN_TOKEN_ID
     reserved_ids: set[int] = set()
-    for token in RESERVED_TOKEN_STRINGS:
+    for token in RESERVED_TOKEN_STRINGS + FACTOR_TOKEN_STRINGS:
         reserved_ids.add(ENCODER.encode(token, add_new=True))
     UNKNOWN_TOKEN_ID = ENCODER.encode(UNKNOWN_TOKEN_STRING, add_new=True)
     return reserved_ids
@@ -809,6 +821,21 @@ def main():
     df_test.to_parquet(INTERIM_DATA_PATH / "df_test.parquet")
 
     ENCODER.save(INTERIM_DATA_PATH / "globalintencoder.txt")
+    print("Number of constraints: {}".format(len(constraints_def)))
+    print("Number of seeded factor tokens: {}".format(len(FACTOR_TOKEN_STRINGS)))
+    print("Number of tokens in final encoder: {}".format(len(ENCODER._encoding)))
+
+    if not FACTOR_TOKEN_STRINGS:
+        raise AssertionError("No constraint factor tokens were seeded.")
+    sample_constraint_ids = list(constraints_def.keys())
+    if len(sample_constraint_ids) > 50:
+        rng = np.random.default_rng(42)
+        sample_constraint_ids = rng.choice(sample_constraint_ids, size=50, replace=False).tolist()
+    for constraint_id in sample_constraint_ids:
+        token = f"{FACTOR_TOKEN_PREFIX}{constraint_id}"
+        token_id = ENCODER.encode(token, add_new=False)
+        assert token_id != 0, f"Missing constraint factor token in encoder: {token}"
+    print("Validated {} constraint factor tokens in encoder.".format(len(sample_constraint_ids)))
 
 
 if __name__ == "__main__":
@@ -843,5 +870,6 @@ if __name__ == "__main__":
     print("Total constraint instances:",
           sum(len(v) for v in constraints_by_property.values()))
     ENCODER = GlobalIntEncoder()
+    _seed_constraint_factor_tokens(constraints_def)
 
     main()

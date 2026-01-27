@@ -11,13 +11,14 @@
 ## Workflow
 1. **Argument handling** – `--dataset {sample,full}` chooses the raw input root, while `--min-occurrence` configures how aggressively rare tokens get mapped to `unknown`.
 2. **Constraint schema load** – `load_constraint_data()` reads `constraints.tsv` once, remapping the Wikidata predicate IRIs so every violation row can expand its constraint graph cheaply, and builds a property → constraint-id index for local closure.
+3. **Factor token seeding** – every constraint id is pre-seeded into the encoder as `constraint_factor::<id>` so `03_graph.py` can build stable factor nodes even after the encoder is frozen.
 3. **Record parsing** – `load_dataset()` iterates the gzipped TSV per constraint target (`conflictWith`, `distinct`, …):
    - `_convert_value()` encodes each string via `GlobalIntEncoder`, also swapping repeated references to the current triple (subject/predicate/object) or its “other” counterparts for reserved placeholders such as `subject` or `other_object`.
    - `_read_entity_desc()` decodes the JSON blobs describing the neighborhood (labels, other facts, HTTP fallback pages) and normalises them into predicate/object lists so they can be appended to the feature arrays.
    - Literal objects are stored in `<feature>_text` columns while entity IDs stay numeric, allowing text-only nodes later in `03_graph.py`.
 4. **Dataset assembly** – `load()` stitches every constraint-type file into a single dictionary per split, converting Python lists to `numpy` arrays (object dtype for ragged sequences, numeric for scalars).
 5. **Global split** – All raw splits are concatenated and repartitioned via `stratified_train_val_test_split()` to guarantee consistent constraint-type proportions.
-6. **Frequency filtering** – `_compute_token_frequency()` inspects only the training split to decide which IDs survive the `MIN_OCCURRENCE` threshold. `_apply_frequency_filter_inplace()` replaces infrequent IDs with `UNKNOWN_TOKEN_ID`, `_prune_encoder()` and `_reindex_encoder()` compress the vocabulary, and `_remap_dataset_inplace()` updates every split accordingly.
+6. **Frequency filtering** – `_compute_token_frequency()` inspects only the training split to decide which IDs survive the `MIN_OCCURRENCE` threshold. `_apply_frequency_filter_inplace()` replaces infrequent IDs with `UNKNOWN_TOKEN_ID`, `_prune_encoder()` and `_reindex_encoder()` compress the vocabulary, and `_remap_dataset_inplace()` updates every split accordingly. Constraint factor tokens are treated as reserved so they survive pruning despite having zero frequency.
 7. **Persistence** – Each final dictionary becomes a pandas dataframe that is written as `df_train.parquet`, `df_val.parquet`, `df_test.parquet`, and the encoder is saved as `globalintencoder.txt`.
 
 ## Common Pitfalls / Gotchas
@@ -27,6 +28,7 @@
 
 ## Implementation Details
 - Reserved placeholders (`subject`, `predicate`, `object`, `other_*`, `LITERAL_OBJECT`, `unknown`) are always injected into the encoder via `_ensure_reserved_tokens()` so downstream models can rely on fixed IDs even after pruning.
+- Constraint factor tokens follow the exact format `constraint_factor::<constraint_id>` and are seeded up-front, then preserved during pruning so their IDs remain stable for graph construction.
 - `LITERAL_OBJECT` is one of the reserved placeholder tokens the pipeline injects into the GlobalIntEncoder. During dataframe building, every triple slot that holds a plain literal (e.g., `"Paris"@en` or a date) can’t be mapped to a Wikidata entity ID, so the script stores `object = 0` and keeps the raw text in `object_text`. Later, when graphs are built, these literal-only nodes still need an integer class so models can point to them; `LITERAL_OBJECT` is that special token. It ensures literals share a consistent ID (and, after 02b_wikidata_retriever.py, an embedding) even though they don’t correspond to real Wikidata entities.
 - `_apply_frequency_filter_inplace()` works on both scalar and sequence features, preserving zero values (used for padding) while masking only the genuinely rare identifiers.
 - Literal overlap heuristics compare subject/object labels against cached HTML snippets, inserting synthetic `pageContainsLabel` edges that graph construction later turns into nodes.
