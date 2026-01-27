@@ -36,7 +36,7 @@ import logging
 import pickle
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any, Callable, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 import json
 
 import datasets
@@ -84,6 +84,7 @@ def create_graph(
     graph: dict[str, Any],
     wikidata_cache: PrecomputedWikidataCache,
     global_int_encoder: GlobalIntEncoder,
+    constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
     store_node_names: bool = False,
     embedding_dtype: np.dtype | None = None,
@@ -141,6 +142,9 @@ def create_graph(
     if encoding == "text_embedding":
         resolved_embedding_dtype = np.dtype(embedding_dtype or np.float16)
     focus_local_nodes: dict[str, int] = {}
+    factor_constraint_ids: list[int] = []
+    factor_constraint_types: list[str] = []
+    primary_factor_index: int = -1
 
     def get_node_attribute(global_node_id: int, node_text: str | None) -> Any:
         """Get the node attribute for a global node ID."""
@@ -319,6 +323,41 @@ def create_graph(
                 assign_focus=assign_focus,
             )
 
+    def add_factor_definition_edge(
+        factor_local_id: int,
+        predicate_global_id: int,
+        object_global_id: int,
+    ) -> None:
+        predicate_name = None
+        object_name = None
+        if store_node_names:
+            predicate_name = wikidata_cache.get_text_for_id(
+                predicate_global_id,
+                fallback_id=unknown_global_id,
+            )
+            object_name = wikidata_cache.get_text_for_id(
+                object_global_id,
+                fallback_id=unknown_global_id,
+            )
+
+        predicate_id = global_to_local_id_encoder.store(
+            predicate_global_id,
+            get_node_attribute(predicate_global_id, None),
+            force_create=True,
+            name=predicate_name,
+        )
+        object_id = global_to_local_id_encoder.store(
+            object_global_id,
+            get_node_attribute(object_global_id, None),
+            name=object_name,
+        )
+
+        edges.append((factor_local_id, predicate_id))
+        edges.append((predicate_id, object_id))
+
+        edges_non_flattened.append((factor_local_id, object_id))
+        non_flattened_edge_attributes.append(predicate_id)
+
     # --- Node construction -------------------------------------------------
     add_edge(graph, "subject", "predicate", "object", assign_focus=True)
     add_edge(graph, "other_subject", "other_predicate", "other_object")
@@ -349,8 +388,78 @@ def create_graph(
             graph, other_entity_name, "other_entity_predicates", "other_entity_objects"
         )
 
-    # add constraint graph
-    add_edge(graph, "constraint_id", "constraint_predicates", "constraint_objects")
+    # add constraint factor branches
+    local_constraint_ids = graph.get("local_constraint_ids") or []
+    if isinstance(local_constraint_ids, Iterable) and not isinstance(
+        local_constraint_ids, (str, bytes)
+    ):
+        factor_ids = [int(cid) for cid in local_constraint_ids if cid is not None]
+    else:
+        factor_ids = []
+    if not factor_ids:
+        factor_ids = [int(graph["constraint_id"])]
+
+    for idx, constraint_id in enumerate(factor_ids):
+        registry_key = str(constraint_id)
+        assert registry_key in constraint_registry, (
+            f"Missing constraint_id={constraint_id} in constraint registry."
+        )
+        registry_entry = constraint_registry[registry_key]
+
+        try:
+            factor_gid = global_int_encoder.encode(
+                f"constraint_factor::{constraint_id}", add_new=False
+            )
+        except Exception as exc:
+            raise AssertionError(
+                f"Missing factor token for constraint_id={constraint_id} in encoder."
+            ) from exc
+        assert factor_gid != 0, (
+            f"Invalid factor global id for constraint_id={constraint_id}."
+        )
+
+        factor_local_id = global_to_local_id_encoder.store(
+            factor_gid,
+            get_node_attribute(factor_gid, None),
+            name=f"constraint_factor::{constraint_id}" if store_node_names else None,
+            force_create=True,
+        )
+
+        factor_constraint_ids.append(constraint_id)
+        factor_constraint_types.append(str(registry_entry.get("constraint_type", "")))
+        if constraint_id == int(graph["constraint_id"]):
+            primary_factor_index = idx
+
+        param_predicates = registry_entry.get("param_predicates") or []
+        param_objects = registry_entry.get("param_objects") or []
+        assert len(param_predicates) == len(param_objects), (
+            f"Constraint registry param list length mismatch for constraint_id={constraint_id}."
+        )
+        for predicate_id_raw, object_id_raw in zip(param_predicates, param_objects):
+            try:
+                predicate_gid = global_int_encoder.encode(
+                    predicate_id_raw, add_new=False
+                )
+            except Exception as exc:
+                raise AssertionError(
+                    f"Missing predicate token '{predicate_id_raw}' in encoder."
+                ) from exc
+            try:
+                object_gid = global_int_encoder.encode(object_id_raw, add_new=False)
+            except Exception as exc:
+                raise AssertionError(
+                    f"Missing object token '{object_id_raw}' in encoder."
+                ) from exc
+
+            add_factor_definition_edge(
+                factor_local_id=factor_local_id,
+                predicate_global_id=predicate_gid,
+                object_global_id=object_gid,
+            )
+
+    assert primary_factor_index >= 0, (
+        "Primary constraint_id missing from factor list."
+    )
 
     # --- Finalise -----------------------------------------------------------
     num_nodes = len(global_to_local_id_encoder.local_attributes)
@@ -409,6 +518,11 @@ def create_graph(
     data_graph.shape_id = int(graph["constraint_id"])
     # Standardize on `constraint_type` across the pipeline
     data_graph.constraint_type = str(graph["constraint_type"])
+    data_graph.factor_constraint_ids = torch.tensor(
+        factor_constraint_ids, dtype=torch.long
+    )
+    data_graph.primary_factor_index = int(primary_factor_index)
+    data_graph.factor_constraint_types = factor_constraint_types
 
     return data_graph
 
@@ -460,6 +574,7 @@ def compute_torch_geometric_objects(
     data: datasets.Dataset,
     wikidata_cache: PrecomputedWikidataCache,
     global_int_encoder: GlobalIntEncoder,
+    constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
     store_node_names: bool = False,
     embedding_dtype: np.dtype | None = None,
@@ -480,6 +595,7 @@ def compute_torch_geometric_objects(
             row,
             wikidata_cache=wikidata_cache,
             global_int_encoder=global_int_encoder,
+            constraint_registry=constraint_registry,
             encoding=encoding,
             store_node_names=store_node_names,
             embedding_dtype=embedding_dtype,
@@ -545,6 +661,7 @@ def collect_sample_for_check(
 def main(
     wikidata_cache: PrecomputedWikidataCache,
     global_int_encoder: GlobalIntEncoder,
+    constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
     store_node_names: bool = False,
     shard_size: int = 0,
@@ -594,6 +711,7 @@ def main(
             dataset,
             wikidata_cache,
             global_int_encoder,
+            constraint_registry,
             encoding=encoding,
             store_node_names=store_node_names,
             embedding_dtype=embedding_dtype,
@@ -830,6 +948,20 @@ if __name__ == "__main__":
     encoder.load(INTERIM_DATA_PATH / "globalintencoder.txt")
     encoder.freeze()
 
+    registry_path = Path("data/interim") / f"constraint_registry_{DATASET}.parquet"
+    registry_df = pd.read_parquet(registry_path)
+    if "registry_json" not in registry_df.columns:
+        raise KeyError(f"Missing registry_json column in {registry_path}")
+    constraint_registry: Dict[str, Dict[str, Any]] = {}
+    for registry_payload in registry_df["registry_json"]:
+        if isinstance(registry_payload, str):
+            registry_payload = json.loads(registry_payload)
+        if not isinstance(registry_payload, dict):
+            raise TypeError(
+                f"Unexpected registry_json payload type: {type(registry_payload)}"
+            )
+        constraint_registry.update(registry_payload)
+
     # Graph
     LITERAL_ID = encoder.encode("LITERAL_OBJECT", add_new=False)
     if args.encoding == "node_id":
@@ -842,6 +974,7 @@ if __name__ == "__main__":
     outputs = main(
         wikidata_cache=wikidata_cache,
         global_int_encoder=encoder,
+        constraint_registry=constraint_registry,
         encoding=args.encoding,
         shard_size=args.shard_size,
         use_torch_save=args.use_torch_save,
