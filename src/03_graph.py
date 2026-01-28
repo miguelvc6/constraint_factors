@@ -88,6 +88,7 @@ def create_graph(
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
     store_node_names: bool = False,
     embedding_dtype: np.dtype | None = None,
+    debug_factor_wiring: bool = False,
 ) -> Data:
     """
     Convert a single Wikidata conflict record into a homogeneous multigraph
@@ -155,6 +156,7 @@ def create_graph(
     factor_constraint_types: list[str] = []
     primary_factor_index: int = -1
     pred_global_to_local_triples: dict[int, list[tuple[int, int, int]]] = {}
+    debug_entries: list[dict[str, Any]] = []
 
     def _resolve_registry_id(raw_id: str) -> int | None:
         candidates: list[str] = []
@@ -476,18 +478,24 @@ def create_graph(
             primary_factor_index = idx
 
         constrained_property = registry_entry.get("constrained_property")
+        matched_local_predicates = 0
+        wiring_edges_created = 0
+        matched_focus_predicate = False
         if constrained_property:
             constrained_gid = _resolve_registry_id(constrained_property)
             if constrained_gid is not None:
-                for subject_id, predicate_id, object_id in pred_global_to_local_triples.get(
-                    constrained_gid, []
-                ):
+                local_triples = pred_global_to_local_triples.get(constrained_gid, [])
+                matched_local_predicates = len(local_triples)
+                for subject_id, predicate_id, object_id in local_triples:
                     edges.append((factor_local_id, predicate_id))
                     edge_types.append(EDGE_FACTOR_TO_LOCAL_PREDICATE)
                     edges.append((factor_local_id, subject_id))
                     edge_types.append(EDGE_FACTOR_TO_LOCAL_SUBJECT)
                     edges.append((factor_local_id, object_id))
                     edge_types.append(EDGE_FACTOR_TO_LOCAL_OBJECT)
+                    wiring_edges_created += 3
+                    if focus_local_nodes.get("predicate") == predicate_id:
+                        matched_focus_predicate = True
 
         param_predicates = registry_entry.get("param_predicates") or []
         param_objects = registry_entry.get("param_objects") or []
@@ -514,6 +522,17 @@ def create_graph(
                 factor_local_id=factor_local_id,
                 predicate_global_id=predicate_gid,
                 object_global_id=object_gid,
+            )
+        if debug_factor_wiring:
+            debug_entries.append(
+                {
+                    "constraint_id": int(constraint_id),
+                    "constraint_token": str(constraint_token),
+                    "constrained_property": constrained_property,
+                    "matched_local_predicates": int(matched_local_predicates),
+                    "wiring_edges_created": int(wiring_edges_created),
+                    "matched_focus_predicate": bool(matched_focus_predicate),
+                }
             )
 
     assert primary_factor_index >= 0, (
@@ -583,6 +602,15 @@ def create_graph(
     )
     data_graph.primary_factor_index = int(primary_factor_index)
     data_graph.factor_constraint_types = factor_constraint_types
+    if debug_factor_wiring:
+        data_graph.factor_wiring_debug = {
+            "constraint_id": int(graph["constraint_id"]),
+            "primary_constraint_id": int(graph["constraint_id"]),
+            "primary_factor_index": int(primary_factor_index),
+            "local_constraint_count": int(len(factor_ids)),
+            "focus_predicate_local_id": int(focus_local_nodes.get("predicate", -1)),
+            "factors": debug_entries,
+        }
 
     return data_graph
 
@@ -639,6 +667,7 @@ def compute_torch_geometric_objects(
     store_node_names: bool = False,
     embedding_dtype: np.dtype | None = None,
     on_sample: Optional[Callable[[Data], None]] = None,
+    debug_state: dict[str, Any] | None = None,
 ) -> Iterator[Data]:
     """
     Build a stream of torch_geometric.data.Data graphs from a *datasets* object.
@@ -659,9 +688,20 @@ def compute_torch_geometric_objects(
             encoding=encoding,
             store_node_names=store_node_names,
             embedding_dtype=embedding_dtype,
+            debug_factor_wiring=bool(debug_state and debug_state.get("enabled")),
         )
         if on_sample is not None:
             on_sample(graph)
+        if debug_state and debug_state.get("enabled") and not debug_state.get("written"):
+            debug_payload = getattr(graph, "factor_wiring_debug", None)
+            if debug_payload and debug_payload.get("local_constraint_count", 0) > 1:
+                debug_payload = dict(debug_payload)
+                debug_payload["row_index"] = int(row_idx)
+                debug_path = Path(debug_state["path"])
+                debug_path.parent.mkdir(parents=True, exist_ok=True)
+                with debug_path.open("w", encoding="utf-8") as fh:
+                    json.dump(debug_payload, fh)
+                debug_state["written"] = True
         yield graph
 
 
@@ -728,6 +768,8 @@ def main(
     use_torch_save: bool = False,
     embedding_dtype: np.dtype | None = None,
     check_sample_size: int = 32,
+    max_instances: int = 0,
+    debug_factor_wiring: bool = False,
 ) -> dict[str, Path]:
     """Sequentially build graphs per split and persist them to disk."""
 
@@ -745,6 +787,12 @@ def main(
     total_predicate_targets: set[int] = {0}
     split_targets: dict[str, dict[str, list[int]]] = {}
 
+    debug_state = {
+        "enabled": debug_factor_wiring,
+        "written": False,
+        "path": PROCESSED_DATA_PATH / "factor_wiring_debug.json",
+    }
+
     for split, parquet_name in split_to_parquet.items():
         logging.info("Processing %s split", split)
 
@@ -752,6 +800,10 @@ def main(
         dataframe = pd.read_parquet(INTERIM_DATA_PATH / parquet_name)
         dataset = pandas_to_dataset(dataframe)
         del dataframe
+        if max_instances and max_instances > 0:
+            limit = min(max_instances, len(dataset))
+            dataset = dataset.select(range(limit))
+            logging.info("Limiting %s split to first %s instances", split, limit)
 
         split_entity_targets: set[int] = {0}
         split_predicate_targets: set[int] = {0}
@@ -776,6 +828,7 @@ def main(
             store_node_names=store_node_names,
             embedding_dtype=embedding_dtype,
             on_sample=collect_targets,
+            debug_state=debug_state,
         )
         del dataset
         output_path = PROCESSED_DATA_PATH / f"{split}_graph-{encoding}.pkl"
@@ -950,6 +1003,13 @@ def parse_args():
         help="Number of graphs per shard when streaming to disk (0 disables sharding).",
     )
     parser.add_argument(
+        "--max_instances",
+        "--max-instances",
+        type=int,
+        default=0,
+        help="Limit the number of rows converted per split (0 uses the full split).",
+    )
+    parser.add_argument(
         "--use-torch-save",
         action="store_true",
         help="Persist shards with torch.save instead of pickle for reduced overhead.",
@@ -965,11 +1025,19 @@ def parse_args():
         default="data/interim/wikidata_text.parquet",
         help="Path to the precomputed Wikidata cache parquet file.",
     )
+    parser.add_argument(
+        "--debug_factor_wiring",
+        "--debug-factor-wiring",
+        action="store_true",
+        help="Write factor wiring diagnostics for the first multi-constraint instance.",
+    )
 
     args = parser.parse_args()
 
     if args.shard_size < 0:
         parser.error("--shard-size must be non-negative")
+    if args.max_instances < 0:
+        parser.error("--max-instances must be non-negative")
 
     return args
 
@@ -1040,6 +1108,8 @@ if __name__ == "__main__":
         shard_size=args.shard_size,
         use_torch_save=args.use_torch_save,
         embedding_dtype=text_embedding_dtype,
+        max_instances=args.max_instances,
+        debug_factor_wiring=args.debug_factor_wiring,
     )
 
     if args.show_graph:
