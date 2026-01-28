@@ -32,12 +32,12 @@ os.environ["TRANSFORMERS_NO_TF"] = "1"
 import argparse
 import gc
 import itertools
+import json
 import logging
 import pickle
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
-import json
 
 import datasets
 import matplotlib.pyplot as plt
@@ -51,13 +51,13 @@ from torch_geometric.loader import DataLoader
 from tqdm.auto import tqdm
 
 from modules.data_encoders import (
-    GlobalIntEncoder,
-    GlobalToLocalNodeMap,
-    PrecomputedWikidataCache,
     ROLE_NONE,
     ROLE_OBJECT,
     ROLE_PREDICATE,
     ROLE_SUBJECT,
+    GlobalIntEncoder,
+    GlobalToLocalNodeMap,
+    PrecomputedWikidataCache,
     dataset_variant_name,
     dump_in_shards,
     dump_stream,
@@ -330,12 +330,8 @@ def create_graph(
         edges.append((predicate_id, object_id))
         edge_types.append(EDGE_PREDICATE_TO_OBJECT)
 
-        pred_global_to_pred_local_ids.setdefault(predicate_global_id, []).append(
-            predicate_id
-        )
-        pred_global_to_local_triples.setdefault(predicate_global_id, []).append(
-            (subject_id, predicate_id, object_id)
-        )
+        pred_global_to_pred_local_ids.setdefault(predicate_global_id, []).append(predicate_id)
+        pred_global_to_local_triples.setdefault(predicate_global_id, []).append((subject_id, predicate_id, object_id))
         subj_local_to_pred_global_to_pred_local_ids.setdefault(subject_id, {}).setdefault(
             predicate_global_id, []
         ).append(predicate_id)
@@ -375,15 +371,11 @@ def create_graph(
                     object_ids = object_ids * length
                 if len(predicate_ids) == 1:
                     predicate_ids = predicate_ids * length
-            assert (
-                len(subject_ids) == len(object_ids) == len(predicate_ids)
-            ), (
+            assert len(subject_ids) == len(object_ids) == len(predicate_ids), (
                 f"Length mismatch when adding edge: {len(subject_ids)} subjects, {len(predicate_ids)} predicates, {len(object_ids)} objects."
             )
 
-            for subject_global, predicate_global, object_global in zip(
-                subject_ids, predicate_ids, object_ids
-            ):
+            for subject_global, predicate_global, object_global in zip(subject_ids, predicate_ids, object_ids):
                 add_edge_from_ids(
                     subject_global,
                     predicate_global,
@@ -395,9 +387,7 @@ def create_graph(
                 )
         else:
             if object_global_id == 0 and graph.get(f"{object_key}_text") in ["", None]:
-                assert predicate_global_id == 0, (
-                    f"Predicate {predicate_global_id} without object {object_global_id}"
-                )
+                assert predicate_global_id == 0, f"Predicate {predicate_global_id} without object {object_global_id}"
                 # skip creation, triple doesn't exist
                 return
             add_edge_from_ids(
@@ -471,28 +461,15 @@ def create_graph(
     elif graph["other_object"] == graph["object"]:
         other_entity_name = "other_subject"
     else:
-        assert (
-            graph["other_subject"]
-            == graph["other_predicate"]
-            == graph["other_object"]
-            == 0
-        )
+        assert graph["other_subject"] == graph["other_predicate"] == graph["other_object"] == 0
         other_entity_name = None
 
     if other_entity_name is not None:
-        add_edge(
-            graph, other_entity_name, "other_entity_predicates", "other_entity_objects"
-        )
+        add_edge(graph, other_entity_name, "other_entity_predicates", "other_entity_objects")
 
-    param_property_gid = _maybe_encode_registry_token(
-        "<http://www.wikidata.org/entity/P2306>"
-    )
-    param_relation_gid = _maybe_encode_registry_token(
-        "<http://www.wikidata.org/entity/P2309>"
-    )
-    param_inverse_gid = _maybe_encode_registry_token(
-        "<http://www.wikidata.org/entity/P1696>"
-    )
+    param_property_gid = _maybe_encode_registry_token("<http://www.wikidata.org/entity/P2306>")
+    param_relation_gid = _maybe_encode_registry_token("<http://www.wikidata.org/entity/P2309>")
+    param_inverse_gid = _maybe_encode_registry_token("<http://www.wikidata.org/entity/P1696>")
     default_relation_gids = [
         gid
         for gid in (
@@ -504,9 +481,7 @@ def create_graph(
 
     # add constraint factor branches
     local_constraint_ids = graph.get("local_constraint_ids") or []
-    if isinstance(local_constraint_ids, Iterable) and not isinstance(
-        local_constraint_ids, (str, bytes)
-    ):
+    if isinstance(local_constraint_ids, Iterable) and not isinstance(local_constraint_ids, (str, bytes)):
         factor_ids = [int(cid) for cid in local_constraint_ids if cid is not None]
     else:
         factor_ids = []
@@ -522,21 +497,13 @@ def create_graph(
         registry_entry = constraint_registry.get(constraint_token)
         if registry_entry is None:
             registry_entry = constraint_registry.get(constraint_token.strip("<>"))
-        assert registry_entry is not None, (
-            f"Missing constraint_id={constraint_token} in constraint registry."
-        )
+        assert registry_entry is not None, f"Missing constraint_id={constraint_token} in constraint registry."
 
         try:
-            factor_gid = global_int_encoder.encode(
-                f"constraint_factor::{constraint_token}", add_new=False
-            )
+            factor_gid = global_int_encoder.encode(f"constraint_factor::{constraint_token}", add_new=False)
         except Exception as exc:
-            raise AssertionError(
-                f"Missing factor token for constraint_id={constraint_token} in encoder."
-            ) from exc
-        assert factor_gid != 0, (
-            f"Invalid factor global id for constraint_id={constraint_id}."
-        )
+            raise AssertionError(f"Missing factor token for constraint_id={constraint_token} in encoder.") from exc
+        assert factor_gid != 0, f"Invalid factor global id for constraint_id={constraint_id}."
 
         factor_local_id = global_to_local_id_encoder.store(
             factor_gid,
@@ -629,11 +596,7 @@ def create_graph(
             subject_scope_ids = {subject_id} if subject_id is not None else set()
         elif constraint_type in {"valueRequiresStatement", "valueType"}:
             object_id = focus_local_nodes.get("object")
-            if (
-                object_id is not None
-                and graph.get("object") is not None
-                and graph.get("object") != LITERAL_ID
-            ):
+            if object_id is not None and graph.get("object") is not None and graph.get("object") != LITERAL_ID:
                 subject_scope_ids = {object_id}
             else:
                 subject_scope_ids = set()
@@ -644,9 +607,7 @@ def create_graph(
                 subject_scope_ids.add(focus_subject_id)
             other_subject_gid = int(graph.get("other_subject") or 0)
             if other_subject_gid:
-                other_subject_id = global_to_local_id_encoder.global_to_local.get(
-                    other_subject_gid
-                )
+                other_subject_id = global_to_local_id_encoder.global_to_local.get(other_subject_gid)
                 if other_subject_id is not None:
                     subject_scope_ids.add(other_subject_id)
         else:
@@ -657,26 +618,18 @@ def create_graph(
         matched_focus_predicate = False
         scope_predicate_counts: dict[int, int] = {}
 
-        def _collect_pred_local_ids(
-            predicate_gid: int, subject_ids: set[int] | None
-        ) -> list[int]:
+        def _collect_pred_local_ids(predicate_gid: int, subject_ids: set[int] | None) -> list[int]:
             if subject_ids is None:
                 return list(pred_global_to_pred_local_ids.get(predicate_gid, []))
             pred_ids: list[int] = []
             for subj_id in sorted(subject_ids):
-                pred_ids.extend(
-                    subj_local_to_pred_global_to_pred_local_ids.get(subj_id, {}).get(
-                        predicate_gid, []
-                    )
-                )
+                pred_ids.extend(subj_local_to_pred_global_to_pred_local_ids.get(subj_id, {}).get(predicate_gid, []))
             return pred_ids
 
         scope_pred_local_ids: list[int] = []
         scope_pred_local_ids_seen: set[int] = set()
         for predicate_gid in observed_predicates:
-            local_pred_ids = _collect_pred_local_ids(
-                predicate_gid, subject_scope_ids
-            )
+            local_pred_ids = _collect_pred_local_ids(predicate_gid, subject_scope_ids)
             if local_pred_ids:
                 scope_predicate_counts[predicate_gid] = len(local_pred_ids)
             for pred_local_id in local_pred_ids:
@@ -706,19 +659,13 @@ def create_graph(
 
         for predicate_id_raw, object_id_raw in zip(param_predicates, param_objects):
             try:
-                predicate_gid = global_int_encoder.encode(
-                    predicate_id_raw, add_new=False
-                )
+                predicate_gid = global_int_encoder.encode(predicate_id_raw, add_new=False)
             except Exception as exc:
-                raise AssertionError(
-                    f"Missing predicate token '{predicate_id_raw}' in encoder."
-                ) from exc
+                raise AssertionError(f"Missing predicate token '{predicate_id_raw}' in encoder.") from exc
             try:
                 object_gid = global_int_encoder.encode(object_id_raw, add_new=False)
             except Exception as exc:
-                raise AssertionError(
-                    f"Missing object token '{object_id_raw}' in encoder."
-                ) from exc
+                raise AssertionError(f"Missing object token '{object_id_raw}' in encoder.") from exc
 
             add_factor_definition_edge(
                 factor_local_id=factor_local_id,
@@ -737,21 +684,16 @@ def create_graph(
                     "wiring_edges_created": int(wiring_edges_created),
                     "matched_focus_predicate": bool(matched_focus_predicate),
                     "scope_predicate_counts": {
-                        str(int(gid)): int(count)
-                        for gid, count in scope_predicate_counts.items()
+                        str(int(gid)): int(count) for gid, count in scope_predicate_counts.items()
                     },
                 }
             )
             if constraint_id == int(graph["constraint_id"]):
                 primary_factor_focus_scope_ok = matched_focus_predicate
 
-    assert primary_factor_index >= 0, (
-        "Primary constraint_id missing from factor list."
-    )
+    assert primary_factor_index >= 0, "Primary constraint_id missing from factor list."
     if debug_factor_wiring and primary_factor_focus_scope_ok is not None:
-        assert primary_factor_focus_scope_ok, (
-            "Primary factor missing scope edge to focus predicate."
-        )
+        assert primary_factor_focus_scope_ok, "Primary factor missing scope edge to focus predicate."
 
     # --- Finalise -----------------------------------------------------------
     num_nodes = len(global_to_local_id_encoder.local_attributes)
@@ -766,28 +708,20 @@ def create_graph(
             role_flags[local_id] |= role_value
 
     if encoding == "text_embedding":
-        x_np = np.asarray(
-            global_to_local_id_encoder.local_attributes, dtype=resolved_embedding_dtype
-        )
+        x_np = np.asarray(global_to_local_id_encoder.local_attributes, dtype=resolved_embedding_dtype)
         if not x_np.flags["C_CONTIGUOUS"]:
             x_np = np.ascontiguousarray(x_np)
         x_tensor = torch.from_numpy(x_np)
     else:
         # integer node ids case
-        x_tensor = torch.tensor(
-            global_to_local_id_encoder.local_attributes, dtype=torch.long
-        )
+        x_tensor = torch.tensor(global_to_local_id_encoder.local_attributes, dtype=torch.long)
 
     data_graph = Data(
         x=x_tensor,
         edge_index=torch.tensor(edges, dtype=torch.long).t().contiguous(),
         edge_type=torch.tensor(edge_types, dtype=torch.long),
-        edge_index_non_flattened=torch.tensor(edges_non_flattened, dtype=torch.long)
-        .t()
-        .contiguous(),
-        edge_attr_non_flattened=torch.tensor(
-            non_flattened_edge_attributes, dtype=torch.long
-        ),
+        edge_index_non_flattened=torch.tensor(edges_non_flattened, dtype=torch.long).t().contiguous(),
+        edge_attr_non_flattened=torch.tensor(non_flattened_edge_attributes, dtype=torch.long),
         y=torch.tensor(
             [
                 [
@@ -811,9 +745,7 @@ def create_graph(
     data_graph.shape_id = int(graph["constraint_id"])
     # Standardize on `constraint_type` across the pipeline
     data_graph.constraint_type = str(graph["constraint_type"])
-    data_graph.factor_constraint_ids = torch.tensor(
-        factor_constraint_ids, dtype=torch.long
-    )
+    data_graph.factor_constraint_ids = torch.tensor(factor_constraint_ids, dtype=torch.long)
     data_graph.primary_factor_index = int(primary_factor_index)
     data_graph.factor_constraint_types = factor_constraint_types
     if debug_factor_wiring:
@@ -1333,9 +1265,7 @@ if __name__ == "__main__":
         if isinstance(registry_payload, str):
             registry_payload = json.loads(registry_payload)
         if not isinstance(registry_payload, dict):
-            raise TypeError(
-                f"Unexpected registry_json payload type: {type(registry_payload)}"
-            )
+            raise TypeError(f"Unexpected registry_json payload type: {type(registry_payload)}")
         for key, value in registry_payload.items():
             constraint_registry[str(key)] = value
 

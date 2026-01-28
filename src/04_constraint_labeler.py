@@ -6,14 +6,12 @@ Generate per-factor constraint satisfaction labels (pre + post gold edit)
 without rebuilding graphs.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -26,7 +24,6 @@ from modules.constraint_checkers import (
     normalize_token,
 )
 from modules.data_encoders import GlobalIntEncoder
-
 
 PARAM_P2306 = "P2306"
 PARAM_P2309 = "P2309"
@@ -227,15 +224,9 @@ def _apply_edit(
     missing_edits: Set[Tuple[int, int]] = set()
 
     def _apply(kind: str) -> None:
-        subj = _resolve_placeholder(
-            getattr(row, f"{kind}_subject", 0), row, placeholder_map, cast_int=cast_int
-        )
-        pred = _resolve_placeholder(
-            getattr(row, f"{kind}_predicate", 0), row, placeholder_map, cast_int=cast_int
-        )
-        obj = _resolve_placeholder(
-            getattr(row, f"{kind}_object", 0), row, placeholder_map, cast_int=cast_int
-        )
+        subj = _resolve_placeholder(getattr(row, f"{kind}_subject", 0), row, placeholder_map, cast_int=cast_int)
+        pred = _resolve_placeholder(getattr(row, f"{kind}_predicate", 0), row, placeholder_map, cast_int=cast_int)
+        obj = _resolve_placeholder(getattr(row, f"{kind}_object", 0), row, placeholder_map, cast_int=cast_int)
         if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
             return
         if pred not in p_local:
@@ -266,9 +257,7 @@ def _build_constraint_instance(
     constraint_type_id: int,
     default_relation_predicates: List[int],
 ) -> ConstraintInstance:
-    constrained_property_id = _resolve_registry_id(
-        registry_entry.constrained_property_raw, encoder
-    )
+    constrained_property_id = _resolve_registry_id(registry_entry.constrained_property_raw, encoder)
 
     param_predicates = registry_entry.param_predicates_raw
     param_objects = registry_entry.param_objects_raw
@@ -468,8 +457,7 @@ def _process_dataframe(
         )
 
         post_facts = {
-            ent: {pred: set(values) for pred, values in facts.items()}
-            for ent, facts in facts_by_entity.items()
+            ent: {pred: set(values) for pred, values in facts.items()} for ent, facts in facts_by_entity.items()
         }
         post_predicates = {ent: set(preds) for ent, preds in predicates_present.items()}
         placeholder_map = _build_placeholder_map(encoder, row)
@@ -495,9 +483,7 @@ def _process_dataframe(
             other_object=other_object,
         )
 
-        local_constraint_ids = _coerce_sequence(
-            getattr(row, "local_constraint_ids", None), cast_int=use_encoded_ids
-        )
+        local_constraint_ids = _coerce_sequence(getattr(row, "local_constraint_ids", None), cast_int=use_encoded_ids)
         checkable_pre_row: List[bool] = []
         satisfied_pre_row: List[int] = []
         checkable_post_row: List[bool] = []
@@ -682,9 +668,7 @@ def main() -> None:
     use_encoded_ids = pd.api.types.is_integer_dtype(first_df["constraint_id"])
     if use_encoded_ids and encoder is None:
         raise SystemExit("Encoder is required to resolve registry ids for encoded parquet data.")
-    registry_by_id = _resolve_registry_mapping(
-        registry_raw, encoder=encoder, use_encoded_ids=use_encoded_ids
-    )
+    registry_by_id = _resolve_registry_mapping(registry_raw, encoder=encoder, use_encoded_ids=use_encoded_ids)
     output_root.mkdir(parents=True, exist_ok=True)
 
     combined_coverage: Dict[str, Counter[str]] = defaultdict(Counter)

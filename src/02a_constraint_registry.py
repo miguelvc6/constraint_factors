@@ -9,8 +9,6 @@ Usage
 python src/02a_constraint_registry.py --dataset {sample,full}
 """
 
-from __future__ import annotations
-
 import argparse
 import importlib.util
 import json
@@ -18,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
 
 CONSTRAINT_TYPE_PREDICATE = "<http://www.wikidata.org/entity/P2302>"
 
@@ -67,13 +64,9 @@ def build_registry(
         if len(predicates) != len(objects):
             raise ValueError(f"Predicate/object mismatch for {constraint_id}.")
 
-        type_objects = [
-            obj for pred, obj in zip(predicates, objects) if pred == CONSTRAINT_TYPE_PREDICATE
-        ]
+        type_objects = [obj for pred, obj in zip(predicates, objects) if pred == CONSTRAINT_TYPE_PREDICATE]
         if len(type_objects) != 1:
-            raise ValueError(
-                f"Constraint {constraint_id} has {len(type_objects)} type objects; expected 1."
-            )
+            raise ValueError(f"Constraint {constraint_id} has {len(type_objects)} type objects; expected 1.")
         constraint_type = _normalize_token(type_objects[0])
 
         constrained_property = constraint_to_property.get(constraint_id)

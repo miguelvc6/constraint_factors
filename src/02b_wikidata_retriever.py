@@ -176,8 +176,7 @@ def _load_constraint_registry(dataset: str) -> dict[str, dict[str, Any]]:
     registry_path = Path("data/interim") / f"constraint_registry_{dataset}.parquet"
     if not registry_path.exists():
         raise FileNotFoundError(
-            f"Constraint registry not found at {registry_path}. "
-            "Run src/02a_constraint_registry.py first."
+            f"Constraint registry not found at {registry_path}. Run src/02a_constraint_registry.py first."
         )
     registry_df = pd.read_parquet(registry_path)
     if "registry_json" not in registry_df.columns or registry_df.empty:

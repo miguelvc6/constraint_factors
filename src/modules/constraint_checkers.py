@@ -3,10 +3,8 @@
 Constraint checking utilities for the 04_constraint_labeler stage.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 
 def normalize_token(raw: str | None) -> str | None:

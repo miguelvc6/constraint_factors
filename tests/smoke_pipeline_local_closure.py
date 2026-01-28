@@ -3,8 +3,6 @@
 Smoke test for local-closure + factor-wiring pipeline changes.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -291,10 +289,7 @@ def main() -> None:
         print("Test 3 failed: primary factor not wired to violating predicate.")
         raise SystemExit(1)
 
-    if (
-        primary_entry.get("constraint_type") == "conflictWith"
-        and debug_payload.get("other_predicate_global_id")
-    ):
+    if primary_entry.get("constraint_type") == "conflictWith" and debug_payload.get("other_predicate_global_id"):
         scope_counts = primary_entry.get("scope_predicate_counts") or {}
         focus_pred_gid = str(int(debug_payload.get("focus_predicate_global_id") or 0))
         other_pred_gid = str(int(debug_payload.get("other_predicate_global_id") or 0))
@@ -355,11 +350,7 @@ def main() -> None:
         post_satisfied = list(row["factor_satisfied_post_gold"])
 
         if not (
-            len(local_ids)
-            == len(pre_checkable)
-            == len(pre_satisfied)
-            == len(post_checkable)
-            == len(post_satisfied)
+            len(local_ids) == len(pre_checkable) == len(pre_satisfied) == len(post_checkable) == len(post_satisfied)
         ):
             print("Test 4 failed: label list lengths do not match local_constraint_ids.")
             raise SystemExit(1)

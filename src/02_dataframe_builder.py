@@ -959,7 +959,6 @@ if __name__ == "__main__":
     REGISTRY_RESERVED_IDS = _collect_registry_reserved_ids(constraints_def, constraints_by_property_raw)
     constraints_by_property = _encode_constraints_by_property(constraints_by_property_raw)
     print("Number of constrained properties:", len(constraints_by_property))
-    print("Total constraint instances:",
-          sum(len(v) for v in constraints_by_property.values()))
+    print("Total constraint instances:", sum(len(v) for v in constraints_by_property.values()))
 
     main()
