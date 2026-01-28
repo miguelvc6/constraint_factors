@@ -305,11 +305,102 @@ def main() -> None:
             print("Test 3 failed: conflictWith primary factor missing other_predicate scope wiring.")
             raise SystemExit(1)
 
+    print("Running 04_constraint_labeler.py...")
+    label_output_dir = workdir / "data" / "interim" / f"{dataset_variant}_labeled"
+    _run(
+        [
+            sys.executable,
+            str(repo_root / "src" / "04_constraint_labeler.py"),
+            "--dataset",
+            dataset,
+            "--min-occurrence",
+            str(min_occurrence),
+            "--max-rows",
+            str(max_rows),
+        ],
+        cwd=workdir,
+    )
+
+    labeled_df = _load_parquet(label_output_dir)
+    required_columns = [
+        "factor_checkable_pre",
+        "factor_satisfied_pre",
+        "factor_checkable_post_gold",
+        "factor_satisfied_post_gold",
+        "factor_types",
+    ]
+    for col in required_columns:
+        if col not in labeled_df.columns:
+            print(f"Test 4 failed: missing column {col} in labeled parquet.")
+            raise SystemExit(1)
+
+    if len(labeled_df) < 10:
+        print("Test 4 failed: need at least 10 rows to validate label columns.")
+        raise SystemExit(1)
+
+    checked_rows = 0
+    pre_violation_found = False
+    post_fix_found = False
+    post_checkable_found = False
+    for _, row in labeled_df.iterrows():
+        local_ids = row["local_constraint_ids"]
+        if local_ids is None:
+            continue
+        local_ids = list(map(int, list(local_ids)))
+        if not local_ids:
+            continue
+        pre_checkable = list(row["factor_checkable_pre"])
+        pre_satisfied = list(row["factor_satisfied_pre"])
+        post_checkable = list(row["factor_checkable_post_gold"])
+        post_satisfied = list(row["factor_satisfied_post_gold"])
+
+        if not (
+            len(local_ids)
+            == len(pre_checkable)
+            == len(pre_satisfied)
+            == len(post_checkable)
+            == len(post_satisfied)
+        ):
+            print("Test 4 failed: label list lengths do not match local_constraint_ids.")
+            raise SystemExit(1)
+
+        primary_id = int(row["constraint_id"])
+        if primary_id in local_ids:
+            idx = local_ids.index(primary_id)
+            if pre_checkable[idx] and pre_satisfied[idx] == 0:
+                pre_violation_found = True
+            if post_checkable[idx]:
+                post_checkable_found = True
+            if post_checkable[idx] and post_satisfied[idx] == 1:
+                post_fix_found = True
+
+        checked_rows += 1
+        if checked_rows >= 10:
+            break
+
+    if not pre_violation_found:
+        print("Test 4 failed: no row found with primary constraint violated pre.")
+        raise SystemExit(1)
+
+    if not post_fix_found:
+        print("Test 4 warning: no row found with primary constraint fixed post-gold.")
+        coverage_pre = labeled_df["num_checkable_factors_pre"].sum()
+        coverage_post = labeled_df["num_checkable_factors_post_gold"].sum()
+        print(
+            "Coverage summary: pre_checkable_total={}, post_checkable_total={}".format(
+                int(coverage_pre), int(coverage_post)
+            )
+        )
+        if post_checkable_found:
+            print("Test 4 failed: post-gold constraints checkable but no fixes found.")
+            raise SystemExit(1)
+
     print(
-        "PASS: checked_rows={}, multi_constraint_instance=yes, encoder_tokens_ok={}, wiring_edges_ok={}".format(
+        "PASS: checked_rows={}, multi_constraint_instance=yes, encoder_tokens_ok={}, wiring_edges_ok={}, labels_ok={}".format(
             checked_rows,
             len(tokens_to_check),
             wiring_edges_total,
+            pre_violation_found,
         )
     )
 
