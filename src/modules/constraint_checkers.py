@@ -65,6 +65,9 @@ class EvidenceState:
     def edit_unknown(self, entity_id: int, predicate_id: int) -> bool:
         return (entity_id, predicate_id) in self.missing_edits
 
+    def focus_statement_present(self) -> bool:
+        return self.has_statement(self.focus_subject, self.focus_predicate, self.focus_object)
+
 
 @dataclass(frozen=True)
 class ConstraintInstance:
@@ -131,11 +134,9 @@ def is_satisfied_conflict_with(
     subject = state.focus_subject
     if subject == 0:
         return True
-    has_p = False
-    if state.focus_predicate == constraint.constrained_property:
-        has_p = True
-    if state.has_property(subject, constraint.constrained_property):
-        has_p = True
+    has_p = state.has_property(subject, constraint.constrained_property)
+    if not has_p:
+        return True
     conflict_props = set(constraint.conflict_properties)
     if not conflict_props and state.other_predicate:
         conflict_props.add(state.other_predicate)
@@ -143,8 +144,6 @@ def is_satisfied_conflict_with(
     for prop in conflict_props:
         if prop == 0:
             continue
-        if state.other_subject == subject and state.other_predicate == prop:
-            has_q = True
         if state.has_property(subject, prop):
             has_q = True
     return not (has_p and has_q)
@@ -158,9 +157,16 @@ def is_checkable_inverse(
     subject = state.focus_subject
     predicate = state.focus_predicate
     obj = state.focus_object
-    if subject == 0 or predicate == 0 or obj == 0:
+    if subject == 0 or predicate == 0:
         return False
     if predicate != constraint.constrained_property:
+        return False
+    if _needs_edit_guard(state, subject, constraint.constrained_property):
+        return False
+    has_trigger = state.focus_statement_present()
+    if not has_trigger:
+        return state.property_complete(subject, constraint.constrained_property)
+    if obj == 0:
         return False
     if not state.entity_in_scope(obj):
         return False
@@ -184,6 +190,8 @@ def is_satisfied_inverse(
 ) -> bool:
     subject = state.focus_subject
     obj = state.focus_object
+    if not state.focus_statement_present():
+        return True
     inverse_props = constraint.inverse_properties or [constraint.constrained_property]
     for inv_prop in inverse_props:
         if state.has_statement(obj, inv_prop, subject):
@@ -201,8 +209,17 @@ def is_checkable_item_requires_statement(
         return False
     if not constraint.required_properties:
         return False
+    if constraint.constrained_property == 0:
+        return False
+    if constraint.constrained_property not in p_local:
+        return False
+    if _needs_edit_guard(state, subject, constraint.constrained_property):
+        return False
     if not state.entity_in_scope(subject):
         return False
+    has_trigger = state.has_property(subject, constraint.constrained_property)
+    if not has_trigger:
+        return state.property_complete(subject, constraint.constrained_property)
     for req_prop in constraint.required_properties:
         if req_prop == 0:
             return False
@@ -221,6 +238,8 @@ def is_satisfied_item_requires_statement(
     p_local: Set[int],
 ) -> bool:
     subject = state.focus_subject
+    if not state.has_property(subject, constraint.constrained_property):
+        return True
     for req_prop in constraint.required_properties:
         if not state.has_property(subject, req_prop):
             return False
@@ -232,7 +251,17 @@ def is_checkable_value_requires_statement(
     constraint: ConstraintInstance,
     p_local: Set[int],
 ) -> bool:
+    subject = state.focus_subject
     obj = state.focus_object
+    if constraint.constrained_property == 0:
+        return False
+    if state.focus_predicate != constraint.constrained_property:
+        return False
+    if _needs_edit_guard(state, subject, constraint.constrained_property):
+        return False
+    has_trigger = state.focus_statement_present()
+    if not has_trigger:
+        return state.property_complete(subject, constraint.constrained_property)
     if obj == 0:
         return False
     if not constraint.required_properties:
@@ -257,6 +286,8 @@ def is_satisfied_value_requires_statement(
     p_local: Set[int],
 ) -> bool:
     obj = state.focus_object
+    if not state.focus_statement_present():
+        return True
     for req_prop in constraint.required_properties:
         if not state.has_property(obj, req_prop):
             return False
@@ -272,6 +303,13 @@ def is_checkable_one_of(
         return False
     if state.focus_predicate != constraint.constrained_property:
         return False
+    if constraint.constrained_property not in p_local:
+        return False
+    if _needs_edit_guard(state, state.focus_subject, constraint.constrained_property):
+        return False
+    has_trigger = state.focus_statement_present()
+    if not has_trigger:
+        return state.property_complete(state.focus_subject, constraint.constrained_property)
     if state.focus_object == 0:
         return False
     return True
@@ -282,6 +320,8 @@ def is_satisfied_one_of(
     constraint: ConstraintInstance,
     p_local: Set[int],
 ) -> bool:
+    if not state.focus_statement_present():
+        return True
     return state.focus_object in constraint.allowed_items
 
 
@@ -301,8 +341,6 @@ def is_checkable_single(
     if not state.entity_in_scope(subject):
         return False
     if not state.property_complete(subject, prop):
-        return False
-    if not state.has_property(subject, prop):
         return False
     return True
 
@@ -329,10 +367,19 @@ def is_checkable_type(
     subject = state.focus_subject
     if subject == 0:
         return False
+    if constraint.constrained_property == 0:
+        return False
+    if constraint.constrained_property not in p_local:
+        return False
+    if _needs_edit_guard(state, subject, constraint.constrained_property):
+        return False
     if not constraint.allowed_classes:
         return False
     if not state.entity_in_scope(subject):
         return False
+    has_trigger = state.has_property(subject, constraint.constrained_property)
+    if not has_trigger:
+        return state.property_complete(subject, constraint.constrained_property)
     rel_preds = _type_relation_predicates(constraint)
     if not rel_preds:
         return False
@@ -354,6 +401,8 @@ def is_satisfied_type(
     p_local: Set[int],
 ) -> bool:
     subject = state.focus_subject
+    if not state.has_property(subject, constraint.constrained_property):
+        return True
     rel_preds = _type_relation_predicates(constraint)
     for rel in rel_preds:
         if state.values_for(subject, rel) & constraint.allowed_classes:
@@ -369,8 +418,17 @@ def is_checkable_value_type(
     obj = state.focus_object
     if obj == 0:
         return False
+    if constraint.constrained_property == 0:
+        return False
+    if constraint.constrained_property not in p_local:
+        return False
+    if _needs_edit_guard(state, state.focus_subject, constraint.constrained_property):
+        return False
     if not constraint.allowed_classes:
         return False
+    has_trigger = state.has_property(state.focus_subject, constraint.constrained_property)
+    if not has_trigger:
+        return state.property_complete(state.focus_subject, constraint.constrained_property)
     if not state.entity_in_scope(obj):
         return False
     rel_preds = _type_relation_predicates(constraint)
@@ -394,6 +452,8 @@ def is_satisfied_value_type(
     p_local: Set[int],
 ) -> bool:
     obj = state.focus_object
+    if not state.has_property(state.focus_subject, constraint.constrained_property):
+        return True
     rel_preds = _type_relation_predicates(constraint)
     for rel in rel_preds:
         if state.values_for(obj, rel) & constraint.allowed_classes:
@@ -406,11 +466,20 @@ def is_checkable_distinct(
     constraint: ConstraintInstance,
     p_local: Set[int],
 ) -> bool:
+    subject = state.focus_subject
+    prop = constraint.constrained_property
+    if subject == 0 or prop == 0:
+        return False
+    if prop not in p_local:
+        return False
+    if _needs_edit_guard(state, subject, prop):
+        return False
+    has_trigger = state.focus_statement_present()
+    if not has_trigger:
+        return state.property_complete(subject, prop)
     if state.other_subject == 0 or state.other_predicate == 0 or state.other_object == 0:
         return False
-    if constraint.constrained_property == 0:
-        return False
-    if state.other_predicate != constraint.constrained_property:
+    if state.other_predicate != prop:
         return False
     if state.other_predicate not in p_local:
         return False
@@ -422,6 +491,8 @@ def is_satisfied_distinct(
     constraint: ConstraintInstance,
     p_local: Set[int],
 ) -> bool:
+    if not state.focus_statement_present():
+        return True
     if state.other_subject == 0 or state.other_predicate == 0 or state.other_object == 0:
         return True
     if state.other_predicate != constraint.constrained_property:

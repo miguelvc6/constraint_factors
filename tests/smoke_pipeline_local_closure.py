@@ -342,10 +342,7 @@ def main() -> None:
         raise SystemExit(1)
 
     checked_rows = 0
-    pre_violation_found = False
-    post_fix_found = False
-    post_checkable_found = False
-    for _, row in labeled_df.iterrows():
+    for _, row in labeled_df.head(10).iterrows():
         local_ids = row["local_constraint_ids"]
         if local_ids is None:
             continue
@@ -363,26 +360,158 @@ def main() -> None:
             print("Test 4 failed: label list lengths do not match local_constraint_ids.")
             raise SystemExit(1)
 
-        primary_id = int(row["constraint_id"])
-        if primary_id in local_ids:
-            idx = local_ids.index(primary_id)
-            if pre_checkable[idx] and pre_satisfied[idx] == 0:
-                pre_violation_found = True
-            if post_checkable[idx]:
-                post_checkable_found = True
-            if post_checkable[idx] and post_satisfied[idx] == 1:
-                post_fix_found = True
-
         checked_rows += 1
-        if checked_rows >= 10:
-            break
+
+    if checked_rows < 10:
+        print("Test 4 failed: insufficient rows to validate label arrays.")
+        raise SystemExit(1)
+
+    from modules.constraint_checkers import EvidenceState
+    import importlib.util
+
+    labeler_path = repo_root / "src" / "04_constraint_labeler.py"
+    spec = importlib.util.spec_from_file_location("constraint_labeler", labeler_path)
+    if spec is None or spec.loader is None:
+        print(f"Test 4 failed: unable to load {labeler_path}")
+        raise SystemExit(1)
+    labeler = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(labeler)
+    _compute_p_local = getattr(labeler, "_compute_p_local")
+    _build_facts_state = getattr(labeler, "_build_facts_state")
+    _build_placeholder_map = getattr(labeler, "_build_placeholder_map")
+    _apply_edit = getattr(labeler, "_apply_edit")
+    _resolve_registry_id = getattr(labeler, "_resolve_registry_id")
+
+    assume_complete = True
+    use_encoded_ids = pd.api.types.is_integer_dtype(labeled_df["constraint_id"])
+
+    def _registry_entry_for_row(row: pd.Series) -> dict | None:
+        cid = int(row["constraint_id"])
+        token = encoder._decoding.get(cid)
+        if token is None:
+            return None
+        entry = registry.get(token)
+        if entry is None:
+            entry = registry.get(token.strip("<>"))
+        return entry
+
+    def _build_states(row: pd.Series) -> tuple[EvidenceState, EvidenceState, set[int]]:
+        p_local = _compute_p_local(row, cast_int=use_encoded_ids)
+        facts_by_entity, predicates_present = _build_facts_state(
+            row, p_local=p_local, assume_complete=assume_complete, cast_int=use_encoded_ids
+        )
+        subject = int(getattr(row, "subject", 0) or 0)
+        predicate = int(getattr(row, "predicate", 0) or 0)
+        obj = int(getattr(row, "object", 0) or 0)
+        other_subject = int(getattr(row, "other_subject", 0) or 0)
+        other_predicate = int(getattr(row, "other_predicate", 0) or 0)
+        other_object = int(getattr(row, "other_object", 0) or 0)
+        pre_state = EvidenceState(
+            facts_by_entity=facts_by_entity,
+            predicates_present=predicates_present,
+            assume_complete=assume_complete,
+            missing_edits=set(),
+            focus_subject=subject,
+            focus_predicate=predicate,
+            focus_object=obj,
+            other_subject=other_subject,
+            other_predicate=other_predicate,
+            other_object=other_object,
+        )
+        post_facts = {ent: {pred: set(values) for pred, values in facts.items()} for ent, facts in facts_by_entity.items()}
+        post_predicates = {ent: set(preds) for ent, preds in predicates_present.items()}
+        placeholder_map = _build_placeholder_map(encoder, row)
+        missing_edits = _apply_edit(
+            post_facts,
+            post_predicates,
+            p_local,
+            row,
+            placeholder_map=placeholder_map,
+            assume_complete=assume_complete,
+            cast_int=use_encoded_ids,
+        )
+        post_state = EvidenceState(
+            facts_by_entity=post_facts,
+            predicates_present=post_predicates,
+            assume_complete=assume_complete,
+            missing_edits=missing_edits,
+            focus_subject=subject,
+            focus_predicate=predicate,
+            focus_object=obj,
+            other_subject=other_subject,
+            other_predicate=other_predicate,
+            other_object=other_object,
+        )
+        return pre_state, post_state, p_local
+
+    pre_violation_found = False
+    post_fix_found = False
+    post_checkable_found = False
+    diagnostic_rows: list[str] = []
+
+    for _, row in labeled_df.iterrows():
+        local_ids = row["local_constraint_ids"]
+        if local_ids is None:
+            continue
+        local_ids = list(map(int, list(local_ids)))
+        if not local_ids:
+            continue
+        primary_id = int(row["constraint_id"])
+        if primary_id not in local_ids:
+            continue
+
+        idx = local_ids.index(primary_id)
+        pre_checkable = list(row["factor_checkable_pre"])
+        pre_satisfied = list(row["factor_satisfied_pre"])
+        post_checkable = list(row["factor_checkable_post_gold"])
+        post_satisfied = list(row["factor_satisfied_post_gold"])
+
+        if pre_checkable[idx] and pre_satisfied[idx] == 0:
+            pre_violation_found = True
+        if post_checkable[idx]:
+            post_checkable_found = True
+        if post_checkable[idx] and post_satisfied[idx] == 1:
+            post_fix_found = True
+
+        if not post_fix_found and len(diagnostic_rows) < 5 and pre_checkable[idx] and pre_satisfied[idx] == 0:
+            entry = _registry_entry_for_row(row) or {}
+            constrained_property_token = entry.get("constrained_property") or ""
+            constrained_property_id = _resolve_registry_id(constrained_property_token, encoder) if encoder else 0
+            pre_state, post_state, _ = _build_states(row)
+            pre_focus_present = pre_state.focus_statement_present()
+            post_focus_present = post_state.focus_statement_present()
+            pre_has_prop = pre_state.has_property(pre_state.focus_subject, constrained_property_id)
+            post_has_prop = post_state.has_property(post_state.focus_subject, constrained_property_id)
+            constraint_type = entry.get("constraint_family") or entry.get("constraint_type_name") or "unknown"
+            del_trip = (
+                int(getattr(row, "del_subject", 0) or 0),
+                int(getattr(row, "del_predicate", 0) or 0),
+                int(getattr(row, "del_object", 0) or 0),
+            )
+            add_trip = (
+                int(getattr(row, "add_subject", 0) or 0),
+                int(getattr(row, "add_predicate", 0) or 0),
+                int(getattr(row, "add_object", 0) or 0),
+            )
+            diagnostic_rows.append(
+                "constraint_type={} del={} add={} focus_present_pre={} focus_present_post={} has_P_pre={} has_P_post={} assume_complete={}".format(
+                    constraint_type,
+                    del_trip,
+                    add_trip,
+                    pre_focus_present,
+                    post_focus_present,
+                    pre_has_prop,
+                    post_has_prop,
+                    assume_complete,
+                )
+            )
 
     if not pre_violation_found:
         print("Test 4 failed: no row found with primary constraint violated pre.")
         raise SystemExit(1)
 
     if not post_fix_found:
-        print("Test 4 warning: no row found with primary constraint fixed post-gold.")
+        print("Test 4 failed: no row found with primary constraint fixed post-gold.")
         coverage_pre = labeled_df["num_checkable_factors_pre"].sum()
         coverage_post = labeled_df["num_checkable_factors_post_gold"].sum()
         print(
@@ -390,9 +519,13 @@ def main() -> None:
                 int(coverage_pre), int(coverage_post)
             )
         )
+        if diagnostic_rows:
+            print("Diagnostics (up to 5):")
+            for line in diagnostic_rows:
+                print(" -", line)
         if not post_checkable_found:
             print("Test 4 failed: zero checkable post-gold constraints.")
-            raise SystemExit(1)
+        raise SystemExit(1)
 
     print(
         "PASS: checked_rows={}, multi_constraint_instance=yes, encoder_tokens_ok={}, wiring_edges_ok={}, labels_ok={}".format(
