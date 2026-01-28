@@ -159,16 +159,30 @@ def create_graph(
     debug_entries: list[dict[str, Any]] = []
 
     def _resolve_registry_id(raw_id: str) -> int | None:
+        raw = raw_id.strip()
+        if raw.startswith("<") and raw.endswith(">"):
+            raw = raw[1:-1].strip()
+        if raw.startswith("http://www.wikidata.org/prop/direct/"):
+            raw = raw.replace(
+                "http://www.wikidata.org/prop/direct/",
+                "http://www.wikidata.org/entity/",
+            )
         candidates: list[str] = []
-        if raw_id.startswith("http://") or raw_id.startswith("https://"):
-            candidates.append(raw_id)
-            candidates.append(f"<{raw_id}>")
+        seen: set[str] = set()
+        if raw.startswith("http://") or raw.startswith("https://"):
+            candidates.extend([raw, f"<{raw}>"])
+            last = raw.rsplit("/", 1)[-1]
+            if last and last[0] in ("P", "Q") and last[1:].isdigit():
+                candidates.append(last)
         else:
-            candidates.append(raw_id)
-            if raw_id and raw_id[0] in ("P", "Q") and raw_id[1:].isdigit():
-                candidates.append(f"http://www.wikidata.org/entity/{raw_id}")
-                candidates.append(f"<http://www.wikidata.org/entity/{raw_id}>")
+            if raw and raw[0] in ("P", "Q") and raw[1:].isdigit():
+                entity_uri = f"http://www.wikidata.org/entity/{raw}"
+                candidates.extend([entity_uri, f"<{entity_uri}>"])
+            candidates.append(raw)
         for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
             gid = global_int_encoder.encode(candidate, add_new=False)
             if gid:
                 return gid
