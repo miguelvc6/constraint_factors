@@ -136,7 +136,7 @@ def _build_requests_session() -> requests.Session:
     retry = Retry(
         total=3,
         backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[403, 429, 500, 502, 503, 504],
         allowed_methods={"GET", "POST"},
         raise_on_status=False,
     )
@@ -162,13 +162,18 @@ def _query_wikidata_labels(
         return []
 
     endpoint = "https://query.wikidata.org/sparql"
+    # IDENTIFICATION: Use the exact header that worked in your curl test
     headers = {
-        "User-Agent": "constraint-factors (miguel.vazquez@wu.ac.at)",
+        "User-Agent": "ConstraintFactorBot/1.0 (https://github.com/your-repo; miguel.vazquez@wu.ac.at) Python-Requests/2.31",
         "Accept": "application/sparql-results+json",
     }
 
     pending: list[list[str]] = [list(entity_ids)]
     results: list[dict] = []
+
+    # Backoff configuration
+    base_delay = 2.0
+    max_delay = 60.0
 
     while pending:
         current = pending.pop()
@@ -183,42 +188,56 @@ def _query_wikidata_labels(
             }}
         """
 
-        try:
-            response = session.post(
-                endpoint,
-                data={"query": sparql_query, "format": "json"},
-                headers=headers,
-                timeout=60,
-            )
-            if response.status_code == 403:
-                logger.warning(
-                    "Wikidata query blocked (HTTP 403). "
-                    "Check robots policy and rate limits; ensure User-Agent is set."
-                )
-            response.raise_for_status()
-            payload = response.json()
-        except requests.Timeout:
-            if len(current) > 1:
-                mid = max(1, len(current) // 2)
-                logger.warning(
-                    "Wikidata query timeout for %s IDs; retrying in %s + %s chunk(s)",
-                    len(current),
-                    len(current[:mid]),
-                    len(current[mid:]),
-                )
-                pending.append(current[mid:])
-                pending.append(current[:mid])
-                continue
-            logger.warning("Wikidata query timeout for ID %s", current[0])
-            continue
-        except (requests.RequestException, ValueError) as exc:
-            logger.warning("Error querying Wikidata for IDs %s: %s", current, exc)
-            continue
-        finally:
-            time.sleep(1)
+        attempt = 0
+        success = False
 
-        bindings = payload.get("results", {}).get("bindings", [])
-        results.extend(bindings)
+        while not success and attempt < 5:
+            try:
+                response = session.post(
+                    endpoint,
+                    data={"query": sparql_query, "format": "json"},
+                    headers=headers,
+                    timeout=60,
+                )
+
+                # 1. HANDLE POLICY BLOCKS IMMEDIATELY
+                if response.status_code == 403:
+                    logger.error("403 Forbidden: Blocked by Robot Policy. STOPPING to prevent IP ban.")
+                    logger.error(f"Response: {response.text[:500]}")
+                    return results  # Return progress to avoid data loss
+
+                # 2. HANDLE RATE LIMITS WITH BACKOFF
+                if response.status_code == 429:
+                    attempt += 1
+                    delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                    logger.warning("429 Too Many Requests. Backing off for %.2f seconds...", delay)
+                    time.sleep(delay)
+                    continue
+
+                response.raise_for_status()
+                payload = response.json()
+                success = True
+
+                # Be a good citizen: small delay between successful batches
+                time.sleep(1.5)
+
+            except requests.Timeout:
+                if len(current) > 1:
+                    mid = max(1, len(current) // 2)
+                    logger.warning("Timeout for batch of %d; splitting.", len(current))
+                    pending.append(current[mid:])
+                    pending.append(current[:mid])
+                    success = True  # Break inner retry to try smaller halves
+                else:
+                    logger.error("Persistent timeout for ID %s. Skipping.", current[0])
+                    break
+            except Exception as exc:
+                logger.error("Request error for IDs %s: %s", current, exc)
+                break
+
+        if success and "payload" in locals():
+            bindings = payload.get("results", {}).get("bindings", [])
+            results.extend(bindings)
 
     return results
 
