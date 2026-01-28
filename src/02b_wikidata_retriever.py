@@ -58,6 +58,15 @@ def _ensure_iterable(value: Any) -> Iterable[int]:
     return [value]
 
 
+def _coerce_str(value: Any) -> str:
+    """Coerce parquet scalars into safe strings."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if value is None:
+        return ""
+    return str(value)
+
+
 def _gather_from_dataframe(
     dataframe: pd.DataFrame,
     unique_ids: set[int],
@@ -224,7 +233,13 @@ def _load_existing_cache(path: Path) -> tuple[dict[CacheKey, CacheEntry], dict[t
         gid = None if pd.isna(raw_gid) else int(raw_gid)
 
         embedding_array = np.asarray(row.embedding, dtype=np.float16)
-        entry = CacheEntry(row.key, row.kind, gid, row.text, embedding_array)
+        entry = CacheEntry(
+            _coerce_str(row.key),
+            _coerce_str(row.kind),
+            gid,
+            _coerce_str(row.text),
+            embedding_array,
+        )
         key = (entry.kind, entry.key, entry.global_id)
         cache[key] = entry
         by_kind_key.setdefault((entry.kind, entry.key), entry)
