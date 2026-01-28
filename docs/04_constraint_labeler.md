@@ -52,7 +52,9 @@ If an edit references an entity/property/value outside the local evidence struct
 constraint checks are marked **not checkable** (conservative).
 
 ## Constraint Types Implemented (v1)
-Per-type checkability and satisfaction are implemented in `src/modules/constraint_checkers.py`:
+Per-type checkability and satisfaction are implemented in `src/modules/constraint_checkers.py`.
+Canonical constraint-family names come from the registry (`constraint_family`), generated via the
+static catalog in `data/static/constraint_type_catalog.json`.
 - `conflictWith`
 - `inverse`
 - `itemRequiresStatement`

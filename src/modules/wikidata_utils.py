@@ -153,6 +153,65 @@ def _chunk_ids(entity_ids: Sequence[str], chunk_size: int) -> Iterable[list[str]
         yield list(entity_ids[index : index + chunk_size])
 
 
+def query_wikidata_sparql(
+    session: requests.Session,
+    sparql_query: str,
+    *,
+    headers: dict[str, str] | None = None,
+    max_attempts: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    min_delay: float = 1.0,
+) -> list[dict]:
+    endpoint = "https://query.wikidata.org/sparql"
+    headers = headers or {
+        "User-Agent": "ConstraintFactorBot/1.0 (https://github.com/your-repo; miguel.vazquez@wu.ac.at) Python-Requests/2.31",
+        "Accept": "application/sparql-results+json",
+    }
+
+    attempt = 0
+    payload: dict | None = None
+    while attempt < max_attempts:
+        try:
+            response = session.post(
+                endpoint,
+                data={"query": sparql_query, "format": "json"},
+                headers=headers,
+                timeout=60,
+            )
+
+            if response.status_code == 403:
+                logger.error("403 Forbidden: Blocked by Robot Policy. STOPPING to prevent IP ban.")
+                logger.error("Response: %s", response.text[:500])
+                return []
+
+            if response.status_code == 429:
+                attempt += 1
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                logger.warning("429 Too Many Requests. Backing off for %.2f seconds...", delay)
+                time.sleep(delay)
+                continue
+
+            response.raise_for_status()
+            payload = response.json()
+
+            # Be a good citizen: delay between successful batches
+            time.sleep(min_delay)
+            break
+        except requests.Timeout:
+            attempt += 1
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            logger.warning("Timeout on SPARQL query. Backing off for %.2f seconds...", delay)
+            time.sleep(delay)
+        except Exception as exc:
+            logger.error("Request error for SPARQL query: %s", exc)
+            break
+
+    if payload is None:
+        return []
+    return payload.get("results", {}).get("bindings", [])
+
+
 def _query_wikidata_labels(
     session: requests.Session,
     entity_ids: Sequence[str],
@@ -161,19 +220,8 @@ def _query_wikidata_labels(
     if not entity_ids:
         return []
 
-    endpoint = "https://query.wikidata.org/sparql"
-    # IDENTIFICATION: Use the exact header that worked in your curl test
-    headers = {
-        "User-Agent": "ConstraintFactorBot/1.0 (https://github.com/your-repo; miguel.vazquez@wu.ac.at) Python-Requests/2.31",
-        "Accept": "application/sparql-results+json",
-    }
-
     pending: list[list[str]] = [list(entity_ids)]
     results: list[dict] = []
-
-    # Backoff configuration
-    base_delay = 2.0
-    max_delay = 60.0
 
     while pending:
         current = pending.pop()
@@ -188,57 +236,19 @@ def _query_wikidata_labels(
             }}
         """
 
-        attempt = 0
-        success = False
-        payload: dict | None = None
-
-        while not success and attempt < 5:
-            try:
-                response = session.post(
-                    endpoint,
-                    data={"query": sparql_query, "format": "json"},
-                    headers=headers,
-                    timeout=60,
-                )
-
-                # 1. HANDLE POLICY BLOCKS IMMEDIATELY
-                if response.status_code == 403:
-                    logger.error("403 Forbidden: Blocked by Robot Policy. STOPPING to prevent IP ban.")
-                    logger.error(f"Response: {response.text[:500]}")
-                    return results  # Return progress to avoid data loss
-
-                # 2. HANDLE RATE LIMITS WITH BACKOFF
-                if response.status_code == 429:
-                    attempt += 1
-                    delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-                    logger.warning("429 Too Many Requests. Backing off for %.2f seconds...", delay)
-                    time.sleep(delay)
-                    continue
-
-                response.raise_for_status()
-                payload = response.json()
-                success = True
-
-                # Be a good citizen: small delay between successful batches
-                time.sleep(1.5)
-
-            except requests.Timeout:
-                if len(current) > 1:
-                    mid = max(1, len(current) // 2)
-                    logger.warning("Timeout for batch of %d; splitting.", len(current))
-                    pending.append(current[mid:])
-                    pending.append(current[:mid])
-                    success = True  # Break inner retry to try smaller halves
-                else:
-                    logger.error("Persistent timeout for ID %s. Skipping.", current[0])
-                    break
-            except Exception as exc:
-                logger.error("Request error for IDs %s: %s", current, exc)
-                break
-
-        if success and payload is not None:
-            bindings = payload.get("results", {}).get("bindings", [])
-            results.extend(bindings)
+        bindings = query_wikidata_sparql(
+            session,
+            sparql_query,
+            base_delay=2.0,
+            min_delay=1.5,
+        )
+        if not bindings and len(current) > 1:
+            mid = max(1, len(current) // 2)
+            logger.warning("Empty bindings for batch of %d; splitting.", len(current))
+            pending.append(current[mid:])
+            pending.append(current[:mid])
+            continue
+        results.extend(bindings)
 
     return results
 

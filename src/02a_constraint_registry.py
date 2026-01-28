@@ -17,7 +17,10 @@ from typing import Any
 
 import pandas as pd
 
+from modules.constraint_checkers import CHECKERS
+
 CONSTRAINT_TYPE_PREDICATE = "<http://www.wikidata.org/entity/P2302>"
+CATALOG_PATH = Path("data/static/constraint_type_catalog.json")
 
 
 def _load_dataframe_builder() -> Any:
@@ -48,6 +51,7 @@ def _normalize_token(value: str) -> str:
 def build_registry(
     constraints_def: dict[str, dict[str, list[str]]],
     constraints_by_property: dict[str, list[str]],
+    constraint_catalog: dict[str, dict[str, str]],
 ) -> dict[str, dict[str, Any]]:
     constraint_to_property: dict[str, str] = {}
     for prop, constraint_ids in constraints_by_property.items():
@@ -67,7 +71,21 @@ def build_registry(
         type_objects = [obj for pred, obj in zip(predicates, objects) if pred == CONSTRAINT_TYPE_PREDICATE]
         if len(type_objects) != 1:
             raise ValueError(f"Constraint {constraint_id} has {len(type_objects)} type objects; expected 1.")
-        constraint_type = _normalize_token(type_objects[0])
+        constraint_type_raw = _normalize_token(type_objects[0])
+        constraint_type_item = _normalize_entity_id(type_objects[0])
+        if constraint_type_item is None and constraint_type_raw:
+            constraint_type_item = _normalize_entity_id(constraint_type_raw)
+        if constraint_type_item is None:
+            constraint_type_item = ""
+        catalog_entry = constraint_catalog.get(constraint_type_item or "")
+        constraint_family = ""
+        constraint_label = ""
+        if catalog_entry:
+            constraint_family = str(catalog_entry.get("family") or "")
+            constraint_label = str(catalog_entry.get("label") or "")
+        if not constraint_family:
+            constraint_family = "unsupported"
+        constraint_supported = constraint_family in CHECKERS
 
         constrained_property = constraint_to_property.get(constraint_id)
         if constrained_property is None:
@@ -84,7 +102,11 @@ def build_registry(
             param_objects.append(_normalize_token(obj))
 
         registry[constraint_id] = {
-            "constraint_type": constraint_type,
+            "constraint_type": constraint_type_raw,
+            "constraint_type_item": constraint_type_item,
+            "constraint_family": constraint_family,
+            "constraint_label": constraint_label,
+            "constraint_family_supported": constraint_supported,
             "constrained_property": constrained_property,
             "param_predicates": param_predicates,
             "param_objects": param_objects,
@@ -116,6 +138,14 @@ def validate_registry(
     for constraint_id, entry in registry.items():
         if entry.get("constrained_property") != constraint_to_property.get(constraint_id):
             raise ValueError(f"Constraint {constraint_id} has inconsistent constrained property.")
+        if not isinstance(entry.get("constraint_type_item"), str):
+            raise TypeError(f"{constraint_id} field constraint_type_item must be a string.")
+        if not isinstance(entry.get("constraint_family"), str):
+            raise TypeError(f"{constraint_id} field constraint_family must be a string.")
+        if not isinstance(entry.get("constraint_label"), str):
+            raise TypeError(f"{constraint_id} field constraint_label must be a string.")
+        if not isinstance(entry.get("constraint_family_supported"), bool):
+            raise TypeError(f"{constraint_id} field constraint_family_supported must be a bool.")
         for field in ("param_predicates", "param_objects"):
             values = entry.get(field)
             if not isinstance(values, list):
@@ -144,12 +174,49 @@ def main() -> None:
     builder.RAW_DATA_PATH = raw_data_path
     constraints_def, constraints_by_property = builder.load_constraint_data()
 
-    registry = build_registry(constraints_def, constraints_by_property)
+    if not CATALOG_PATH.exists():
+        raise FileNotFoundError(
+            f"Constraint type catalog not found at {CATALOG_PATH}. "
+            "Run scripts/build_constraint_type_catalog.py to generate it."
+        )
+    catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+
+    registry = build_registry(constraints_def, constraints_by_property, catalog)
     validate_registry(registry, constraints_def, constraints_by_property)
 
     registry_json = json.dumps(registry, sort_keys=True)
     output_path = interim_root / f"constraint_registry_{args.dataset}.parquet"
     pd.DataFrame({"registry_json": [registry_json]}).to_parquet(output_path)
+
+    family_counts: dict[str, int] = {}
+    supported_counts: dict[str, int] = {}
+    missing_catalog: dict[str, int] = {}
+    for entry in registry.values():
+        type_item = entry.get("constraint_type_item", "")
+        if type_item and type_item not in catalog:
+            missing_catalog[type_item] = missing_catalog.get(type_item, 0) + 1
+        family = entry.get("constraint_family", "")
+        family_counts[family] = family_counts.get(family, 0) + 1
+        if entry.get("constraint_family_supported"):
+            supported_counts[family] = supported_counts.get(family, 0) + 1
+    supported_total = sum(supported_counts.values())
+    unsupported_total = len(registry) - supported_total
+    unsupported_sorted = sorted(
+        ((family, count) for family, count in family_counts.items() if family not in supported_counts),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    print(f"Unique constraint_family values: {len(family_counts)}")
+    print(f"Supported constraints: {supported_total}, Unsupported constraints: {unsupported_total}")
+    if unsupported_sorted:
+        print("Top unsupported constraint families:")
+        for family, count in unsupported_sorted[:20]:
+            print(f"  {family}: {count}")
+    if missing_catalog:
+        missing_sorted = sorted(missing_catalog.items(), key=lambda item: item[1], reverse=True)
+        print(f"Constraint types missing from catalog: {len(missing_sorted)}")
+        for qid, count in missing_sorted[:20]:
+            print(f"  {qid}: {count}")
 
     print(f"Wrote constraint registry with {len(registry)} entries to {output_path}")
 

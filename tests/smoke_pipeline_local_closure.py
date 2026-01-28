@@ -201,6 +201,14 @@ def main() -> None:
     encoder.load(encoder_path)
 
     registry = _load_registry(repo_root, workdir, dataset)
+    for entry in registry.values():
+        family = entry.get("constraint_family")
+        if not family:
+            print("Test 2 failed: registry missing constraint_family.")
+            raise SystemExit(1)
+        if family.startswith("Q") and not family.startswith("unsupported"):
+            print(f"Test 2 failed: registry has bare Q-id constraint_family: {family}")
+            raise SystemExit(1)
 
     primary_constraint_id = int(multi_constraint_row["constraint_id"])
     local_ids = list(map(int, list(multi_constraint_row["local_constraint_ids"])))

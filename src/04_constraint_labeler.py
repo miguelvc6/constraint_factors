@@ -35,6 +35,10 @@ PARAM_P1696 = "P1696"
 @dataclass(frozen=True)
 class RegistryEntry:
     constraint_type_raw: str
+    constraint_type_item: str
+    constraint_family: str
+    constraint_label: str
+    constraint_family_supported: bool
     constrained_property_raw: str
     param_predicates_raw: Tuple[str, ...]
     param_objects_raw: Tuple[str, ...]
@@ -46,8 +50,18 @@ def _load_registry(path: Path) -> Dict[str, RegistryEntry]:
     registry = json.loads(registry_json) if isinstance(registry_json, str) else registry_json
     parsed: Dict[str, RegistryEntry] = {}
     for constraint_id, entry in registry.items():
+        constraint_family = entry.get("constraint_family")
+        if not constraint_family:
+            constraint_family = entry.get("constraint_type_name", "")
+        constraint_family_supported = entry.get("constraint_family_supported")
+        if constraint_family_supported is None:
+            constraint_family_supported = entry.get("constraint_type_supported", False)
         parsed[constraint_id] = RegistryEntry(
             constraint_type_raw=str(entry.get("constraint_type", "")),
+            constraint_type_item=str(entry.get("constraint_type_item", "")),
+            constraint_family=str(constraint_family or ""),
+            constraint_label=str(entry.get("constraint_label", "")),
+            constraint_family_supported=bool(constraint_family_supported),
             constrained_property_raw=str(entry.get("constrained_property", "")),
             param_predicates_raw=tuple(entry.get("param_predicates") or ()),
             param_objects_raw=tuple(entry.get("param_objects") or ()),
@@ -332,26 +346,6 @@ def _lookup_registry_entry(
     return registry_by_id.get(key)  # type: ignore[arg-type]
 
 
-def _build_type_name_map(
-    df: pd.DataFrame,
-    registry_by_id: Dict[int, RegistryEntry] | Dict[str, RegistryEntry],
-    *,
-    use_encoded_ids: bool,
-) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    for row in df.itertuples(index=False):
-        constraint_id = getattr(row, "constraint_id", None)
-        entry = _lookup_registry_entry(constraint_id, registry_by_id, use_encoded_ids=use_encoded_ids)
-        if entry is None:
-            continue
-        type_raw = normalize_token(entry.constraint_type_raw)
-        if not type_raw:
-            continue
-        if type_raw not in mapping:
-            mapping[type_raw] = str(getattr(row, "constraint_type", "")).strip()
-    return mapping
-
-
 def _load_encoder(path: Path | None) -> GlobalIntEncoder | None:
     if path is None:
         return None
@@ -394,7 +388,7 @@ def _constraint_type_id_from_registry(
 ) -> int:
     if encoder is None:
         return 0
-    return _resolve_registry_id(registry_entry.constraint_type_raw, encoder)
+    return _resolve_registry_id(registry_entry.constraint_type_item, encoder)
 
 
 def _resolve_default_relations(encoder: GlobalIntEncoder | None) -> List[int]:
@@ -414,7 +408,6 @@ def _process_dataframe(
     assume_complete: bool,
     use_encoded_ids: bool,
 ) -> Tuple[pd.DataFrame, Dict[str, Counter[str]]]:
-    type_name_map = _build_type_name_map(df, registry_by_id, use_encoded_ids=use_encoded_ids)
     default_relation_predicates = _resolve_default_relations(encoder)
     constraint_cache: Dict[str, ConstraintInstance] = {}
     coverage: Dict[str, Counter[str]] = defaultdict(Counter)
@@ -501,8 +494,7 @@ def _process_dataframe(
 
             cache_key = str(int(constraint_id)) if use_encoded_ids else str(constraint_id)
             if cache_key not in constraint_cache:
-                type_raw = normalize_token(entry.constraint_type_raw)
-                type_name = type_name_map.get(type_raw or "", type_raw or "")
+                type_name = entry.constraint_family or ""
                 constraint_type_id = _constraint_type_id_from_registry(entry, encoder)
                 constraint_cache[cache_key] = _build_constraint_instance(
                     int(constraint_id) if use_encoded_ids else 0,
@@ -514,8 +506,14 @@ def _process_dataframe(
                 )
 
             constraint_instance = constraint_cache[cache_key]
-            checkable_pre, satisfied_pre = evaluate_constraint(pre_state, constraint_instance, p_local)
-            checkable_post, satisfied_post = evaluate_constraint(post_state, constraint_instance, p_local)
+            if not entry.constraint_family_supported:
+                checkable_pre = False
+                satisfied_pre = 0
+                checkable_post = False
+                satisfied_post = 0
+            else:
+                checkable_pre, satisfied_pre = evaluate_constraint(pre_state, constraint_instance, p_local)
+                checkable_post, satisfied_post = evaluate_constraint(post_state, constraint_instance, p_local)
 
             checkable_pre_row.append(bool(checkable_pre))
             satisfied_pre_row.append(int(satisfied_pre))
