@@ -57,6 +57,8 @@ MIN_OCCURRENCE = 1
 UNKNOWN_TOKEN_ID = 0
 VALIDATE_CONSTRAINTS = True
 PROP_RE = re.compile(r"^P[1-9]\d*$")
+MAX_ROWS: int | None = None
+ROWS_PROCESSED = 0
 
 # Includes the new per-row constraint neighborhood IDs.
 SEQUENCE_FEATURE_KEYS: tuple[str, ...] = SEQUENCE_FEATURES + ("local_constraint_ids",)
@@ -353,8 +355,11 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
         "del_object": [],
         "local_constraint_ids": [],
     }
+    global ROWS_PROCESSED, MAX_ROWS
     with gzip.open(file_path, "rt", encoding="utf-8") as fp:
         for line_i, line in enumerate(fp):
+            if MAX_ROWS is not None and ROWS_PROCESSED >= MAX_ROWS:
+                break
             if line_i == max_size:
                 break
 
@@ -487,6 +492,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
                 for cid in constraints_by_property.get(prop, []):
                     local_constraint_ids.add(cid)
             dataset["local_constraint_ids"].append(sorted(local_constraint_ids))
+            ROWS_PROCESSED += 1
     return dataset
 
 
@@ -781,6 +787,8 @@ def load(kind: str, targets: Union[list[Any], np.ndarray]) -> dict[str, Any]:
             result[k] = np.array(v, dtype=object)
         elif k.endswith("_text") or k == "constraint_type":
             result[k] = np.array(v, dtype=object)
+        elif k in SCALAR_FEATURES:
+            result[k] = np.asarray(v, dtype=np.int64)
         else:
             result[k] = np.asarray(v)
     gc.collect()
@@ -788,7 +796,7 @@ def load(kind: str, targets: Union[list[Any], np.ndarray]) -> dict[str, Any]:
 
 
 def main():
-    global ALLOW_NEW_TOKENS, RECORD_FREQUENCIES, UNKNOWN_TOKEN_ID, ENCODER, REGISTRY_RESERVED_IDS
+    global ALLOW_NEW_TOKENS, RECORD_FREQUENCIES, UNKNOWN_TOKEN_ID, ENCODER, REGISTRY_RESERVED_IDS, ROWS_PROCESSED
 
     # Types of contraints
     targets = [
@@ -809,6 +817,7 @@ def main():
     RECORD_FREQUENCIES = False
 
     # Load raw datasets
+    ROWS_PROCESSED = 0
     raw_train_dataset = load("train", targets)
     raw_dev_dataset = load("dev", targets)
     raw_test_dataset = load("test", targets)
@@ -920,10 +929,21 @@ if __name__ == "__main__":
         default=100,
         help="Minimum number of occurrences in the training split required for a token to keep its ID.",
     )
+    parser.add_argument(
+        "--max_rows",
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Maximum number of parsed correction rows to process across all input files.",
+    )
     args = parser.parse_args()
 
     DATASET = args.dataset
     MIN_OCCURRENCE = max(1, args.min_occurrence)
+    if args.max_rows is not None and args.max_rows > 0:
+        MAX_ROWS = args.max_rows
+    else:
+        MAX_ROWS = None
     dataset_variant = dataset_variant_name(DATASET, MIN_OCCURRENCE)
     print(f"Processing {DATASET} data (min_occurrence={MIN_OCCURRENCE})...\n")
 
