@@ -291,6 +291,20 @@ def main() -> None:
         print("Test 3 failed: primary factor not wired to violating predicate.")
         raise SystemExit(1)
 
+    if (
+        primary_entry.get("constraint_type") == "conflictWith"
+        and debug_payload.get("other_predicate_global_id")
+    ):
+        scope_counts = primary_entry.get("scope_predicate_counts") or {}
+        focus_pred_gid = str(int(debug_payload.get("focus_predicate_global_id") or 0))
+        other_pred_gid = str(int(debug_payload.get("other_predicate_global_id") or 0))
+        if int(scope_counts.get(focus_pred_gid, 0)) <= 0:
+            print("Test 3 failed: conflictWith primary factor missing focus predicate scope wiring.")
+            raise SystemExit(1)
+        if int(scope_counts.get(other_pred_gid, 0)) <= 0:
+            print("Test 3 failed: conflictWith primary factor missing other_predicate scope wiring.")
+            raise SystemExit(1)
+
     print(
         "PASS: checked_rows={}, multi_constraint_instance=yes, encoder_tokens_ok={}, wiring_edges_ok={}".format(
             checked_rows,
