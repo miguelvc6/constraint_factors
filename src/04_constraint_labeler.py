@@ -275,7 +275,6 @@ def _build_constraint_instance(
         obj_norm = normalize_token(obj_raw)
         pred_key = pred_norm or pred_raw
         obj_key = obj_norm or obj_raw
-        pred_id = _resolve_registry_id(pred_raw, encoder) if encoder else 0
         obj_id = _resolve_registry_id(obj_raw, encoder) if encoder else 0
 
         if pred_key == PARAM_P2306:

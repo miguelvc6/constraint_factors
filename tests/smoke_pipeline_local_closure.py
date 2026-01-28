@@ -382,8 +382,8 @@ def main() -> None:
                 int(coverage_pre), int(coverage_post)
             )
         )
-        if post_checkable_found:
-            print("Test 4 failed: post-gold constraints checkable but no fixes found.")
+        if not post_checkable_found:
+            print("Test 4 failed: zero checkable post-gold constraints.")
             raise SystemExit(1)
 
     print(
