@@ -190,6 +190,7 @@ def _query_wikidata_labels(
 
         attempt = 0
         success = False
+        payload: dict | None = None
 
         while not success and attempt < 5:
             try:
@@ -235,7 +236,7 @@ def _query_wikidata_labels(
                 logger.error("Request error for IDs %s: %s", current, exc)
                 break
 
-        if success and "payload" in locals():
+        if success and payload is not None:
             bindings = payload.get("results", {}).get("bindings", [])
             results.extend(bindings)
 
