@@ -80,9 +80,25 @@ def _normalize_target_id(value: Any, encoder: GlobalIntEncoder, unknown_id: int)
     return idx
 
 
+def _is_id_iterable(value: Any) -> bool:
+    """True when value should be treated as a list of ids."""
+    return isinstance(value, Iterable) and not isinstance(value, (str, bytes))
+
+
+def _normalize_id_sequence(value: Any) -> list[Any]:
+    """Normalize singletons and iterables into a concrete list."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if _is_id_iterable(value):
+        return list(value)
+    return [value]
+
+
 def create_graph(
     graph: dict[str, Any],
-    wikidata_cache: PrecomputedWikidataCache,
+    wikidata_cache: PrecomputedWikidataCache | None,
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
@@ -188,9 +204,15 @@ def create_graph(
                 return gid
         return None
 
+    if encoding == "text_embedding" and wikidata_cache is None:
+        raise ValueError("wikidata_cache is required when encoding='text_embedding'")
+    if store_node_names and wikidata_cache is None:
+        raise ValueError("wikidata_cache is required to store node names")
+
     def get_node_attribute(global_node_id: int, node_text: str | None) -> Any:
         """Get the node attribute for a global node ID."""
         if encoding == "text_embedding":
+            assert wikidata_cache is not None
             if node_text is not None and node_text != "":
                 return wikidata_cache.get_embedding_for_literal(
                     node_text,
@@ -241,6 +263,7 @@ def create_graph(
         predicate_name = None
         object_name = None
         if store_node_names:
+            assert wikidata_cache is not None
             subject_name = subject_text or wikidata_cache.get_text_for_id(
                 subject_global_id,
                 fallback_id=unknown_global_id,
@@ -306,44 +329,33 @@ def create_graph(
 
         # handle iterable ids
         if (
-            isinstance(subject_global_id, Iterable)
-            or isinstance(object_global_id, Iterable)
-            or isinstance(predicate_global_id, Iterable)
+            _is_id_iterable(subject_global_id)
+            or _is_id_iterable(object_global_id)
+            or _is_id_iterable(predicate_global_id)
         ):
-            if not isinstance(subject_global_id, Iterable):
-                subject_global_id = [subject_global_id]
-            if not isinstance(object_global_id, Iterable):
-                object_global_id = [object_global_id]
-            if not isinstance(predicate_global_id, Iterable):
-                predicate_global_id = [predicate_global_id]
-            if (
-                len(subject_global_id) == 0
-                or len(object_global_id) == 0
-                or len(predicate_global_id) == 0
-            ):
+            subject_ids = _normalize_id_sequence(subject_global_id)
+            object_ids = _normalize_id_sequence(object_global_id)
+            predicate_ids = _normalize_id_sequence(predicate_global_id)
+            if len(subject_ids) == 0 or len(object_ids) == 0 or len(predicate_ids) == 0:
                 # skip creation, triple doesn't exist
                 return
-            length = max(
-                len(subject_global_id), len(object_global_id), len(predicate_global_id)
-            )
+            length = max(len(subject_ids), len(object_ids), len(predicate_ids))
             if length > 1:
                 # broadcast singletons
-                if len(subject_global_id) == 1:
-                    subject_global_id = subject_global_id * length
-                if len(object_global_id) == 1:
-                    object_global_id = object_global_id * length
-                if len(predicate_global_id) == 1:
-                    predicate_global_id = predicate_global_id * length
+                if len(subject_ids) == 1:
+                    subject_ids = subject_ids * length
+                if len(object_ids) == 1:
+                    object_ids = object_ids * length
+                if len(predicate_ids) == 1:
+                    predicate_ids = predicate_ids * length
             assert (
-                len(subject_global_id)
-                == len(object_global_id)
-                == len(predicate_global_id)
+                len(subject_ids) == len(object_ids) == len(predicate_ids)
             ), (
-                f"Length mismatch when adding edge: {len(subject_global_id)} subjects, {len(predicate_global_id)} predicates, {len(object_global_id)} objects."
+                f"Length mismatch when adding edge: {len(subject_ids)} subjects, {len(predicate_ids)} predicates, {len(object_ids)} objects."
             )
 
             for subject_global, predicate_global, object_global in zip(
-                subject_global_id, predicate_global_id, object_global_id
+                subject_ids, predicate_ids, object_ids
             ):
                 add_edge_from_ids(
                     subject_global,
@@ -384,11 +396,13 @@ def create_graph(
         predicate_name = None
         object_name = None
         if store_node_names:
-            predicate_name = wikidata_cache.get_text_for_id(
+            assert wikidata_cache is not None
+            cache = wikidata_cache
+            predicate_name = cache.get_text_for_id(
                 predicate_global_id,
                 fallback_id=unknown_global_id,
             )
-            object_name = wikidata_cache.get_text_for_id(
+            object_name = cache.get_text_for_id(
                 object_global_id,
                 fallback_id=unknown_global_id,
             )
@@ -674,7 +688,7 @@ def _update_target_sets(graph: dict[str, Any], entity_store: set[int], predicate
 
 def compute_torch_geometric_objects(
     data: datasets.Dataset,
-    wikidata_cache: PrecomputedWikidataCache,
+    wikidata_cache: PrecomputedWikidataCache | None,
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
@@ -773,7 +787,7 @@ def collect_sample_for_check(
 
 
 def main(
-    wikidata_cache: PrecomputedWikidataCache,
+    wikidata_cache: PrecomputedWikidataCache | None,
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
@@ -823,8 +837,16 @@ def main(
         split_predicate_targets: set[int] = {0}
 
         def collect_targets(graph: Data):
-            assert graph.y.shape == (1, 6), "Expected y to be of shape (1, 6)"
-            add_subject, add_predicate, add_object, del_subject, del_predicate, del_object = graph.y[0].tolist()
+            y = graph.y
+            if y is None:
+                raise ValueError("Missing graph.y targets for sanity check.")
+            if not isinstance(y, torch.Tensor):
+                y = torch.as_tensor(y)
+            if y.ndim == 1:
+                y = y.unsqueeze(0)
+            if y.shape != (1, 6):
+                raise ValueError(f"Expected y to be of shape (1, 6), got {tuple(y.shape)}")
+            add_subject, add_predicate, add_object, del_subject, del_predicate, del_object = y[0].tolist()
             for idx in (add_subject, add_object, del_subject, del_object):
                 split_entity_targets.add(idx)
                 total_entity_targets.add(idx)
@@ -947,18 +969,22 @@ def display_graph(encoder: GlobalIntEncoder) -> None:
             # node_attrs=graph_to_show.x_names)
             node_attrs=["x_names"],
         )
+        x_names = getattr(graph_to_show, "x_names", None)
+        labels = dict(enumerate(x_names)) if x_names is not None else None
         nx.draw(
             g,
             pos=nx.spring_layout(g, k=7 / g.order() ** (1 / 2)),
             with_labels=True,
             node_size=500,
             font_size=8,
-            labels=dict(enumerate(graph_to_show.x_names)),
+            labels=labels,
         )
         plt.savefig(PROCESSED_DATA_PATH / "graph_visualization.png")
         plt.show()
 
         # show non-flattened graph
+        if graph_to_show.edge_index_non_flattened is None:
+            raise ValueError("Missing edge_index_non_flattened for non-flattened display.")
         graph_to_show.edge_index = graph_to_show.edge_index_non_flattened
         graph_to_show.validate()
         g = utils.to_networkx(
@@ -968,6 +994,12 @@ def display_graph(encoder: GlobalIntEncoder) -> None:
             edge_attrs=["edge_attr_non_flattened"],
         )
         pos = nx.spring_layout(g, k=7 / g.order() ** (1 / 2))
+        x = graph_to_show.x
+        if x is None:
+            raise ValueError("Missing node features for graph visualization.")
+        edge_attr = graph_to_show.edge_attr_non_flattened
+        if edge_attr is None:
+            raise ValueError("Missing edge_attr_non_flattened for edge label display.")
         nx.draw(
             g,
             pos=pos,
@@ -975,14 +1007,18 @@ def display_graph(encoder: GlobalIntEncoder) -> None:
             node_size=500,
             font_size=8,
             labels={
-                i: encoder.decode(global_id.item(), use_filtered_id_mapping=True) for i, global_id in enumerate(graph_to_show.x)
+                i: encoder.decode(int(global_id.item()), use_filtered_id_mapping=True)
+                for i, global_id in enumerate(x)
             },
         )
         nx.draw_networkx_edge_labels(
             g,
             pos=pos,
             edge_labels={
-                (u, v): encoder.decode(graph_to_show.x[graph_to_show.edge_attr_non_flattened[i].item()].item(), use_filtered_id_mapping=True)
+                (u, v): encoder.decode(
+                    int(x[int(edge_attr[i].item())].item()),
+                    use_filtered_id_mapping=True,
+                )
                 for i, (u, v) in enumerate(g.edges())
             },
         )
