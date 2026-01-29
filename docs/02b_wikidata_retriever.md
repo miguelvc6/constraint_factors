@@ -1,8 +1,8 @@
 # 02b_wikidata_retriever.py
 
 ## Objective
-- Precompute human-readable labels and SentenceTransformer embeddings for every identifier or literal text that appears in the interim parquet splits.
-- Materialise the lookup cache at `data/interim/wikidata_text.parquet` so `03_graph.py` can turn node IDs into dense features without repeatedly calling external services.
+- Precompute human-readable labels and SentenceTransformer embeddings for every identifier or literal text referenced in the interim parquet splits.
+- Materialise the lookup cache at `data/interim/wikidata_text.parquet` (or a custom path) so `03_graph.py` can build node features without repeatedly calling external services.
 
 ## Inputs & Outputs
 - **Inputs:** `data/interim/<variant>/df_{train,val,test}.parquet`, `data/interim/constraint_registry_{dataset}.parquet`, the matching `globalintencoder.txt`, CLI flags for dataset/min-occurrence/embed settings, and outbound network access to Wikidata + the embedding model hub.
@@ -16,7 +16,7 @@
    - Traverses ragged columns listed in `SEQUENCE_FEATURES`.
    - Gathers all strings from `*_text` columns.
    - Ensures placeholder tokens like `subject`, `predicate`, or `LITERAL_OBJECT` are always included so embeddings exist for synthetic nodes as well.
-4. `_load_constraint_registry()` reads `constraint_registry_{dataset}.parquet` and `_collect_registry_ids()` resolves constrained properties and parameter predicate/object IDs via the frozen encoder, then unions them into the retrieval set. Unknown registry IDs are skipped with a warning instead of aborting.
+4. `_load_constraint_registry()` reads `constraint_registry_{dataset}.parquet` and `_collect_registry_ids()` resolves constrained properties and parameter predicate/object IDs via the frozen encoder, then unions them into the retrieval set. If no registry identifiers resolve, the script aborts to prevent silent drift.
 5. `_load_existing_cache()` (if present) keeps previously embedded rows in memory, keyed by `(kind, key, global_id)`. This lets repeated runs skip already resolved URIs/literals.
 6. `_materialise_entries()` handles the heavy lifting:
    - URIs are resolved via `WikidataUriEmbedder.embed_uris()`, which fetches labels (with HTTP batching and caching handled inside `modules.wikidata_utils`).
@@ -36,4 +36,4 @@
 - The cache distinguishes `kind` (`uri`, `placeholder`, `literal`) so `03_graph.py` can request either an embedding by integer ID (`kind=uri`, `global_id` populated) or by raw string (literals).
 - When encountering multiple integer IDs that decode to the same URI, the script stores only one embedding payload and merely aliases the additional IDs, shrinking the on-disk footprint.
 - Literal texts are deduplicated case-insensitively and trimmed; noisy strings like `"nan"` are ignored to avoid polluting the embedding table.
-- Every embedding is stored as `np.float16` by default (configurable via `--embed-dim` and future dtype parameters), which halves storage while remaining adequate for downstream PyTorch models.
+- Every embedding is stored as `np.float16` by default. The `--embed-dim` flag controls the model embedding dimensionality (default 256), while `--batch-size` tunes Wikidata label batching (default 512).

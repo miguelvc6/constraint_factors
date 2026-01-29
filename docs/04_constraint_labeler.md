@@ -1,9 +1,9 @@
 # 04_constraint_labeler.py
 
 ## Objective
-- Generate per-factor constraint labels (checkable + satisfied) for the local constraint neighborhood.
+- Generate per-factor constraint labels (checkable + satisfied) for the local or focus constraint neighborhood.
 - Produce both **pre-edit** and **post-gold-edit** labels without rebuilding graphs.
-- Track coverage and emit a per-type summary.
+- Track coverage and emit per-type summaries and coverage reports.
 
 ## Inputs & Outputs
 **Inputs**
@@ -12,12 +12,16 @@
 - Encoder (`data/interim/<dataset_variant>/globalintencoder.txt`) for encoded parquet IDs.
 
 **Outputs**
-- Parquet file(s) with additional columns:
-- `factor_checkable_pre`, `factor_satisfied_pre`
-- `factor_checkable_post_gold`, `factor_satisfied_post_gold`
-- `factor_types` (aligned with `local_constraint_ids`)
-- `num_checkable_factors_pre`, `coverage_pre`
-- `num_checkable_factors_post_gold`, `coverage_post_gold`
+- Labeled parquet files under `data/interim/<dataset_variant>_labeled/` with additional columns:
+  - `factor_checkable_pre`, `factor_satisfied_pre`
+  - `factor_checkable_post_gold`, `factor_satisfied_post_gold`
+  - `factor_types` (constraint type ids, aligned with `factor_constraint_ids`)
+  - `factor_constraint_ids` (the constraint ids evaluated for the row)
+  - `num_checkable_factors_pre`, `coverage_pre`
+  - `num_checkable_factors_post_gold`, `coverage_post_gold`
+- Coverage reports in the same output folder:
+  - `coverage_<scope>.csv`
+  - `coverage_<scope>.md`
 
 ## Evidence Model
 The labeler builds a normalized evidence structure per row:
@@ -80,5 +84,11 @@ Example usage:
 ```bash
 python src/04_constraint_labeler.py \
   --dataset sample \
-  --min-occurrence 100
+  --min-occurrence 100 \
+  --constraint-scope local
 ```
+
+Key flags:
+- `--constraint-scope {local,focus}` selects `local_constraint_ids` vs `local_constraint_ids_focus`.
+- `--assume-complete-entity-facts/--no-assume-complete-entity-facts` toggles completeness assumptions.
+- `--max-rows` caps rows per parquet for debugging.
