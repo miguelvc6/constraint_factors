@@ -588,10 +588,8 @@ def _print_coverage(coverage: Dict[str, Counter[str]]) -> None:
         )
 
 
-def _print_coverage_table(coverage: Dict[str, Counter[str]]) -> None:
-    if not coverage:
-        return
-    rows = []
+def _coverage_rows(coverage: Dict[str, Counter[str]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     for ctype in sorted(coverage.keys()):
         stats = coverage[ctype]
         total = int(stats.get("total", 0))
@@ -602,18 +600,24 @@ def _print_coverage_table(coverage: Dict[str, Counter[str]]) -> None:
         satisfied_pre = int(stats.get("satisfied_pre", 0))
         satisfied_post = int(stats.get("satisfied_post", 0))
         rows.append(
-            (
-                ctype,
-                total,
-                checkable_pre,
-                checkable_post,
-                satisfied_pre,
-                satisfied_post,
-                checkable_pre / total if total else 0.0,
-                checkable_post / total if total else 0.0,
-            )
+            {
+                "constraint_family": ctype,
+                "total": total,
+                "checkable_pre": checkable_pre,
+                "checkable_post": checkable_post,
+                "satisfied_pre": satisfied_pre,
+                "satisfied_post": satisfied_post,
+                "checkable_pre_rate": checkable_pre / total if total else 0.0,
+                "checkable_post_rate": checkable_post / total if total else 0.0,
+            }
         )
+    return rows
 
+
+def _print_coverage_table(coverage: Dict[str, Counter[str]]) -> None:
+    if not coverage:
+        return
+    rows = _coverage_rows(coverage)
     if not rows:
         return
 
@@ -629,22 +633,36 @@ def _print_coverage_table(coverage: Dict[str, Counter[str]]) -> None:
         "checkable_post_rate",
     )
     print("  ".join(f"{col:>18s}" for col in header))
-    for row in sorted(rows, key=lambda r: (r[6], r[0])):
-        (
-            ctype,
-            total,
-            checkable_pre,
-            checkable_post,
-            satisfied_pre,
-            satisfied_post,
-            checkable_pre_rate,
-            checkable_post_rate,
-        ) = row
+    for row in sorted(rows, key=lambda r: (r["checkable_pre_rate"], r["constraint_family"])):
+        ctype = row["constraint_family"]
+        total = row["total"]
+        checkable_pre = row["checkable_pre"]
+        checkable_post = row["checkable_post"]
+        satisfied_pre = row["satisfied_pre"]
+        satisfied_post = row["satisfied_post"]
+        checkable_pre_rate = row["checkable_pre_rate"]
+        checkable_post_rate = row["checkable_post_rate"]
         print(
             f"{ctype:>18s}  {total:18d}  {checkable_pre:18d}  {checkable_post:18d}  "
             f"{satisfied_pre:18d}  {satisfied_post:18d}  "
             f"{checkable_pre_rate:18.2%}  {checkable_post_rate:18.2%}"
         )
+
+
+def _write_coverage_report(
+    coverage: Dict[str, Counter[str]],
+    output_root: Path,
+    constraint_scope: str,
+) -> None:
+    rows = _coverage_rows(coverage)
+    if not rows:
+        return
+    df = pd.DataFrame(rows).sort_values(["checkable_pre_rate", "constraint_family"])
+    output_root.mkdir(parents=True, exist_ok=True)
+    csv_path = output_root / f"coverage_{constraint_scope}.csv"
+    md_path = output_root / f"coverage_{constraint_scope}.md"
+    df.to_csv(csv_path, index=False)
+    md_path.write_text(df.to_markdown(index=False), encoding="utf-8")
 
 
 def _resolve_registry_mapping(
@@ -767,6 +785,7 @@ def main() -> None:
 
     _print_coverage(combined_coverage)
     _print_coverage_table(combined_coverage)
+    _write_coverage_report(combined_coverage, output_root, args.constraint_scope)
 
 
 if __name__ == "__main__":
