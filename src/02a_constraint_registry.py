@@ -21,7 +21,8 @@ from modules.constraint_checkers import CHECKERS
 from modules.constraint_type_map import canonicalize_constraint_type
 
 CONSTRAINT_TYPE_PREDICATE = "<http://www.wikidata.org/entity/P2302>"
-CATALOG_PATH = Path("data/static/constraint_type_catalog.json")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CATALOG_PATH = REPO_ROOT / "data" / "static" / "constraint_type_catalog.json"
 
 
 def _load_dataframe_builder() -> Any:
