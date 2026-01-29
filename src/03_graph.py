@@ -499,6 +499,16 @@ def create_graph(
         factor_ids = [int(cid) for cid in constraint_ids_raw if cid is not None]
     else:
         factor_ids = []
+    if "factor_constraint_ids" in graph:
+        expected_ids_raw = graph.get("factor_constraint_ids") or []
+        if isinstance(expected_ids_raw, Iterable) and not isinstance(expected_ids_raw, (str, bytes)):
+            expected_ids = [int(cid) for cid in expected_ids_raw if cid is not None]
+        else:
+            expected_ids = []
+        if expected_ids and expected_ids != factor_ids:
+            raise AssertionError(
+                "Factor constraint id order mismatch between labeled data and graph builder."
+            )
     if not factor_ids:
         factor_ids = [int(graph["constraint_id"])]
 
