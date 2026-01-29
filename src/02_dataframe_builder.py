@@ -533,7 +533,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
                 dataset["object"].append(obj)
                 dataset["object_text"].append("")
             else:
-                dataset["object"].append(0)
+                dataset["object"].append(obj)
                 dataset["object_text"].append(elements[4].split("^^")[0])
             dataset["other_subject"].append(other_subject)
             dataset["other_predicate"].append(other_predicate)
@@ -541,7 +541,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
                 dataset["other_object"].append(other_object)
                 dataset["other_object_text"].append("")
             else:
-                dataset["other_object"].append(0)
+                dataset["other_object"].append(other_object)
                 dataset["other_object_text"].append(elements[7].split("^^")[0])
 
             operations = {

@@ -65,6 +65,9 @@ from modules.data_encoders import (
 )
 
 
+LITERAL_ID = 0
+
+
 def _normalize_target_id(value: Any, encoder: GlobalIntEncoder, unknown_id: int) -> int:
     """Return a sanitized class id compatible with the filtered encoder."""
     if value is None:
@@ -94,6 +97,15 @@ def _normalize_id_sequence(value: Any) -> list[Any]:
     if _is_id_iterable(value):
         return list(value)
     return [value]
+
+
+def _is_literal_node(graph: dict[str, Any], key: str) -> bool:
+    text_value = graph.get(f"{key}_text")
+    if isinstance(text_value, str) and text_value != "":
+        return True
+    if LITERAL_ID and graph.get(key) == LITERAL_ID:
+        return True
+    return False
 
 
 def create_graph(
@@ -246,9 +258,6 @@ def create_graph(
                 fallback_id=unknown_global_id,
             )
         else:
-            # TODO: choose a better attribute for text nodes, e.g., add new IDs for each unique literal
-            if node_text is not None:
-                global_node_id = LITERAL_ID
             if global_node_id in global_int_encoder._filtered_ids:
                 global_node_id = unknown_global_id
             return global_int_encoder.get_unfiltered_global_id(global_node_id)
@@ -266,8 +275,7 @@ def create_graph(
             if not subject_text:
                 subject_global_id = unknown_global_id
             else:
-                # TODO: add new unique literal IDs here. Probably requires changes in the evaluation/training, so postpone for now.
-                #  Only important when we use `node_id` encoding.
+                # Fall back to the literal placeholder when a text literal lacks a global id.
                 subject_global_id = LITERAL_ID
         if predicate_global_id == 0:
             if not predicate_text:
@@ -596,7 +604,7 @@ def create_graph(
             subject_scope_ids = {subject_id} if subject_id is not None else set()
         elif constraint_type in {"valueRequiresStatement", "valueType"}:
             object_id = focus_local_nodes.get("object")
-            if object_id is not None and graph.get("object") is not None and graph.get("object") != LITERAL_ID:
+            if object_id is not None and not _is_literal_node(graph, "object"):
                 subject_scope_ids = {object_id}
             else:
                 subject_scope_ids = set()
@@ -765,18 +773,9 @@ def create_graph(
 
 def pandas_to_dataset(dataframe: pd.DataFrame) -> datasets.Dataset:
     """
-    Convert a Pandas DataFrame with BASS columns into a *datasets* Dataset
-    while replacing literal objects by a special **LITERAL_ID** placeholder.
+    Convert a Pandas DataFrame with BASS columns into a *datasets* Dataset.
     """
     dataset = datasets.Dataset.from_pandas(dataframe)
-
-    # FIXME: if both `object` and `other_object` are literals, we would treat them as the same node
-    dataset = dataset.map(
-        lambda x: {
-            "object": x["object"] if x["object_text"] == "" else LITERAL_ID,
-            "other_object": (x["other_object"] if x["other_object_text"] == "" else LITERAL_ID),
-        },
-    )
     return dataset
 
 
