@@ -407,6 +407,7 @@ def _process_dataframe(
     encoder: GlobalIntEncoder | None,
     assume_complete: bool,
     use_encoded_ids: bool,
+    constraint_scope: str,
 ) -> Tuple[pd.DataFrame, Dict[str, Counter[str]]]:
     default_relation_predicates = _resolve_default_relations(encoder)
     constraint_cache: Dict[str, ConstraintInstance] = {}
@@ -475,7 +476,13 @@ def _process_dataframe(
             other_object=other_object,
         )
 
-        local_constraint_ids = _coerce_sequence(getattr(row, "local_constraint_ids", None), cast_int=use_encoded_ids)
+        if constraint_scope == "focus":
+            constraint_ids_raw = getattr(row, "local_constraint_ids_focus", None)
+            if constraint_ids_raw is None:
+                constraint_ids_raw = getattr(row, "local_constraint_ids", None)
+        else:
+            constraint_ids_raw = getattr(row, "local_constraint_ids", None)
+        local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=use_encoded_ids)
         checkable_pre_row: List[bool] = []
         satisfied_pre_row: List[int] = []
         checkable_post_row: List[bool] = []
@@ -581,6 +588,65 @@ def _print_coverage(coverage: Dict[str, Counter[str]]) -> None:
         )
 
 
+def _print_coverage_table(coverage: Dict[str, Counter[str]]) -> None:
+    if not coverage:
+        return
+    rows = []
+    for ctype in sorted(coverage.keys()):
+        stats = coverage[ctype]
+        total = int(stats.get("total", 0))
+        if total == 0:
+            continue
+        checkable_pre = int(stats.get("checkable_pre", 0))
+        checkable_post = int(stats.get("checkable_post", 0))
+        satisfied_pre = int(stats.get("satisfied_pre", 0))
+        satisfied_post = int(stats.get("satisfied_post", 0))
+        rows.append(
+            (
+                ctype,
+                total,
+                checkable_pre,
+                checkable_post,
+                satisfied_pre,
+                satisfied_post,
+                checkable_pre / total if total else 0.0,
+                checkable_post / total if total else 0.0,
+            )
+        )
+
+    if not rows:
+        return
+
+    print("\nConstraint coverage table:")
+    header = (
+        "constraint_family",
+        "total",
+        "checkable_pre",
+        "checkable_post",
+        "satisfied_pre",
+        "satisfied_post",
+        "checkable_pre_rate",
+        "checkable_post_rate",
+    )
+    print("  ".join(f"{col:>18s}" for col in header))
+    for row in sorted(rows, key=lambda r: (r[6], r[0])):
+        (
+            ctype,
+            total,
+            checkable_pre,
+            checkable_post,
+            satisfied_pre,
+            satisfied_post,
+            checkable_pre_rate,
+            checkable_post_rate,
+        ) = row
+        print(
+            f"{ctype:>18s}  {total:18d}  {checkable_pre:18d}  {checkable_post:18d}  "
+            f"{satisfied_pre:18d}  {satisfied_post:18d}  "
+            f"{checkable_pre_rate:18.2%}  {checkable_post_rate:18.2%}"
+        )
+
+
 def _resolve_registry_mapping(
     registry: Dict[str, RegistryEntry],
     *,
@@ -647,6 +713,12 @@ def main() -> None:
         default=None,
         help="Optional cap on rows per parquet for debugging.",
     )
+    parser.add_argument(
+        "--constraint-scope",
+        choices=["local", "focus"],
+        default="local",
+        help="Which constraint neighborhood to label: local (default) or focus predicate scope.",
+    )
     args = parser.parse_args()
 
     from modules.data_encoders import dataset_variant_name
@@ -672,6 +744,8 @@ def main() -> None:
 
     for parquet_path in parquet_paths:
         df = pd.read_parquet(parquet_path)
+        if args.constraint_scope == "focus" and "local_constraint_ids_focus" not in df.columns:
+            print("Warning: local_constraint_ids_focus missing; falling back to local_constraint_ids.")
         if args.max_rows is not None and args.max_rows > 0:
             df = df.iloc[: args.max_rows].copy()
 
@@ -681,6 +755,7 @@ def main() -> None:
             encoder=encoder,
             assume_complete=args.assume_complete_entity_facts,
             use_encoded_ids=use_encoded_ids,
+            constraint_scope=args.constraint_scope,
         )
         for ctype, stats in coverage.items():
             combined_coverage[ctype].update(stats)
@@ -691,6 +766,7 @@ def main() -> None:
         print(f"Wrote labeled parquet to {output_path}")
 
     _print_coverage(combined_coverage)
+    _print_coverage_table(combined_coverage)
 
 
 if __name__ == "__main__":

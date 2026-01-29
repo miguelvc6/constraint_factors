@@ -61,8 +61,12 @@ MAX_ROWS: int | None = None
 ROWS_PROCESSED = 0
 
 # Includes the new per-row constraint neighborhood IDs.
-SEQUENCE_FEATURE_KEYS: tuple[str, ...] = SEQUENCE_FEATURES + ("local_constraint_ids",)
+SEQUENCE_FEATURE_KEYS: tuple[str, ...] = SEQUENCE_FEATURES + (
+    "local_constraint_ids",
+    "local_constraint_ids_focus",
+)
 REGISTRY_RESERVED_IDS: set[int] = set()
+CONSTRAINT_PROPERTY_BY_ID: dict[str, str] = {}
 
 
 def _normalize_property_id(value: str | None) -> str | None:
@@ -385,6 +389,7 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
         "del_predicate": [],
         "del_object": [],
         "local_constraint_ids": [],
+        "local_constraint_ids_focus": [],
     }
     global ROWS_PROCESSED, MAX_ROWS
     with gzip.open(file_path, "rt", encoding="utf-8") as fp:
@@ -591,6 +596,21 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
                 for cid in constraints_by_property.get(prop, []):
                     local_constraint_ids.add(cid)
             dataset["local_constraint_ids"].append(sorted(local_constraint_ids))
+
+            # C_focus = constraints attached to focus/conflict predicates (+ central constrained property).
+            p_focus: set[str] = set()
+            if main_prop:
+                p_focus.add(main_prop)
+            if other_prop:
+                p_focus.add(other_prop)
+            central_prop = CONSTRAINT_PROPERTY_BY_ID.get(elements[0])
+            if central_prop:
+                p_focus.add(central_prop)
+            focus_constraint_ids: set[int] = {constraint_id}
+            for prop in p_focus:
+                for cid in constraints_by_property.get(prop, []):
+                    focus_constraint_ids.add(cid)
+            dataset["local_constraint_ids_focus"].append(sorted(focus_constraint_ids))
             ROWS_PROCESSED += 1
     return dataset
 
@@ -1057,6 +1077,10 @@ if __name__ == "__main__":
     _seed_constraint_factor_tokens(constraints_def)
     REGISTRY_RESERVED_IDS = _collect_registry_reserved_ids(constraints_def, constraints_by_property_raw)
     constraints_by_property = _encode_constraints_by_property(constraints_by_property_raw)
+    CONSTRAINT_PROPERTY_BY_ID = {}
+    for prop, constraint_ids in constraints_by_property_raw.items():
+        for constraint_id in constraint_ids:
+            CONSTRAINT_PROPERTY_BY_ID[constraint_id] = prop
     print("Number of constrained properties:", len(constraints_by_property))
     print("Total constraint instances:", sum(len(v) for v in constraints_by_property.values()))
 

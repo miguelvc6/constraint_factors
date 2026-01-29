@@ -114,6 +114,7 @@ def create_graph(
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
+    constraint_scope: Literal["local", "focus"] = "local",
     store_node_names: bool = False,
     embedding_dtype: np.dtype | None = None,
     debug_factor_wiring: bool = False,
@@ -488,9 +489,14 @@ def create_graph(
     ]
 
     # add constraint factor branches
-    local_constraint_ids = graph.get("local_constraint_ids") or []
-    if isinstance(local_constraint_ids, Iterable) and not isinstance(local_constraint_ids, (str, bytes)):
-        factor_ids = [int(cid) for cid in local_constraint_ids if cid is not None]
+    if constraint_scope == "focus":
+        constraint_ids_raw = graph.get("local_constraint_ids_focus")
+        if constraint_ids_raw is None:
+            constraint_ids_raw = graph.get("local_constraint_ids")
+    else:
+        constraint_ids_raw = graph.get("local_constraint_ids")
+    if isinstance(constraint_ids_raw, Iterable) and not isinstance(constraint_ids_raw, (str, bytes)):
+        factor_ids = [int(cid) for cid in constraint_ids_raw if cid is not None]
     else:
         factor_ids = []
     if not factor_ids:
@@ -811,6 +817,7 @@ def compute_torch_geometric_objects(
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
+    constraint_scope: Literal["local", "focus"] = "local",
     store_node_names: bool = False,
     embedding_dtype: np.dtype | None = None,
     on_sample: Optional[Callable[[Data], None]] = None,
@@ -833,6 +840,7 @@ def compute_torch_geometric_objects(
             global_int_encoder=global_int_encoder,
             constraint_registry=constraint_registry,
             encoding=encoding,
+            constraint_scope=constraint_scope,
             store_node_names=store_node_names,
             embedding_dtype=embedding_dtype,
             debug_factor_wiring=bool(debug_state and debug_state.get("enabled")),
@@ -920,6 +928,7 @@ def main(
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
+    constraint_scope: Literal["local", "focus"] = "local",
     store_node_names: bool = False,
     shard_size: int = 0,
     use_torch_save: bool = False,
@@ -990,6 +999,7 @@ def main(
             global_int_encoder,
             constraint_registry,
             encoding=encoding,
+            constraint_scope=constraint_scope,
             store_node_names=store_node_names,
             embedding_dtype=embedding_dtype,
             on_sample=collect_targets,
@@ -1210,6 +1220,12 @@ def parse_args():
         action="store_true",
         help="Write factor wiring diagnostics for the first multi-constraint instance.",
     )
+    parser.add_argument(
+        "--constraint-scope",
+        choices=["local", "focus"],
+        default="local",
+        help="Which constraint neighborhood to use for factor nodes (default: local).",
+    )
 
     args = parser.parse_args()
 
@@ -1282,6 +1298,7 @@ if __name__ == "__main__":
         global_int_encoder=encoder,
         constraint_registry=constraint_registry,
         encoding=args.encoding,
+        constraint_scope=args.constraint_scope,
         shard_size=args.shard_size,
         use_torch_save=args.use_torch_save,
         embedding_dtype=text_embedding_dtype,
