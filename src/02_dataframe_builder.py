@@ -233,33 +233,13 @@ def _seed_constraint_factor_tokens(constraints_def: dict[str, dict[str, list[str
         ENCODER.encode(token, add_new=True)
 
 
-def _read_entity_desc(line: list[str], desc_position: int) -> dict[str, Any]:
-    """Parse the JSON entity/page description found at *desc_position* in *line*.
+def _is_json_blob(value: str) -> bool:
+    stripped = value.strip()
+    return stripped.startswith("{") and stripped.endswith("}")
 
-    Depending on the "type" field the description can either refer to a
-    Wikidata **entity** (containing labels and facts) or to a **page**
-    (containing HTTP status code and raw HTML content).
 
-    The function translates every URI it touches via :pyfunc:`_convert_value`
-    and returns four lists which are later merged into the main dataset.
-
-    Parameters
-    ----------
-    line
-        Entire TSV row already split on \\t.
-    desc_position
-        Index of the field holding the JSON description.
-
-    Returns
-    -------
-    dict
-        Keys:
-            - entity_predicates : list[int]
-            - entity_objects   : list[int]
-            - entity_labels    : list[str]
-            - http_content     : str
-    """
-    desc = line[desc_position].strip()
+def _build_entity_desc(desc: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize a loaded entity/page description dict into feature lists."""
     result: dict[str, Any] = {
         "entity_predicates": [],
         "entity_objects": [],
@@ -268,11 +248,6 @@ def _read_entity_desc(line: list[str], desc_position: int) -> dict[str, Any]:
         "http_content": "",
     }
     if not desc:
-        return result
-    try:
-        desc = json.loads(desc)
-    except ValueError:
-        print("Invalid description: {}".format(desc))
         return result
     if desc.get("type") == "page":
         # robust status handling (covers non-standard codes like 520, 599, 999)
@@ -303,6 +278,62 @@ def _read_entity_desc(line: list[str], desc_position: int) -> dict[str, Any]:
         pass
 
     return result
+
+
+def _read_entity_desc(line: list[str], desc_position: int) -> dict[str, Any]:
+    """Parse the JSON entity/page description found at *desc_position* in *line*.
+
+    Depending on the "type" field the description can either refer to a
+    Wikidata **entity** (containing labels and facts) or to a **page**
+    (containing HTTP status code and raw HTML content).
+
+    The function translates every URI it touches via :pyfunc:`_convert_value`
+    and returns four lists which are later merged into the main dataset.
+
+    Parameters
+    ----------
+    line
+        Entire TSV row already split on \\t.
+    desc_position
+        Index of the field holding the JSON description.
+
+    Returns
+    -------
+    dict
+        Keys:
+            - entity_predicates : list[int]
+            - entity_objects   : list[int]
+            - entity_labels    : list[str]
+            - http_content     : str
+    """
+    if desc_position < -len(line) or desc_position >= len(line):
+        return _build_entity_desc(None)
+    desc = line[desc_position].strip()
+    if not desc:
+        return _build_entity_desc(None)
+    try:
+        desc = json.loads(desc)
+    except ValueError:
+        print("Invalid description: {}".format(desc))
+        return _build_entity_desc(None)
+    return _build_entity_desc(desc)
+
+
+def _extract_desc_fields(elements: list[str]) -> list[str]:
+    """Return trailing description fields (JSON blobs or empty placeholders)."""
+    idx = len(elements) - 1
+    tail: list[str] = []
+    while idx >= 0:
+        value = elements[idx]
+        stripped = value.strip()
+        if stripped == "" or _is_json_blob(value):
+            tail.append(value)
+            idx -= 1
+            continue
+        break
+    if not tail:
+        return []
+    return list(reversed(tail))
 
 
 def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[Any]]:
@@ -382,8 +413,12 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
             del_subject = None
             del_predicate = None
             del_object = None
+            desc_tail = _extract_desc_fields(elements)
+            op_end_index = len(elements) - len(desc_tail)
+            desc_fields = desc_tail[-3:] if desc_tail else []
+
             i = 12
-            while i < len(elements):
+            while i < op_end_index:
                 if elements[i] == "<http://wikiba.se/history/ontology#addition>":
                     add_subject = elements[i - 3]
                     add_predicate = elements[i - 2]
@@ -399,9 +434,73 @@ def load_dataset(file_path: Path | str, max_size: int = -1) -> dict[str, list[An
                 i += 4
 
             # Parse JSON descriptions (page/entity)
-            subject_desc = _read_entity_desc(elements, -3)
-            object_desc = _read_entity_desc(elements, -2)
-            other_entity_desc = _read_entity_desc(elements, -1)
+            subject_desc = _build_entity_desc(None)
+            object_desc = _build_entity_desc(None)
+            other_entity_desc = _build_entity_desc(None)
+
+            subject_id = elements[2].strip()
+            object_id = elements[4].strip()
+            other_subject_id = elements[5].strip()
+
+            parsed_descs: list[tuple[dict[str, Any] | None, dict[str, Any] | None]] = []
+            for raw in desc_fields:
+                raw_str = raw.strip()
+                if raw_str == "":
+                    parsed_descs.append((None, None))
+                    continue
+                if not _is_json_blob(raw):
+                    parsed_descs.append((None, None))
+                    continue
+                try:
+                    data = json.loads(raw_str)
+                except ValueError:
+                    parsed_descs.append((None, None))
+                    continue
+                parsed_descs.append((data, _build_entity_desc(data)))
+
+            assigned = {"subject": False, "object": False, "other": False}
+
+            for data, built in parsed_descs:
+                if not data or not built:
+                    continue
+                if data.get("type") != "entity":
+                    continue
+                desc_id = str(data.get("id", "")).strip()
+                if desc_id == subject_id and not assigned["subject"]:
+                    subject_desc = built
+                    assigned["subject"] = True
+                elif desc_id == other_subject_id and not assigned["other"]:
+                    other_entity_desc = built
+                    assigned["other"] = True
+                elif desc_id == object_id and object_id.startswith("<http://www.wikidata.org/entity/") and not assigned["object"]:
+                    object_desc = built
+                    assigned["object"] = True
+
+            for data, built in parsed_descs:
+                if not data or not built:
+                    continue
+                if data.get("type") == "page" and not assigned["object"]:
+                    object_desc = built
+                    assigned["object"] = True
+                    break
+
+            remaining = []
+            for data, built in parsed_descs:
+                if not data or not built:
+                    continue
+                if built is subject_desc or built is object_desc or built is other_entity_desc:
+                    continue
+                remaining.append(built)
+
+            if not assigned["subject"] and remaining:
+                subject_desc = remaining.pop(0)
+                assigned["subject"] = True
+            if not assigned["object"] and remaining:
+                object_desc = remaining.pop(0)
+                assigned["object"] = True
+            if not assigned["other"] and remaining:
+                other_entity_desc = remaining.pop(0)
+                assigned["other"] = True
             if any(label in object_desc["http_content"] for label in subject_desc["entity_labels"]):
                 object_desc["entity_predicates"].append(
                     _convert_value("<http://wikiba.se/history/ontology#pageContainsLabel>")

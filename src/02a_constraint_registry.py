@@ -18,6 +18,7 @@ from typing import Any
 import pandas as pd
 
 from modules.constraint_checkers import CHECKERS
+from modules.constraint_type_map import canonicalize_constraint_type
 
 CONSTRAINT_TYPE_PREDICATE = "<http://www.wikidata.org/entity/P2302>"
 CATALOG_PATH = Path("data/static/constraint_type_catalog.json")
@@ -78,14 +79,15 @@ def build_registry(
         if constraint_type_item is None:
             constraint_type_item = ""
         catalog_entry = constraint_catalog.get(constraint_type_item or "")
-        constraint_family = ""
         constraint_label = ""
         if catalog_entry:
-            constraint_family = str(catalog_entry.get("family") or "")
             constraint_label = str(catalog_entry.get("label") or "")
+
+        constraint_family, constraint_supported = canonicalize_constraint_type(constraint_type_item or "")
         if not constraint_family:
             constraint_family = "unsupported"
-        constraint_supported = constraint_family in CHECKERS
+        if constraint_family in CHECKERS:
+            constraint_supported = True
 
         constrained_property = constraint_to_property.get(constraint_id)
         if constrained_property is None:
