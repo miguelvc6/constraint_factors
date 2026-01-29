@@ -243,6 +243,9 @@ def _apply_edit(
         obj = _resolve_placeholder(getattr(row, f"{kind}_object", 0), row, placeholder_map, cast_int=cast_int)
         if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
             return
+        if not assume_complete and pred not in predicates_present.get(subj, set()):
+            missing_edits.add((subj, pred))
+            return
         if pred not in p_local:
             missing_edits.add((subj, pred))
             return
@@ -418,6 +421,7 @@ def _process_dataframe(
     factor_checkable_post: List[List[bool]] = []
     factor_satisfied_post: List[List[int]] = []
     factor_types: List[List[int]] = []
+    factor_constraint_ids: List[List[int]] = []
     num_checkable_pre: List[int] = []
     num_checkable_post: List[int] = []
     coverage_pre: List[float] = []
@@ -483,6 +487,7 @@ def _process_dataframe(
         else:
             constraint_ids_raw = getattr(row, "local_constraint_ids", None)
         local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=use_encoded_ids)
+        factor_constraint_ids.append([int(cid) for cid in local_constraint_ids])
         checkable_pre_row: List[bool] = []
         satisfied_pre_row: List[int] = []
         checkable_post_row: List[bool] = []
@@ -555,6 +560,7 @@ def _process_dataframe(
     df["factor_checkable_post_gold"] = factor_checkable_post
     df["factor_satisfied_post_gold"] = factor_satisfied_post
     df["factor_types"] = factor_types
+    df["factor_constraint_ids"] = factor_constraint_ids
     df["num_checkable_factors_pre"] = num_checkable_pre
     df["coverage_pre"] = coverage_pre
     df["num_checkable_factors_post_gold"] = num_checkable_post
