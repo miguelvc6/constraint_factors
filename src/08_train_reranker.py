@@ -422,6 +422,73 @@ def _aggregate_epoch_metrics(records: list[dict[str, float]]) -> dict[str, float
     return {key: total / len(records) for key, total in totals.items()}
 
 
+def _candidate_to_slots(candidate: Sequence[int]) -> tuple[int, int, int, int, int, int]:
+    if len(candidate) != NUM_SLOTS:
+        raise ValueError("Candidate must have 6 slots.")
+    return tuple(int(v) for v in candidate)
+
+
+def _candidate_slots_to_actions(candidate: Sequence[int]) -> dict[str, list[int]]:
+    add = list(candidate[:3])
+    delete = list(candidate[3:6])
+    return {"add": add, "del": delete}
+
+
+@torch.no_grad()
+def _predict_reranker_edits(
+    *,
+    model: CandidateReranker,
+    proposal_model: nn.Module,
+    data: Sequence[Data],
+    contexts: Sequence[ViolationContext],
+    rows: Sequence[Any],
+    heuristics: ConstraintRepairHeuristics,
+    evaluator: CandidateConstraintEvaluator,
+    device: torch.device,
+    cfg: RerankerTrainingConfig,
+) -> list[dict[str, list[int]]]:
+    model.eval()
+    proposal_model.eval()
+    predictions: list[dict[str, list[int]]] = []
+
+    loader = DataLoader(
+        data,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+    )
+
+    for batch in progress_bar(loader, desc="predict"):
+        batch = batch.to(device)
+        proposal_outputs = proposal_model(batch)
+        proposal_logits = proposal_outputs["edit_logits"].detach()
+        graph_emb = model.encode_graphs(batch)
+        graphs = batch.to_data_list()
+
+        for idx, graph in enumerate(graphs):
+            context_index = int(getattr(graph, "context_index"))
+            context = contexts[context_index]
+            row = rows[context_index]
+            candidates, _ = _build_candidates(
+                graph=graph,
+                context=context,
+                heuristics=heuristics,
+                proposal_logits=proposal_logits[idx],
+                cfg=cfg,
+                placeholder_ids=set(heuristics.placeholder_ids.values()),
+                num_target_ids=model.num_target_ids,
+            )
+            candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=device)
+            scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+            best_idx = int(torch.argmax(scores).item())
+            best_candidate = _candidate_to_slots(candidates[best_idx])
+            predictions.append(_candidate_slots_to_actions(best_candidate))
+            _ = evaluator  # keep evaluator in signature for future diagnostics
+
+    return predictions
+
+
 def _run_epoch(
     *,
     model: CandidateReranker,
@@ -755,9 +822,9 @@ def main() -> None:
                 model_path,
             )
 
-        if epoch - best_epoch >= training_cfg.early_stopping_rounds:
-            logger.info("Early stopping at epoch %s", epoch + 1)
-            break
+    if epoch - best_epoch >= training_cfg.early_stopping_rounds:
+        logger.info("Early stopping at epoch %s", epoch + 1)
+        break
 
     config_destination = config_copy_path(run_dir)
     if config_destination.resolve(strict=False) != args.experiment_config.resolve(strict=False):
@@ -766,6 +833,46 @@ def main() -> None:
     history_file = history_path(run_dir)
     with history_file.open("w", encoding="utf-8") as fh:
         json.dump(history, fh, indent=2)
+
+    # Generate reranker predictions for evaluation.
+    test_path = processed_root / f"test_graph-{model_cfg.encoding}.pkl"
+    if test_path.exists():
+        test_data = load_graph_dataset(test_path)
+        if isinstance(test_data, list):
+            test_contexts = load_violation_contexts(interim_path, "test", none_class=NONE_CLASS_INDEX)
+            if len(test_contexts) == len(test_data):
+                for idx, graph in enumerate(test_data):
+                    setattr(graph, "context_index", idx)
+                test_rows = _load_parquet_rows(interim_path, "test")
+                if len(test_rows) == len(test_data):
+                    checkpoint = torch.load(get_checkpoint_path(run_dir), map_location=device)
+                    state_dict = checkpoint.get("model_state")
+                    if state_dict is not None:
+                        model.load_state_dict(state_dict)
+                        model.to(device)
+                    predictions = _predict_reranker_edits(
+                        model=model,
+                        proposal_model=proposal_model,
+                        data=test_data,
+                        contexts=test_contexts,
+                        rows=test_rows,
+                        heuristics=heuristics,
+                        evaluator=evaluator,
+                        device=device,
+                        cfg=training_cfg,
+                    )
+                    pred_path = run_dir / "reranker_predictions.json"
+                    with pred_path.open("w", encoding="utf-8") as fh:
+                        json.dump(predictions, fh, indent=2)
+                    logger.info("Saved reranker predictions to %s", pred_path)
+                else:
+                    logger.warning("Skipping reranker predictions: test rows mismatch.")
+            else:
+                logger.warning("Skipping reranker predictions: test contexts mismatch.")
+        else:
+            logger.warning("Skipping reranker predictions: test dataset is streamed.")
+    else:
+        logger.warning("Skipping reranker predictions: test split not found at %s", test_path)
 
     logger.info("Training complete. Best val loss=%.4f", best_val)
 

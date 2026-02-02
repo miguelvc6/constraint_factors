@@ -224,6 +224,20 @@ def main() -> int:
 
     model_dirs = discover_model_directories(MODELS_ROOT)
     logger.info("Discovered %s model directories", len(model_dirs))
+    planned: list[str] = []
+    for model_dir in model_dirs:
+        config_path = model_dir / CONFIG_FILENAME
+        if not config_path.exists():
+            continue
+        try:
+            cfg = load_config(config_path)
+        except Exception:
+            continue
+        if cfg.get("disabled") is True:
+            continue
+        planned.append(model_dir.name)
+    if planned:
+        logger.info("Planned runs (first %s): %s", min(5, len(planned)), ", ".join(planned[:5]))
 
     for index, model_dir in enumerate(model_dirs, start=1):
         config_path = model_dir / CONFIG_FILENAME
@@ -358,7 +372,7 @@ def main() -> int:
             eval_flags: list[str] = []
             if args.eval_global_metrics:
                 eval_flags.append("--global-metrics")
-            if args.eval_per_constraint_csv:
+            if args.eval_per_constraint_csv or "--per-constraint-csv" not in eval_flags:
                 eval_flags.append("--per-constraint-csv")
 
             if kind == "proposal":
@@ -376,8 +390,29 @@ def main() -> int:
                     logger.error("Stopping scheduler after eval failure (use --keep-going to continue).")
                     return 1
             else:
-                logger.info("Eval command: (skipped for reranker)")
-                logger.warning("Skipping evaluation for reranker experiment %s (no reranker eval path).", model_dir.name)
+                reranker_predictions = resolved_run_dir / "reranker_predictions.json"
+                if reranker_predictions.exists():
+                    eval_command = [
+                        sys.executable,
+                        "src/09_eval.py",
+                        "--run-directory",
+                        str(resolved_run_dir),
+                        "--reranker-predictions",
+                        str(reranker_predictions),
+                    ] + eval_flags
+                    logger.info("Eval command: %s", " ".join(eval_command))
+                    evaluation = run_evaluation(resolved_run_dir, run_name, logger, extra_flags=eval_flags + ["--reranker-predictions", str(reranker_predictions)])
+                    record["evaluation"] = evaluation
+                    if evaluation.get("return_code") not in (0, None) and not args.keep_going:
+                        write_history(record)
+                        logger.error("Stopping scheduler after eval failure (use --keep-going to continue).")
+                        return 1
+                else:
+                    logger.info("Eval command: (skipped for reranker)")
+                    logger.warning(
+                        "Skipping evaluation for reranker experiment %s (missing reranker_predictions.json).",
+                        model_dir.name,
+                    )
         else:
             logger.error("Training failed for %s with return code %s", model_dir.name, return_code)
             record.update(

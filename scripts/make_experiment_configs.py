@@ -155,7 +155,7 @@ def main() -> None:
             factor_loss_enabled=True,
             pressure_enabled=True,
             fix_prob_enabled=False,
-            validate_factor_labels=True,  # good early; turn off later for speed
+            validate_factor_labels=True,  # required for factor loss + global metrics
             factor_weight_pre=0.1,
         ),
     ]
@@ -186,6 +186,14 @@ def main() -> None:
         )
 
     reranker_exps: list[RerankerExperiment] = [
+        # M1 reranker: Fix 1 (imitation + no-regression vs gold)
+        RerankerExperiment(
+            name="m1_fix1_reranker",
+            objective="main",
+            proposal_ref_config_tag="m1_main_fix1",
+            constraint_scope="local",
+            disabled=False,
+        ),
         # M2: Global Fix reranker (objective global_fix)
         RerankerExperiment(
             name="m2_global_fix_reranker",
@@ -274,6 +282,7 @@ def main() -> None:
                     "topk_per_slot": 5,
                     "include_gold": True,
                     "max_candidates_total": 80,
+                    "regression_weight": 0.5,  # beta for no-regression vs gold (Fix 1)
                 },
                 "proposal_config": {
                     # 08_train_reranker.py can resolve this using resolve_run_dir(...)
