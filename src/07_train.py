@@ -998,6 +998,7 @@ def main():
         predicate_class_ids=predicate_class_ids,
         use_role_embeddings=role_spec.enabled,
         num_role_types=role_spec.num_types if role_spec.enabled else 0,
+        num_embedding_size=feature_dim if not use_node_embeddings else model_cfg.num_embedding_size,
     )
     num_factor_types = derive_factor_type_count(train_data, val_data)
     if num_factor_types > 0:

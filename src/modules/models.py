@@ -36,6 +36,7 @@ class BaseGraphModel(nn.Module, ABC):
         predicate_class_ids: Sequence[int] | torch.Tensor | None = None,
         num_factor_types: int = 0,
         factor_type_embedding_dim: int = 8,
+        pressure_enabled: bool = False,
     ):
         super().__init__()
         self._num_input_graph_nodes = int(num_input_graph_nodes)
@@ -325,13 +326,21 @@ class BaseGraphModel(nn.Module, ABC):
             factor_hidden = F.relu(self.shared_projection(factor_node_emb))
             factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
             factor_type_embeddings = self.factor_type_embeddings
-            if factor_type_embeddings is not None and factor_types is not None:
-                factor_types_tensor = torch.as_tensor(
-                    factor_types, dtype=torch.long, device=graph_emb.device
-                ).view(-1)
-                factor_type_emb = factor_type_embeddings(
-                    factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
-                )
+            if factor_type_embeddings is not None:
+                if factor_types is not None:
+                    factor_types_tensor = torch.as_tensor(
+                        factor_types, dtype=torch.long, device=graph_emb.device
+                    ).view(-1)
+                    factor_type_emb = factor_type_embeddings(
+                        factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
+                    )
+                else:
+                    factor_type_emb = torch.zeros(
+                        factor_hidden.size(0),
+                        self._factor_type_embedding_dim,
+                        device=factor_hidden.device,
+                        dtype=factor_hidden.dtype,
+                    )
                 factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
             factor_logits_pre = self.factor_pre_head(factor_hidden).squeeze(-1)
 
@@ -453,34 +462,72 @@ class RepairGINFactorPressure(BaseGraphModel):
     def _apply_pressure(self, x: torch.Tensor, data) -> torch.Tensor:
         if not self._pressure_enabled:
             return x
-        edge_type = getattr(data, "edge_type", None)
         edge_index = getattr(data, "edge_index", None)
-        if edge_type is None or edge_index is None:
+        if edge_index is None:
             return x
-        edge_type = edge_type.to(device=x.device)
         edge_index = edge_index.to(device=x.device)
-        mask = (
-            (edge_type == self.EDGE_FACTOR_TO_LOCAL_PREDICATE)
-            | (edge_type == self.EDGE_FACTOR_TO_LOCAL_SUBJECT)
-            | (edge_type == self.EDGE_FACTOR_TO_LOCAL_OBJECT)
-        )
-        if not mask.any():
-            return x
-        src = edge_index[0, mask]
-        dst = edge_index[1, mask]
-        if src.numel() == 0:
-            return x
+        edge_type = getattr(data, "edge_type", None)
+
+        role_emb = None
+        if edge_type is not None:
+            edge_type = edge_type.to(device=x.device)
+            mask = (
+                (edge_type == self.EDGE_FACTOR_TO_LOCAL_PREDICATE)
+                | (edge_type == self.EDGE_FACTOR_TO_LOCAL_SUBJECT)
+                | (edge_type == self.EDGE_FACTOR_TO_LOCAL_OBJECT)
+            )
+            if mask.any():
+                src = edge_index[0, mask]
+                dst = edge_index[1, mask]
+                if src.numel() == 0:
+                    return x
+
+                role_map = torch.full_like(edge_type, 0)
+                role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_PREDICATE] = 0
+                role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_SUBJECT] = 1
+                role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_OBJECT] = 2
+                role_ids = role_map[mask]
+                role_emb = self._pressure_role_embeddings(role_ids)
+            else:
+                edge_type = None
+
+        if edge_type is None:
+            factor_node_index = getattr(data, "factor_node_index", None)
+            factor_node_mask = getattr(data, "is_factor_node", None)
+            if factor_node_index is not None:
+                factor_nodes = torch.as_tensor(
+                    factor_node_index, device=x.device, dtype=torch.long
+                ).view(-1)
+            elif factor_node_mask is not None:
+                factor_node_mask = torch.as_tensor(
+                    factor_node_mask, device=x.device, dtype=torch.bool
+                ).view(-1)
+                if factor_node_mask.numel() != x.size(0):
+                    return x
+                factor_nodes = torch.nonzero(factor_node_mask, as_tuple=False).view(-1)
+            else:
+                return x
+
+            if factor_nodes.numel() == 0:
+                return x
+
+            src = edge_index[0]
+            dst = edge_index[1]
+            mask = torch.isin(src, factor_nodes)
+            if not mask.any():
+                return x
+            src = src[mask]
+            dst = dst[mask]
+            role_emb = torch.zeros(
+                src.size(0),
+                self._pressure_role_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
 
         h_c = x.index_select(0, src)
         h_v = x.index_select(0, dst)
         viol = torch.sigmoid(self._pressure_violation_head(h_c))
-
-        role_map = torch.full_like(edge_type, 0)
-        role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_PREDICATE] = 0
-        role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_SUBJECT] = 1
-        role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_OBJECT] = 2
-        role_ids = role_map[mask]
-        role_emb = self._pressure_role_embeddings(role_ids)
 
         message_input = torch.cat([h_c, h_v, role_emb, viol], dim=-1)
         messages = self._pressure_mlp(message_input)
@@ -605,13 +652,21 @@ class RepairGINFactorPressure(BaseGraphModel):
             factor_hidden = F.relu(self.shared_projection(factor_node_emb))
             factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
             factor_type_embeddings = self.factor_type_embeddings
-            if factor_type_embeddings is not None and factor_types is not None:
-                factor_types_tensor = torch.as_tensor(
-                    factor_types, dtype=torch.long, device=graph_emb.device
-                ).view(-1)
-                factor_type_emb = factor_type_embeddings(
-                    factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
-                )
+            if factor_type_embeddings is not None:
+                if factor_types is not None:
+                    factor_types_tensor = torch.as_tensor(
+                        factor_types, dtype=torch.long, device=graph_emb.device
+                    ).view(-1)
+                    factor_type_emb = factor_type_embeddings(
+                        factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
+                    )
+                else:
+                    factor_type_emb = torch.zeros(
+                        factor_hidden.size(0),
+                        self._factor_type_embedding_dim,
+                        device=factor_hidden.device,
+                        dtype=factor_hidden.dtype,
+                    )
                 factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
             factor_logits_pre = self.factor_pre_head(factor_hidden).squeeze(-1)
 
