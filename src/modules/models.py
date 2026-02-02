@@ -37,6 +37,7 @@ class BaseGraphModel(nn.Module, ABC):
         num_factor_types: int = 0,
         factor_type_embedding_dim: int = 8,
         pressure_enabled: bool = False,
+        pressure_type_conditioning: str = "none",
     ):
         super().__init__()
         self._num_input_graph_nodes = int(num_input_graph_nodes)
@@ -147,6 +148,7 @@ class BaseGraphModel(nn.Module, ABC):
         self._num_layers = int(num_layers)
         self._num_factor_types = int(num_factor_types)
         self._factor_type_embedding_dim = int(factor_type_embedding_dim)
+        self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
         if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0:
             self.factor_type_embeddings = nn.Embedding(
                 self._num_factor_types, self._factor_type_embedding_dim
@@ -417,17 +419,40 @@ class RepairGINFactorPressure(BaseGraphModel):
     EDGE_FACTOR_TO_LOCAL_SUBJECT = 5
     EDGE_FACTOR_TO_LOCAL_OBJECT = 6
 
-    def __init__(self, *args, pressure_enabled: bool = False, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        *args,
+        pressure_enabled: bool = False,
+        pressure_type_conditioning: str = "none",
+        **kwargs,
+    ):
+        super().__init__(*args, pressure_type_conditioning=pressure_type_conditioning, **kwargs)
         self._pressure_enabled = bool(pressure_enabled)
+        self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
+        if self._pressure_type_conditioning not in {"none", "concat", "gate"}:
+            raise ValueError(
+                "pressure_type_conditioning must be 'none', 'concat', or 'gate'"
+            )
         self._pressure_role_dim = 8
         self._pressure_role_embeddings = nn.Embedding(3, self._pressure_role_dim)
         self._pressure_violation_head = nn.Linear(self.hidden_channels, 1)
+        self._pressure_type_dim = (
+            self._factor_type_embedding_dim if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0 else 0
+        )
+        base_pressure_in = self.hidden_channels * 2 + self._pressure_role_dim + 1
+        if self._pressure_type_conditioning == "concat" and self._pressure_type_dim > 0:
+            pressure_in = base_pressure_in + self._pressure_type_dim
+        else:
+            pressure_in = base_pressure_in
         self._pressure_mlp = nn.Sequential(
-            nn.Linear(self.hidden_channels * 2 + self._pressure_role_dim + 1, self.hidden_channels),
+            nn.Linear(pressure_in, self.hidden_channels),
             nn.ReLU(),
             nn.Linear(self.hidden_channels, self.hidden_channels),
         )
+        if self._pressure_type_conditioning == "gate" and self._pressure_type_dim > 0:
+            self._pressure_type_gate = nn.Linear(self._pressure_type_dim, self.hidden_channels)
+        else:
+            self._pressure_type_gate = None
 
     def create_conv_layer(self, in_channels: int, out_channels: int):
         if self.use_edge_attributes:
@@ -458,6 +483,7 @@ class RepairGINFactorPressure(BaseGraphModel):
         edge_type = getattr(data, "edge_type", None)
 
         role_emb = None
+        type_emb = None
         if edge_type is not None:
             edge_type = edge_type.to(device=x.device)
             mask = (
@@ -514,12 +540,40 @@ class RepairGINFactorPressure(BaseGraphModel):
                 dtype=x.dtype,
             )
 
+        if self._pressure_type_conditioning != "none" and self.factor_type_embeddings is not None:
+            factor_types = getattr(data, "factor_types", None)
+            factor_node_index = getattr(data, "factor_node_index", None)
+            if factor_types is not None and factor_node_index is not None:
+                factor_types_tensor = torch.as_tensor(
+                    factor_types, dtype=torch.long, device=x.device
+                ).view(-1)
+                factor_node_index = torch.as_tensor(
+                    factor_node_index, dtype=torch.long, device=x.device
+                ).view(-1)
+                if factor_types_tensor.numel() == factor_node_index.numel() and factor_node_index.numel() > 0:
+                    type_ids = torch.full(
+                        (x.size(0),),
+                        -1,
+                        device=x.device,
+                        dtype=torch.long,
+                    )
+                    type_ids.index_copy_(0, factor_node_index, factor_types_tensor)
+                    src_type_ids = type_ids.index_select(0, src).clamp(
+                        min=0, max=self._num_factor_types - 1
+                    )
+                    type_emb = self.factor_type_embeddings(src_type_ids)
+
         h_c = x.index_select(0, src)
         h_v = x.index_select(0, dst)
         viol = torch.sigmoid(self._pressure_violation_head(h_c))
 
         message_input = torch.cat([h_c, h_v, role_emb, viol], dim=-1)
+        if self._pressure_type_conditioning == "concat" and type_emb is not None:
+            message_input = torch.cat([message_input, type_emb], dim=-1)
         messages = self._pressure_mlp(message_input)
+        if self._pressure_type_conditioning == "gate" and type_emb is not None:
+            gate = torch.sigmoid(self._pressure_type_gate(type_emb))
+            messages = messages * gate
         x = x + torch.zeros_like(x).index_add(0, dst, messages)
         return x
 
@@ -774,6 +828,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         num_factor_types=config.num_factor_types,
         factor_type_embedding_dim=config.factor_type_embedding_dim,
         pressure_enabled=config.pressure_enabled,
+        pressure_type_conditioning=getattr(config, "pressure_type_conditioning", "none"),
     )
 
 

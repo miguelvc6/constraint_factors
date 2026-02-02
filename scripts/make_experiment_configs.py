@@ -99,6 +99,7 @@ class ProposalExperiment:
     model_name: str
     factor_loss_enabled: bool
     pressure_enabled: bool
+    pressure_type_conditioning: str
     fix_prob_enabled: bool
     validate_factor_labels: bool = False
     factor_weight_pre: float = 0.1
@@ -145,6 +146,7 @@ def main() -> None:
             model_name="GIN",
             factor_loss_enabled=False,
             pressure_enabled=False,
+            pressure_type_conditioning="none",
             fix_prob_enabled=True,
             validate_factor_labels=False,
         ),
@@ -154,6 +156,7 @@ def main() -> None:
             model_name="GIN_PRESSURE",
             factor_loss_enabled=True,
             pressure_enabled=True,
+            pressure_type_conditioning="concat",
             fix_prob_enabled=False,
             validate_factor_labels=True,  # required for factor loss + global metrics
             factor_weight_pre=0.1,
@@ -168,6 +171,7 @@ def main() -> None:
                 model_name="GIN",
                 factor_loss_enabled=True,
                 pressure_enabled=False,
+                pressure_type_conditioning="none",
                 fix_prob_enabled=False,
                 validate_factor_labels=True,
                 factor_weight_pre=0.1,
@@ -180,8 +184,34 @@ def main() -> None:
                 model_name="GIN_PRESSURE",
                 factor_loss_enabled=False,
                 pressure_enabled=True,
+                pressure_type_conditioning="none",
                 fix_prob_enabled=False,
                 validate_factor_labels=False,
+            )
+        )
+        # Ablation: pressure typed vs untyped (keep loss same as main model)
+        proposal_exps.append(
+            ProposalExperiment(
+                name="a3_pressure_untyped",
+                model_name="GIN_PRESSURE",
+                factor_loss_enabled=True,
+                pressure_enabled=True,
+                pressure_type_conditioning="none",
+                fix_prob_enabled=False,
+                validate_factor_labels=True,
+                factor_weight_pre=0.1,
+            )
+        )
+        proposal_exps.append(
+            ProposalExperiment(
+                name="a4_pressure_typed",
+                model_name="GIN_PRESSURE",
+                factor_loss_enabled=True,
+                pressure_enabled=True,
+                pressure_type_conditioning="concat",
+                fix_prob_enabled=False,
+                validate_factor_labels=True,
+                factor_weight_pre=0.1,
             )
         )
 
@@ -238,6 +268,7 @@ def main() -> None:
                     # The following keys are only used if present in your current ModelConfig:
                     "num_factor_types": int(num_factor_types),
                     "pressure_enabled": bool(exp.pressure_enabled),
+                    "pressure_type_conditioning": exp.pressure_type_conditioning,
                     # optional: "factor_type_embedding_dim": 16,
                 },
                 "training_config": {

@@ -264,6 +264,8 @@ class ModelConfig:
     """Embedding dim for factor type conditioning."""
     pressure_enabled: bool = False
     """Toggle factor pressure injection during message passing."""
+    pressure_type_conditioning: str = "none"
+    """Condition pressure messages on factor types: none|concat|gate."""
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ModelConfig":
@@ -299,6 +301,11 @@ class ModelConfig:
             filtered["factor_type_embedding_dim"] = int(filtered["factor_type_embedding_dim"])
         if "pressure_enabled" in filtered and filtered["pressure_enabled"] is not None:
             filtered["pressure_enabled"] = bool(filtered["pressure_enabled"])
+        if "pressure_type_conditioning" in filtered and filtered["pressure_type_conditioning"] is not None:
+            value = str(filtered["pressure_type_conditioning"]).lower()
+            if value not in {"none", "concat", "gate"}:
+                raise ValueError("pressure_type_conditioning must be 'none', 'concat', or 'gate'")
+            filtered["pressure_type_conditioning"] = value
 
         current = asdict(self)
         current.update(filtered)
