@@ -264,6 +264,7 @@ class TrainingConfig:
     scheduler_patience: int = 3  # Epochs with no improvement before lowering LR.
     num_workers: int = 0  # Worker processes used by DataLoader.
     pin_memory: bool | None = None  # Override DataLoader pin_memory behaviour (None keeps the default).
+    validate_factor_labels: bool = False  # Enable strict factor label assertions per batch.
     constraint_loss: ConstraintLossConfig = field(default_factory=ConstraintLossConfig)
     fix_probability_loss: FixProbabilityLossConfig = field(default_factory=FixProbabilityLossConfig)
 

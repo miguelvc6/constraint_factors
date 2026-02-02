@@ -54,6 +54,17 @@ ENTITY_SLOT_INDICES: tuple[int, ...] = (0, 2, 3, 5)
 PREDICATE_SLOT_INDICES: tuple[int, ...] = (1, 4)
 
 
+# Implementation checklist (factor supervision):
+# - In train() and validation loops, insert factor-level losses after graph_loss is computed
+#   and before dynamic reweighting (and before weighted_loss is averaged).
+# - Reuse per-graph loss vectors (graph_loss) for weighting; add factor losses as per-graph
+#   scalars to preserve the same averaging and dynamic constraint weighting path.
+# - Use factor label tensors on Data (factor_* fields) aligned to factor_constraint_ids;
+#   primary_factor_index identifies the violated constraint within each graph.
+# - Mask factor losses with factor_checkable_* to avoid penalizing uncheckable factors.
+# - Keep fix-probability loss term order: slot loss -> optional fix loss -> factor losses -> reweight.
+
+
 def derive_target_class_ids(
     *datasets: list[Data] | GraphStreamDataset | None,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -93,6 +104,53 @@ def derive_target_class_ids(
     predicate_sorted = tuple(sorted(predicate_ids))
 
     return entity_sorted, predicate_sorted
+
+
+def _assert_factor_labels(graph: Data, graph_index: int | None = None) -> None:
+    prefix = f"graph[{graph_index}] " if graph_index is not None else ""
+
+    factor_ids = getattr(graph, "factor_constraint_ids", None)
+    assert factor_ids is not None, f"{prefix}missing factor_constraint_ids"
+    factor_ids_tensor = torch.as_tensor(factor_ids).view(-1)
+    assert factor_ids_tensor.numel() > 0, f"{prefix}factor_constraint_ids must be non-empty"
+    expected_len = int(factor_ids_tensor.numel())
+
+    primary_idx = getattr(graph, "primary_factor_index", None)
+    assert primary_idx is not None, f"{prefix}missing primary_factor_index"
+    if torch.is_tensor(primary_idx):
+        if primary_idx.numel() != 1:
+            raise AssertionError(f"{prefix}primary_factor_index must be scalar; got {tuple(primary_idx.shape)}")
+        primary_idx = int(primary_idx.item())
+    else:
+        primary_idx = int(primary_idx)
+    assert 0 <= primary_idx < expected_len, (
+        f"{prefix}primary_factor_index {primary_idx} out of range for {expected_len} factors"
+    )
+
+    def _check_vector(name: str, *, expect_bool: bool = False, expect_int: bool = False) -> torch.Tensor:
+        value = getattr(graph, name, None)
+        assert value is not None, f"{prefix}missing {name}"
+        tensor = torch.as_tensor(value).view(-1)
+        assert tensor.numel() == expected_len, (
+            f"{prefix}{name} length {tensor.numel()} does not match factor_constraint_ids {expected_len}"
+        )
+        if expect_bool:
+            assert tensor.dtype == torch.bool, f"{prefix}{name} must be bool, got {tensor.dtype}"
+        if expect_int:
+            assert not torch.is_floating_point(tensor), f"{prefix}{name} must be integer dtype"
+        return tensor
+
+    _check_vector("factor_checkable_pre", expect_bool=True)
+    _check_vector("factor_checkable_post_gold", expect_bool=True)
+    _check_vector("factor_satisfied_pre", expect_int=True)
+    _check_vector("factor_satisfied_post_gold", expect_int=True)
+    _check_vector("factor_types", expect_int=True)
+
+
+def _assert_factor_labels_batch(data: Data) -> None:
+    graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
+    for idx, graph in enumerate(graphs):
+        _assert_factor_labels(graph, idx)
 
 
 def train(
@@ -227,6 +285,8 @@ def train(
         data_iter = progress_bar(train_loader, desc="Training Batches", leave=False)
         for batch_idx, data in enumerate(data_iter, start=1):
             data = data.to(device, non_blocking=True)
+            if train_cfg.validate_factor_labels:
+                _assert_factor_labels_batch(data)
             targets = data.y.long()
 
             # Validation checks
@@ -386,6 +446,8 @@ def train(
                 start=1,
             ):
                 data = data.to(device, non_blocking=True)
+                if train_cfg.validate_factor_labels:
+                    _assert_factor_labels_batch(data)
                 targets = data.y.long()
 
                 out = model(data)

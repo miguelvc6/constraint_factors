@@ -115,11 +115,16 @@ re-run.
 - `primary_factor_index`: index of the violated constraint in `factor_constraint_ids`
 - `factor_constraint_types`: list of constraint family labels (debug)
 - `factor_wiring_debug` (optional): wiring diagnostics when `--debug-factor-wiring` is enabled
+- `context_index` (optional): integer index into violation contexts, attached at training time when fix-probability loss is enabled
 
 `target_vocabs.json` contains:
 - `entity_class_ids`
 - `predicate_class_ids`
 - `per_split` (per-split versions of the above)
+
+**Notes**
+- Factor label tensors (`factor_checkable_*`, `factor_satisfied_*`, `factor_types`) are 1-D and must align with
+  `factor_constraint_ids` length; `primary_factor_index` is an index into that list.
 
 ## 7) Labeled Constraint Factors (`05_constraint_labeler.py`)
 **Location:** `data/interim/<variant>_labeled/`
