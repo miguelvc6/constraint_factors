@@ -409,6 +409,213 @@ class RepairGIN(BaseGraphModel):
             )
 
 
+class RepairGINFactorPressure(BaseGraphModel):
+    EDGE_FACTOR_TO_LOCAL_PREDICATE = 4
+    EDGE_FACTOR_TO_LOCAL_SUBJECT = 5
+    EDGE_FACTOR_TO_LOCAL_OBJECT = 6
+
+    def __init__(self, *args, pressure_enabled: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pressure_enabled = bool(pressure_enabled)
+        self._pressure_role_dim = 8
+        self._pressure_role_embeddings = nn.Embedding(3, self._pressure_role_dim)
+        self._pressure_violation_head = nn.Linear(self.hidden_channels, 1)
+        self._pressure_mlp = nn.Sequential(
+            nn.Linear(self.hidden_channels * 2 + self._pressure_role_dim + 1, self.hidden_channels),
+            nn.ReLU(),
+            nn.Linear(self.hidden_channels, self.hidden_channels),
+        )
+
+    def create_conv_layer(self, in_channels: int, out_channels: int):
+        if self.use_edge_attributes:
+            return GINEConv(
+                Sequential(
+                    Linear(in_channels, out_channels),
+                    ReLU(),
+                    BN(out_channels),
+                    Linear(out_channels, out_channels),
+                )
+            )
+        return GINConv(
+            Sequential(
+                Linear(in_channels, out_channels),
+                ReLU(),
+                BN(out_channels),
+                Linear(out_channels, out_channels),
+            )
+        )
+
+    def _apply_pressure(self, x: torch.Tensor, data) -> torch.Tensor:
+        if not self._pressure_enabled:
+            return x
+        edge_type = getattr(data, "edge_type", None)
+        edge_index = getattr(data, "edge_index", None)
+        if edge_type is None or edge_index is None:
+            return x
+        edge_type = edge_type.to(device=x.device)
+        edge_index = edge_index.to(device=x.device)
+        mask = (
+            (edge_type == self.EDGE_FACTOR_TO_LOCAL_PREDICATE)
+            | (edge_type == self.EDGE_FACTOR_TO_LOCAL_SUBJECT)
+            | (edge_type == self.EDGE_FACTOR_TO_LOCAL_OBJECT)
+        )
+        if not mask.any():
+            return x
+        src = edge_index[0, mask]
+        dst = edge_index[1, mask]
+        if src.numel() == 0:
+            return x
+
+        h_c = x.index_select(0, src)
+        h_v = x.index_select(0, dst)
+        viol = torch.sigmoid(self._pressure_violation_head(h_c))
+
+        role_map = torch.full_like(edge_type, 0)
+        role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_PREDICATE] = 0
+        role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_SUBJECT] = 1
+        role_map[edge_type == self.EDGE_FACTOR_TO_LOCAL_OBJECT] = 2
+        role_ids = role_map[mask]
+        role_emb = self._pressure_role_embeddings(role_ids)
+
+        message_input = torch.cat([h_c, h_v, role_emb, viol], dim=-1)
+        messages = self._pressure_mlp(message_input)
+        x = x + torch.zeros_like(x).index_add(0, dst, messages)
+        return x
+
+    def forward(self, data):
+        x, batch = data.x, data.batch
+        if self.use_edge_attributes:
+            edge_index = data.edge_index_non_flattened
+            edge_attr = data.edge_attr_non_flattened
+        else:
+            edge_index = data.edge_index
+            edge_attr = None
+
+        if self._use_node_embeddings:
+            if x.dtype not in (torch.long, torch.int64, torch.int32):
+                x = x.long()
+            x = self.node_embeddings(x)
+        else:
+            if not torch.is_floating_point(x):
+                x = x.float()
+            if x.dtype != torch.float32:
+                x = x.to(torch.float32)
+
+        if self._use_role_embeddings:
+            role_flags = getattr(data, "role_flags", None)
+            if role_flags is None:
+                role_flags = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            else:
+                role_flags = role_flags.view(-1)
+                if role_flags.size(0) != x.size(0):
+                    raise ValueError(
+                        f"role_flags length {role_flags.size(0)} does not match node feature rows {x.size(0)}"
+                    )
+                if role_flags.dtype != torch.long:
+                    role_flags = role_flags.to(dtype=torch.long)
+                if role_flags.device != x.device:
+                    role_flags = role_flags.to(device=x.device)
+            role_features = self.role_embeddings(role_flags)
+            x = torch.cat([x, role_features], dim=-1)
+
+        x = self.initialization(x)
+        for conv in self.mp_layers:
+            x = F.dropout(x, p=self._dropout, training=self.training)
+            if self.use_edge_attributes:
+                edge_features = self.edge_mlp(x[edge_attr])
+                if self.use_edge_subtraction:
+                    inverse_edge_indices = edge_index.flip(0)
+                    inverse_edge_features = -edge_features
+                    edge_index_forward = torch.cat([edge_index, inverse_edge_indices], dim=1)
+                    edge_features_forward = torch.cat(
+                        [edge_features, inverse_edge_features], dim=0
+                    )
+                else:
+                    edge_index_forward = edge_index
+                    edge_features_forward = edge_features
+                x = conv(x, edge_index_forward, edge_attr=edge_features_forward)
+            else:
+                x = conv(x, edge_index)
+            x = self._apply_pressure(x, data)
+
+        node_emb = x
+        graph_emb = global_mean_pool(x, batch)
+
+        shared = F.relu(self.shared_projection(graph_emb))
+        shared = F.dropout(shared, p=self._dropout, training=self.training)
+
+        subject_features = self.subject_branch(shared)
+        subject_features = F.dropout(subject_features, p=self._dropout, training=self.training)
+
+        object_features = self.object_branch(shared)
+        object_features = F.dropout(object_features, p=self._dropout, training=self.training)
+
+        predicate_features = self.predicate_branch(shared)
+        predicate_features = F.dropout(predicate_features, p=self._dropout, training=self.training)
+
+        y_add_s = self._expand_entity_logits(self.subject_add_head(subject_features))
+        y_del_s = self._expand_entity_logits(self.subject_del_head(subject_features))
+
+        y_add_o = self._expand_entity_logits(self.object_add_head(object_features))
+        y_del_o = self._expand_entity_logits(self.object_del_head(object_features))
+
+        y_add_p = self._expand_predicate_logits(self.predicate_add_head(predicate_features))
+        y_del_p = self._expand_predicate_logits(self.predicate_del_head(predicate_features))
+
+        prediction = torch.stack([y_add_s, y_add_p, y_add_o, y_del_s, y_del_p, y_del_o], dim=1)
+        assert prediction.shape == (
+            graph_emb.shape[0],
+            6,
+            self.num_target_ids,
+        ), f"Expected {(graph_emb.shape[0], 6, self.num_target_ids)}, got {prediction.shape}"
+
+        factor_logits_pre = None
+        factor_mask_pre = None
+        factor_graph_index = None
+        factor_checkable = getattr(data, "factor_checkable_pre", None)
+        factor_node_index = getattr(data, "factor_node_index", None)
+        factor_node_mask = getattr(data, "is_factor_node", None)
+        factor_types = getattr(data, "factor_types", None)
+
+        if factor_checkable is not None:
+            factor_mask_pre = torch.as_tensor(
+                factor_checkable, dtype=torch.bool, device=graph_emb.device
+            ).view(-1)
+
+        if factor_node_index is not None:
+            factor_node_index = torch.as_tensor(factor_node_index, device=graph_emb.device).view(-1)
+            factor_node_emb = node_emb.index_select(0, factor_node_index)
+            factor_graph_index = batch.index_select(0, factor_node_index)
+        elif factor_node_mask is not None:
+            factor_node_mask = torch.as_tensor(factor_node_mask, dtype=torch.bool, device=graph_emb.device).view(-1)
+            factor_node_emb = node_emb[factor_node_mask]
+            factor_graph_index = batch[factor_node_mask]
+        else:
+            factor_node_emb = None
+
+        if factor_node_emb is not None and factor_node_emb.numel() > 0:
+            factor_hidden = F.relu(self.shared_projection(factor_node_emb))
+            factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
+            if self.factor_type_embeddings is not None and factor_types is not None:
+                factor_types_tensor = torch.as_tensor(
+                    factor_types, dtype=torch.long, device=graph_emb.device
+                ).view(-1)
+                factor_type_emb = self.factor_type_embeddings(
+                    factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
+                )
+                factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
+            factor_logits_pre = self.factor_pre_head(factor_hidden).squeeze(-1)
+
+        return {
+            "edit_logits": prediction,
+            "node_emb": node_emb,
+            "graph_emb": graph_emb,
+            "factor_logits_pre": factor_logits_pre,
+            "factor_mask_pre": factor_mask_pre,
+            "factor_graph_index": factor_graph_index,
+        }
+
+
 class RepairGCN(BaseGraphModel):
     def create_conv_layer(self, in_channels: int, out_channels: int):
         assert not self.use_edge_attributes, "GCNConv does not support edge attributes."
@@ -418,6 +625,7 @@ class RepairGCN(BaseGraphModel):
 MODEL_REGISTRY: dict[str, Callable[..., BaseGraphModel]] = {
     "GAT": RepairGAT,
     "GIN": RepairGIN,
+    "GIN_PRESSURE": RepairGINFactorPressure,
     "GCN": RepairGCN,
 }
 
@@ -445,6 +653,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         predicate_class_ids=config.predicate_class_ids,
         num_factor_types=config.num_factor_types,
         factor_type_embedding_dim=config.factor_type_embedding_dim,
+        pressure_enabled=config.pressure_enabled,
     )
 
 
@@ -452,6 +661,7 @@ __all__ = [
     "BaseGraphModel",
     "RepairGAT",
     "RepairGIN",
+    "RepairGINFactorPressure",
     "RepairGCN",
     "build_model",
     "MODEL_REGISTRY",

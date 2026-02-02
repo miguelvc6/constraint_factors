@@ -262,6 +262,8 @@ class ModelConfig:
     """Number of distinct factor type ids (0 disables type conditioning)."""
     factor_type_embedding_dim: int = 8
     """Embedding dim for factor type conditioning."""
+    pressure_enabled: bool = False
+    """Toggle factor pressure injection during message passing."""
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ModelConfig":
@@ -295,6 +297,8 @@ class ModelConfig:
             filtered["num_factor_types"] = int(filtered["num_factor_types"])
         if "factor_type_embedding_dim" in filtered and filtered["factor_type_embedding_dim"] is not None:
             filtered["factor_type_embedding_dim"] = int(filtered["factor_type_embedding_dim"])
+        if "pressure_enabled" in filtered and filtered["pressure_enabled"] is not None:
+            filtered["pressure_enabled"] = bool(filtered["pressure_enabled"])
 
         current = asdict(self)
         current.update(filtered)
