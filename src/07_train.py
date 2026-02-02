@@ -6,6 +6,7 @@ import logging
 import shutil
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import torch
 from torch.utils.data import IterableDataset
@@ -27,7 +28,7 @@ from modules.model_store import (
     history_path,
 )
 from modules.models import BaseGraphModel, build_model
-from modules.repair_eval import ConstraintRepairHeuristics, load_violation_contexts
+from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
 from modules.training_utils import (
     ConstraintMetricsAccumulator,
     DynamicConstraintWeighter,
@@ -208,11 +209,8 @@ def _log_factor_debug(
         if factor_ids is None:
             continue
         factor_ids = torch.as_tensor(factor_ids).view(-1)
-        primary_idx = getattr(graphs[graph_idx], "primary_factor_index", None)
-        try:
-            primary_idx = int(primary_idx)
-        except Exception:
-            primary_idx = None
+        primary_idx_raw = getattr(graphs[graph_idx], "primary_factor_index", None)
+        primary_idx = int(primary_idx_raw) if primary_idx_raw is not None else None
         entries = []
         for rank, (score, local_idx) in enumerate(zip(values.tolist(), indices.tolist()), start=1):
             global_factor_idx = int(local_idx)
@@ -242,15 +240,16 @@ def train(
         device = torch.device(device)
 
     # Optional fix-probability regulariser state (scheduler, heuristics, contexts).
-    fix_scheduler = fix_heuristics = train_contexts = val_contexts = None
+    fix_scheduler: FixProbabilityScheduler | None = None
+    fix_heuristics: ConstraintRepairHeuristics | None = None
+    train_contexts: list[ViolationContext] | None = None
+    val_contexts: list[ViolationContext] | None = None
 
     if fix_loss_state:
-        fix_scheduler, fix_heuristics, train_contexts, val_contexts = (
-            fix_loss_state.get("scheduler"),
-            fix_loss_state.get("heuristics"),
-            fix_loss_state.get("train_contexts"),
-            fix_loss_state.get("val_contexts"),
-        )
+        fix_scheduler = cast(FixProbabilityScheduler | None, fix_loss_state.get("scheduler"))
+        fix_heuristics = cast(ConstraintRepairHeuristics | None, fix_loss_state.get("heuristics"))
+        train_contexts = cast(list[ViolationContext] | None, fix_loss_state.get("train_contexts"))
+        val_contexts = cast(list[ViolationContext] | None, fix_loss_state.get("val_contexts"))
 
     # Unpack training configuration.
     batch_size = train_cfg.batch_size
@@ -287,14 +286,14 @@ def train(
     train_is_iterable = isinstance(train_data, IterableDataset)
 
     train_loader = DataLoader(
-        train_data,
+        cast(Any, train_data),
         batch_size=batch_size,
         shuffle=(not train_is_iterable),
         pin_memory=pin_memory,
         num_workers=train_cfg.num_workers,
     )
     val_loader = DataLoader(
-        val_data,
+        cast(Any, val_data),
         batch_size=batch_size,
         shuffle=False,
         pin_memory=pin_memory,
@@ -334,7 +333,7 @@ def train(
     best_model_state = None
 
     # Rolling training history for logging + persistence.
-    history = {
+    history: dict[str, Any] = {
         "train_loss": [],
         "val_loss": [],
         "train_acc_all6": [],

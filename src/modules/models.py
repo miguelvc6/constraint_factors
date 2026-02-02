@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import BatchNorm1d as BN
 from torch.nn import Linear, ReLU, Sequential
-from torch_geometric.nn import GATConv, GCNConv, GINConv, GINEConv, global_mean_pool, MLP
+from torch_geometric.nn import GATConv, GCNConv, GINConv, GINEConv, global_mean_pool
 
 from .config import ModelConfig
 
@@ -110,9 +110,9 @@ class BaseGraphModel(nn.Module, ABC):
 
         self._num_target_ids = -1
         if predicate_class_ids is not None:
-            self._num_target_ids = max(predicate_class_ids) + 1
+            self._num_target_ids = int(max(predicate_class_ids)) + 1
         if entity_class_ids is not None:
-            self._num_target_ids = max(self._num_target_ids, max(entity_class_ids) + 1)
+            self._num_target_ids = max(self._num_target_ids, int(max(entity_class_ids)) + 1)
 
         # If still -1, set to num_input_graph_nodes
         if self._num_target_ids == -1:
@@ -126,6 +126,8 @@ class BaseGraphModel(nn.Module, ABC):
         )
         self.register_buffer("entity_class_ids", entity_ids_tensor)
         self.register_buffer("predicate_class_ids", predicate_ids_tensor)
+        self.entity_class_ids: torch.Tensor
+        self.predicate_class_ids: torch.Tensor
         self._entity_full_vocab = bool(entity_is_full_vocab)
         self._predicate_full_vocab = bool(predicate_is_full_vocab)
 
@@ -160,11 +162,11 @@ class BaseGraphModel(nn.Module, ABC):
 
     @property
     def num_input_graph_nodes(self) -> int:
-        return self._num_input_graph_nodes
+        return int(self._num_input_graph_nodes)
     
     @property
     def num_target_ids(self) -> int:
-        return self._num_target_ids
+        return int(self._num_target_ids)
 
     @property
     def hidden_channels(self) -> int:
@@ -217,7 +219,8 @@ class BaseGraphModel(nn.Module, ABC):
                 x = x.to(torch.float32)
 
         # Preppend role embeddings for subject/predicate/object roles
-        if self._use_role_embeddings:
+        role_embeddings = self.role_embeddings
+        if self._use_role_embeddings and role_embeddings is not None:
             role_flags = getattr(data, "role_flags", None)
             if role_flags is None:
                 role_flags = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
@@ -231,7 +234,7 @@ class BaseGraphModel(nn.Module, ABC):
                     role_flags = role_flags.to(dtype=torch.long)
                 if role_flags.device != x.device:
                     role_flags = role_flags.to(device=x.device)
-            role_features = self.role_embeddings(role_flags)
+            role_features = role_embeddings(role_flags)
             x = torch.cat([x, role_features], dim=-1)
 
         # Forward pass through the model
@@ -240,7 +243,9 @@ class BaseGraphModel(nn.Module, ABC):
         for conv in self.mp_layers:
             x = F.dropout(x, p=self._dropout, training=self.training)
             if self.use_edge_attributes:
-                edge_features = self.edge_mlp(x[edge_attr])
+                edge_mlp = self.edge_mlp
+                assert edge_mlp is not None
+                edge_features = edge_mlp(x[edge_attr])
                 if self.use_edge_subtraction:
                     # TODO: Verify that this is correct, and helps the model.
                     #  An alternative implementation could learn a seperate MLP for inverse edges.
@@ -319,11 +324,12 @@ class BaseGraphModel(nn.Module, ABC):
         if factor_node_emb is not None and factor_node_emb.numel() > 0:
             factor_hidden = F.relu(self.shared_projection(factor_node_emb))
             factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
-            if self.factor_type_embeddings is not None and factor_types is not None:
+            factor_type_embeddings = self.factor_type_embeddings
+            if factor_type_embeddings is not None and factor_types is not None:
                 factor_types_tensor = torch.as_tensor(
                     factor_types, dtype=torch.long, device=graph_emb.device
                 ).view(-1)
-                factor_type_emb = self.factor_type_embeddings(
+                factor_type_emb = factor_type_embeddings(
                     factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
                 )
                 factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
@@ -361,10 +367,12 @@ class BaseGraphModel(nn.Module, ABC):
         return tensor, full_vocab
 
     def _expand_entity_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        return self._expand_logits(logits, self.entity_class_ids, self._entity_full_vocab)
+        class_ids = self.entity_class_ids
+        return self._expand_logits(logits, class_ids, self._entity_full_vocab)
 
     def _expand_predicate_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        return self._expand_logits(logits, self.predicate_class_ids, self._predicate_full_vocab)
+        class_ids = self.predicate_class_ids
+        return self._expand_logits(logits, class_ids, self._predicate_full_vocab)
 
     def _expand_logits(
         self, logits: torch.Tensor, class_ids: torch.Tensor, full_vocab: bool
@@ -372,10 +380,7 @@ class BaseGraphModel(nn.Module, ABC):
         if full_vocab:
             return logits
         batch_size = logits.size(0)
-        fill_value = torch.as_tensor(
-            self._mask_fill_value, dtype=logits.dtype, device=logits.device
-        )
-        expanded = logits.new_full((batch_size, self.num_target_ids), fill_value)
+        expanded = logits.new_full((batch_size, self.num_target_ids), self._mask_fill_value)
         scatter_index = class_ids.unsqueeze(0).expand(batch_size, -1)
         expanded.scatter_(1, scatter_index, logits)
         return expanded
@@ -501,7 +506,8 @@ class RepairGINFactorPressure(BaseGraphModel):
             if x.dtype != torch.float32:
                 x = x.to(torch.float32)
 
-        if self._use_role_embeddings:
+        role_embeddings = self.role_embeddings
+        if self._use_role_embeddings and role_embeddings is not None:
             role_flags = getattr(data, "role_flags", None)
             if role_flags is None:
                 role_flags = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
@@ -515,14 +521,16 @@ class RepairGINFactorPressure(BaseGraphModel):
                     role_flags = role_flags.to(dtype=torch.long)
                 if role_flags.device != x.device:
                     role_flags = role_flags.to(device=x.device)
-            role_features = self.role_embeddings(role_flags)
+            role_features = role_embeddings(role_flags)
             x = torch.cat([x, role_features], dim=-1)
 
         x = self.initialization(x)
         for conv in self.mp_layers:
             x = F.dropout(x, p=self._dropout, training=self.training)
             if self.use_edge_attributes:
-                edge_features = self.edge_mlp(x[edge_attr])
+                edge_mlp = self.edge_mlp
+                assert edge_mlp is not None
+                edge_features = edge_mlp(x[edge_attr])
                 if self.use_edge_subtraction:
                     inverse_edge_indices = edge_index.flip(0)
                     inverse_edge_features = -edge_features
@@ -596,11 +604,12 @@ class RepairGINFactorPressure(BaseGraphModel):
         if factor_node_emb is not None and factor_node_emb.numel() > 0:
             factor_hidden = F.relu(self.shared_projection(factor_node_emb))
             factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
-            if self.factor_type_embeddings is not None and factor_types is not None:
+            factor_type_embeddings = self.factor_type_embeddings
+            if factor_type_embeddings is not None and factor_types is not None:
                 factor_types_tensor = torch.as_tensor(
                     factor_types, dtype=torch.long, device=graph_emb.device
                 ).view(-1)
-                factor_type_emb = self.factor_type_embeddings(
+                factor_type_emb = factor_type_embeddings(
                     factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
                 )
                 factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)

@@ -74,3 +74,4 @@ def test_pressure_forward_and_backward():
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.requires_grad]
     assert any(g is not None for g in grads)
+    print("test_pressure_forward_and_backward passed")

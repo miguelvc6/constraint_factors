@@ -72,10 +72,19 @@ def _to_int(value: object, none_class: int) -> int:
         return none_class
     if isinstance(value, (int, float)):
         return int(value)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return none_class
+    if isinstance(value, (bytes, bytearray, memoryview)):
         return none_class
+    if hasattr(value, "__int__"):
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return none_class
+    return none_class
 
 
 def _coerce_sequence(value: object) -> tuple[int, ...]:

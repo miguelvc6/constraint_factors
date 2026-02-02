@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import math
@@ -8,7 +10,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,6 +20,9 @@ from tqdm.autonotebook import tqdm
 
 from modules.data_encoders import GlobalIntEncoder, GraphStreamDataset
 from modules.repair_eval import ConstraintRepairHeuristics, TriplePattern, ViolationContext
+
+if TYPE_CHECKING:
+    from modules.config import DynamicReweightingConfig, FixProbabilityLossConfig
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +92,7 @@ class DynamicConstraintWeighter:
 
     __slots__ = ("_cfg", "_enabled", "_weights")
 
-    def __init__(self, cfg: "DynamicReweightingConfig | None") -> None:
+    def __init__(self, cfg: DynamicReweightingConfig | None) -> None:
         from modules.config import DynamicReweightingConfig  # Local import to avoid cycles
 
         if cfg is None:
@@ -367,7 +372,7 @@ class FixProbabilityScheduler:
 
     __slots__ = ("_cfg",)
 
-    def __init__(self, cfg: "FixProbabilityLossConfig") -> None:
+    def __init__(self, cfg: FixProbabilityLossConfig) -> None:
         from modules.config import FixProbabilityLossConfig  # Local import
 
         if not isinstance(cfg, FixProbabilityLossConfig):
