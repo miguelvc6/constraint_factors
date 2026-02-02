@@ -1385,7 +1385,9 @@ def main():
     )
 
     # Dataset paths
-    dataset_variant = dataset_variant_name(model_cfg.dataset_variant, model_cfg.min_occurrence)
+    dataset_variant = model_cfg.dataset_variant
+    if "_minocc" not in dataset_variant:
+        dataset_variant = dataset_variant_name(model_cfg.dataset_variant, model_cfg.min_occurrence)
     path = Path("data/processed") / dataset_variant
     logger.debug("Resolved dataset base path to %s", path)
 

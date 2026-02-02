@@ -1330,6 +1330,11 @@ def parse_args():
         default="local",
         help="Which constraint neighborhood to use for factor nodes (default: local).",
     )
+    parser.add_argument(
+        "--use-unlabeled-interim",
+        action="store_true",
+        help="Force using data/interim/<variant> even if a labeled interim dataset exists.",
+    )
 
     args = parser.parse_args()
 
@@ -1359,9 +1364,20 @@ if __name__ == "__main__":
     gitignore.write_text("*\n!.gitignore\n")
 
     # Define data paths
-    INTERIM_DATA_PATH = Path("data/interim/") / dataset_variant  # Load data
+    base_interim_path = Path("data/interim/") / dataset_variant  # Load encoder + base data
+    labeled_interim_path = Path("data/interim/") / f"{dataset_variant}_labeled"
+    use_labeled_interim = (
+        not args.use_unlabeled_interim
+        and labeled_interim_path.exists()
+        and (labeled_interim_path / "df_train.parquet").exists()
+    )
+    INTERIM_DATA_PATH = labeled_interim_path if use_labeled_interim else base_interim_path
     PROCESSED_DATA_PATH = Path("data/processed/") / dataset_variant  # Save data
     PROCESSED_DATA_PATH.mkdir(parents=True, exist_ok=True)
+    if use_labeled_interim:
+        logging.info("Using labeled interim dataframes from %s", INTERIM_DATA_PATH)
+    else:
+        logging.info("Using interim dataframes from %s", INTERIM_DATA_PATH)
 
     logging.info(
         "Building graphs for dataset=%s (variant=%s, min_occurrence=%s)",
@@ -1372,7 +1388,7 @@ if __name__ == "__main__":
 
     # Load and freeze int encoder
     encoder = GlobalIntEncoder()
-    encoder.load(INTERIM_DATA_PATH / "globalintencoder.txt")
+    encoder.load(base_interim_path / "globalintencoder.txt")
     encoder.freeze()
 
     registry_path = Path("data/interim") / f"constraint_registry_{DATASET}.parquet"

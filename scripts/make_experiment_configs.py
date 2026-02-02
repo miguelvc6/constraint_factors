@@ -440,8 +440,6 @@ def main() -> None:
             created += 1
 
     print(f"[ok] wrote {created} configs under {args.models_root}")
-    print("Next: update scheduler to skip disabled configs and to route to 07_train / 08_train_reranker.")
-
 
 if __name__ == "__main__":
     main()

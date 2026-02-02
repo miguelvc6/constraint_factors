@@ -92,7 +92,7 @@ class DynamicConstraintWeighter:
 
     __slots__ = ("_cfg", "_enabled", "_weights")
 
-    def __init__(self, cfg: DynamicReweightingConfig | None) -> None:
+    def __init__(self, cfg: "DynamicReweightingConfig | None") -> None:
         from modules.config import DynamicReweightingConfig  # Local import to avoid cycles
 
         if cfg is None:
@@ -372,7 +372,7 @@ class FixProbabilityScheduler:
 
     __slots__ = ("_cfg",)
 
-    def __init__(self, cfg: FixProbabilityLossConfig) -> None:
+    def __init__(self, cfg: "FixProbabilityLossConfig") -> None:
         from modules.config import FixProbabilityLossConfig  # Local import
 
         if not isinstance(cfg, FixProbabilityLossConfig):
