@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """List constraint type items and their canonical families from a registry parquet."""
 
-from __future__ import annotations
-
 import argparse
 import json
 from collections import Counter

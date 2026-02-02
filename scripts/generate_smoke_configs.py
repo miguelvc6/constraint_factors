@@ -11,8 +11,6 @@ This does NOT attempt a full grid search. It targets coverage for:
 Adjust the base template below if your data uses different encoding or dimensions.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path

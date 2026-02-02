@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-from __future__ import annotations
 
 import argparse
 import json
@@ -240,7 +239,9 @@ def _candidate_from_triple(triple: tuple[int, int, int], *, action: str) -> tupl
     return (0, 0, 0, triple[0], triple[1], triple[2])
 
 
-def _select_values(values: Iterable[int] | None, *, placeholder_ids: set[int], none_class: int, max_values: int) -> list[int]:
+def _select_values(
+    values: Iterable[int] | None, *, placeholder_ids: set[int], none_class: int, max_values: int
+) -> list[int]:
     if not values:
         return []
     unique = []
@@ -280,9 +281,15 @@ def _instantiate_patterns(
 ) -> list[tuple[int, int, int]]:
     candidates: list[tuple[int, int, int]] = []
     for pattern in patterns:
-        subjects = _select_values(pattern.subjects, placeholder_ids=placeholder_ids, none_class=none_class, max_values=max_values)
-        predicates = _select_values(pattern.predicates, placeholder_ids=placeholder_ids, none_class=none_class, max_values=max_values)
-        objects = _select_values(pattern.objects, placeholder_ids=placeholder_ids, none_class=none_class, max_values=max_values)
+        subjects = _select_values(
+            pattern.subjects, placeholder_ids=placeholder_ids, none_class=none_class, max_values=max_values
+        )
+        predicates = _select_values(
+            pattern.predicates, placeholder_ids=placeholder_ids, none_class=none_class, max_values=max_values
+        )
+        objects = _select_values(
+            pattern.objects, placeholder_ids=placeholder_ids, none_class=none_class, max_values=max_values
+        )
         if not subjects or not predicates or not objects:
             continue
         for s in subjects:
@@ -399,9 +406,7 @@ def _evaluate_candidate_set(
 ) -> list:
     metrics: list = []
     for cand in candidates:
-        metrics.append(
-            evaluator.evaluate(row, candidate_slots=cand, primary_factor_index=primary_index)
-        )
+        metrics.append(evaluator.evaluate(row, candidate_slots=cand, primary_factor_index=primary_index))
     return metrics
 
 
@@ -643,14 +648,18 @@ def main() -> None:
         pin_memory=training_cfg.pin_memory,
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=training_cfg.learning_rate, weight_decay=training_cfg.weight_decay)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=training_cfg.learning_rate, weight_decay=training_cfg.weight_decay
+    )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         factor=training_cfg.scheduler_factor,
         patience=training_cfg.scheduler_patience,
     )
 
-    run_dir = ensure_run_dir(model_cfg.dataset_variant, model_cfg.encoding, "RERANKER", config_tag_from_path(args.experiment_config))
+    run_dir = ensure_run_dir(
+        model_cfg.dataset_variant, model_cfg.encoding, "RERANKER", config_tag_from_path(args.experiment_config)
+    )
 
     best_val = float("inf")
     best_epoch = -1

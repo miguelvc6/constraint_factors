@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Build a constraint type catalog with labels from Wikidata (one-time script)."""
 
-from __future__ import annotations
-
 import argparse
 import csv
 import json
-import time
 from collections import Counter
 from pathlib import Path
 from typing import Iterable
