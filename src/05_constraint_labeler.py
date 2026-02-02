@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-04_constraint_labeler.py
+05_constraint_labeler.py
 ========================
 Generate per-factor constraint satisfaction labels (pre + post gold edit)
 without rebuilding graphs.

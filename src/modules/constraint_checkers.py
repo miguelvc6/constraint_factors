@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Constraint checking utilities for the 04_constraint_labeler stage.
+Constraint checking utilities for the 05_constraint_labeler stage.
 """
 
 from dataclasses import dataclass

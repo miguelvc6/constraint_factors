@@ -1,8 +1,8 @@
-# 02b_wikidata_retriever.py
+# 04_wikidata_retriever.py
 
 ## Objective
 - Precompute human-readable labels and SentenceTransformer embeddings for every identifier or literal text referenced in the interim parquet splits.
-- Materialise the lookup cache at `data/interim/wikidata_text.parquet` (or a custom path) so `03_graph.py` can build node features without repeatedly calling external services.
+- Materialise the lookup cache at `data/interim/wikidata_text.parquet` (or a custom path) so `06_graph.py` can build node features without repeatedly calling external services.
 
 ## Inputs & Outputs
 - **Inputs:** `data/interim/<variant>/df_{train,val,test}.parquet`, `data/interim/constraint_registry_{dataset}.parquet`, the matching `globalintencoder.txt`, CLI flags for dataset/min-occurrence/embed settings, and outbound network access to Wikidata + the embedding model hub.
@@ -25,15 +25,15 @@
 7. `_persist_records()` sorts every `CacheEntry`, writes them as a parquet file with float16 embeddings, and allows other stages to reconstruct `PrecomputedWikidataCache` instances quickly.
 
 ## Common Pitfalls / Gotchas
-- If you regenerate parquet splits with a different `--min-occurrence`, you must rerun this script; otherwise, `03_graph.py` will reference IDs that lack embeddings.
-- The script fails fast if `constraint_registry_{dataset}.parquet` is missing, so run `02a_constraint_registry.py` first.
+- If you regenerate parquet splits with a different `--min-occurrence`, you must rerun this script; otherwise, `06_graph.py` will reference IDs that lack embeddings.
+- The script fails fast if `constraint_registry_{dataset}.parquet` is missing, so run `03_constraint_registry.py` first.
 - Registry entries that do not exist in the frozen encoder are skipped; if you see large skip counts, regenerate the encoder or the registry to keep them in sync.
 - Running without a cached SentenceTransformer model triggers a download the first time—ensure you have disk space and network access or pre-pull the model beforehand.
 - Wikidata rate limiting can slow large batches; when `_materialise_entries()` hits many URIs it is safer to leave the default batch size instead of cranking it up aggressively.
 
 ## Implementation Details
 - `WikidataUriEmbedder` reads `WIKIDATA_EMBEDDING_MODEL` (default `jinaai/jina-embeddings-v3`) and `WIKIDATA_EMBEDDING_FALLBACK` (default `sentence-transformers/all-MiniLM-L6-v2`) to select the embedding model. If the primary model fails to load, it falls back automatically.
-- The cache distinguishes `kind` (`uri`, `placeholder`, `literal`) so `03_graph.py` can request either an embedding by integer ID (`kind=uri`, `global_id` populated) or by raw string (literals).
+- The cache distinguishes `kind` (`uri`, `placeholder`, `literal`) so `06_graph.py` can request either an embedding by integer ID (`kind=uri`, `global_id` populated) or by raw string (literals).
 - When encountering multiple integer IDs that decode to the same URI, the script stores only one embedding payload and merely aliases the additional IDs, shrinking the on-disk footprint.
 - Literal texts are deduplicated case-insensitively and trimmed; noisy strings like `"nan"` are ignored to avoid polluting the embedding table.
 - Every embedding is stored as `np.float16` by default. The `--embed-dim` flag controls the model embedding dimensionality (default 256), while `--batch-size` tunes Wikidata label batching (default 512).

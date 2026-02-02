@@ -1,4 +1,4 @@
-# 03_graph.py
+# 06_graph.py
 
 ## Objective
 - Convert the parquet splits plus the Wikidata text cache into PyTorch Geometric `Data` objects that encode every violation as a graph with rich node features.
@@ -20,7 +20,7 @@
 5. If `--show_graph` is enabled, `display_graph()` reads one of the stored graphs, converts it to NetworkX, and renders `graph_visualization.png` plus a non-flattened view to make edge labels inspectable.
 
 ## Common Pitfalls / Gotchas
-- Selecting `--encoding text_embedding` without having run `02b_wikidata_retriever.py` first will raise lookup errors because literal/URI embeddings are missing.
+- Selecting `--encoding text_embedding` without having run `04_wikidata_retriever.py` first will raise lookup errors because literal/URI embeddings are missing.
 - Large `--shard-size` values can exhaust RAM when saving; pick smaller shards or enable `--use-torch-save` if you see pickle spills.
 - Graphs inherit the constraint type distribution of the parquet splits—mixing mismatched dataset variants (e.g., graphs built with min-occurrence 100 but training on 50) guarantees label/encoder inconsistencies.
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-02b_wikidata_retriever.py
+04_wikidata_retriever.py
 =========================
-Pre-compute Wikidata labels and embeddings used by 03_graph.py.
+Pre-compute Wikidata labels and embeddings used by 06_graph.py.
 
 The script scans the interim parquet files, collects every referenced
 identifier and literal text, resolves their human-readable labels via
@@ -12,7 +12,7 @@ result as a parquet cache under data/raw/wikidata_text.parquet.
 
 Usage
 -----
-python src/02b_wikidata_retriever.py --dataset sample
+python src/04_wikidata_retriever.py --dataset sample
 """
 
 import argparse
@@ -176,7 +176,7 @@ def _load_constraint_registry(dataset: str) -> dict[str, dict[str, Any]]:
     registry_path = Path("data/interim") / f"constraint_registry_{dataset}.parquet"
     if not registry_path.exists():
         raise FileNotFoundError(
-            f"Constraint registry not found at {registry_path}. Run src/02a_constraint_registry.py first."
+            f"Constraint registry not found at {registry_path}. Run src/03_constraint_registry.py first."
         )
     registry_df = pd.read_parquet(registry_path)
     if "registry_json" not in registry_df.columns or registry_df.empty:
@@ -378,7 +378,7 @@ def _persist_records(records: list[CacheEntry], output: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Materialise Wikidata lookups for 03_graph.py")
+    parser = argparse.ArgumentParser(description="Materialise Wikidata lookups for 06_graph.py")
     parser.add_argument(
         "--dataset",
         choices=["sample", "full"],

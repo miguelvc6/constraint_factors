@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-02a_constraint_registry.py
+03_constraint_registry.py
 ==========================
 Build a standalone constraint registry from constraints.tsv.
 
 Usage
 -----
-python src/02a_constraint_registry.py --dataset {sample,full}
+python src/03_constraint_registry.py --dataset {sample,full}
 """
 
 import argparse

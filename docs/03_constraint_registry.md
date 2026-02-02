@@ -1,4 +1,4 @@
-# 02a_constraint_registry.py
+# 03_constraint_registry.py
 
 ## Objective
 - Build a standalone registry of constraint metadata from `constraints.tsv` so downstream stages can look up constraint semantics by id without repeating the parsing per row.
@@ -40,4 +40,4 @@ The registry maps each constraint id to:
 
 ## Common Pitfalls / Gotchas
 - The script expects `constraints.tsv` under `data/raw/<dataset>/`; verify the dataset name matches the directory.
-- `constraint_registry_<dataset>.parquet` is required by `02b_wikidata_retriever.py`; run this script first when building a fresh pipeline.
+- `constraint_registry_<dataset>.parquet` is required by `04_wikidata_retriever.py`; run this script first when building a fresh pipeline.

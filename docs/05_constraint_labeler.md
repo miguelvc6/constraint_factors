@@ -1,4 +1,4 @@
-# 04_constraint_labeler.py
+# 05_constraint_labeler.py
 
 ## Objective
 - Generate per-factor constraint labels (checkable + satisfied) for the local or focus constraint neighborhood.
@@ -8,7 +8,7 @@
 ## Inputs & Outputs
 **Inputs**
 - Parquet split file(s) produced by `02_dataframe_builder.py` (from `data/interim/<dataset_variant>`).
-- Constraint registry from `02a_constraint_registry.py` (`data/interim/constraint_registry_<dataset>.parquet`).
+- Constraint registry from `03_constraint_registry.py` (`data/interim/constraint_registry_<dataset>.parquet`).
 - Encoder (`data/interim/<dataset_variant>/globalintencoder.txt`) for encoded parquet IDs.
 
 **Outputs**
@@ -82,7 +82,7 @@ Use this report to tune completeness assumptions and identify constraint types w
 ## CLI
 Example usage:
 ```bash
-python src/04_constraint_labeler.py \
+python src/05_constraint_labeler.py \
   --dataset sample \
   --min-occurrence 100 \
   --constraint-scope local

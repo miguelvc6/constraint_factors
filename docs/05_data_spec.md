@@ -63,7 +63,7 @@ Each dataframe row represents one constraint violation instance with the fields 
   - constraints attached to the focus predicate(s), plus the constrained property
     of the violated constraint.
 
-## 4) Constraint Registry (`02a_constraint_registry.py`)
+## 4) Constraint Registry (`03_constraint_registry.py`)
 **Location:** `data/interim/constraint_registry_<dataset>.parquet`
 
 **Schema**
@@ -78,7 +78,7 @@ mapping each constraint id to:
 - `param_predicates`
 - `param_objects`
 
-## 5) Wikidata Text Cache (`02b_wikidata_retriever.py`)
+## 5) Wikidata Text Cache (`04_wikidata_retriever.py`)
 **Location:** `data/interim/wikidata_text.parquet`
 
 **Schema**
@@ -91,7 +91,7 @@ mapping each constraint id to:
 The cache is shared across dataset variants and is incrementally updated when
 re-run.
 
-## 6) Graph Artifacts (`03_graph.py`)
+## 6) Graph Artifacts (`06_graph.py`)
 **Location:** `data/processed/<variant>/`
 
 **Files**
@@ -121,7 +121,7 @@ re-run.
 - `predicate_class_ids`
 - `per_split` (per-split versions of the above)
 
-## 7) Labeled Constraint Factors (`04_constraint_labeler.py`)
+## 7) Labeled Constraint Factors (`05_constraint_labeler.py`)
 **Location:** `data/interim/<variant>_labeled/`
 
 **Files**

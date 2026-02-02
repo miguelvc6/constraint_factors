@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-03_graph.py
+06_graph.py
 ====================
 Transforms the interim dataframes into a NetworkX-backed, PyTorch Geometric
 `Data` object and stores the resulting list of graphs as pickle files.
@@ -19,7 +19,7 @@ Encoding Options
 
 Usage
 -----
-python src/03_graph.py --dataset {sample,full} --encoding {node_id,text_embedding} \
+python src/06_graph.py --dataset {sample,full} --encoding {node_id,text_embedding} \
     [--min-occurrence N] [--shard-size N] [--use-torch-save] [--embedding-dtype {float32,float16}]
 """
 

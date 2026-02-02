@@ -26,7 +26,7 @@ def main() -> None:
     registry_json = df["registry_json"].iloc[0]
     registry = json.loads(registry_json) if isinstance(registry_json, str) else registry_json
     if not registry:
-        print("Registry is empty. Rebuild it with 02a_constraint_registry.py.")
+        print("Registry is empty. Rebuild it with 03_constraint_registry.py.")
         return
 
     type_counts = Counter()
@@ -37,7 +37,7 @@ def main() -> None:
         if type_item is None or type_name is None:
             print(
                 "Registry entries are missing constraint_type_item/constraint_family. "
-                "Rebuild the registry with the updated 02a_constraint_registry.py."
+                "Rebuild the registry with the updated 03_constraint_registry.py."
             )
             return
         type_item = type_item or ""

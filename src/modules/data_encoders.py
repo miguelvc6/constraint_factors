@@ -293,7 +293,7 @@ class PrecomputedWikidataCache:
         cache_path = Path(cache_path)
         if not cache_path.exists():
             raise FileNotFoundError(
-                f"Precomputed Wikidata cache not found at {cache_path}. Run 02b_wikidata_retriever.py first."
+                f"Precomputed Wikidata cache not found at {cache_path}. Run 04_wikidata_retriever.py first."
             )
 
         dataframe = pd.read_parquet(cache_path)
