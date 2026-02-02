@@ -20,7 +20,7 @@ import json
 import logging
 import math
 import pickle
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -40,9 +40,12 @@ from modules.repair_eval import (
     ConstraintRepairHeuristics,
     RepairSample,
     ViolationContext,
+    evaluate_global_repair_samples,
     evaluate_repair_samples,
+    load_global_eval_rows,
     load_violation_contexts,
 )
+from modules.reranker_eval import CandidateConstraintEvaluator
 
 NONE_CLASS_INDEX = 0  # Bass-style datasets reserve class 0 for "no triple"
 ACTIONS = ("add", "del")
@@ -79,6 +82,54 @@ class RepairSupport:
                 heuristics=self.heuristics,
                 actions=ACTIONS,
             )
+
+        return _postprocess, state
+
+
+@dataclass
+class GlobalMetricsSupport:
+    rows: list[object]
+    evaluator: CandidateConstraintEvaluator
+    none_class: int = NONE_CLASS_INDEX
+
+    def build_postprocess(
+        self,
+        test_data: Sequence[Data] | None = None,
+    ) -> tuple[Callable[[torch.Tensor, torch.Tensor, list[str]], None], dict[str, object]]:
+        state: dict[str, object] = {}
+
+        pre_vectors: list[dict[str, object]] | None = None
+        if test_data:
+            vectors: list[dict[str, object]] = []
+            any_vectors = False
+            for data in test_data:
+                pre_satisfied = getattr(data, "factor_satisfied_pre", None)
+                pre_checkable = getattr(data, "factor_checkable_pre", None)
+                primary_index = getattr(data, "primary_factor_index", None)
+                if pre_satisfied is None and pre_checkable is None and primary_index is None:
+                    vectors.append({})
+                    continue
+                any_vectors = True
+                vectors.append(
+                    {
+                        "pre_satisfied": pre_satisfied,
+                        "pre_checkable": pre_checkable,
+                        "primary_factor_index": primary_index,
+                    }
+                )
+            if any_vectors:
+                pre_vectors = vectors
+
+        def _postprocess(predictions: torch.Tensor, targets: torch.Tensor, kinds: list[str]) -> None:
+            samples = _repair_samples_from_predictions(predictions, targets, kinds, self.none_class)
+            state["global_metrics"] = evaluate_global_repair_samples(
+                samples=samples,
+                rows=self.rows,
+                evaluator=self.evaluator,
+                none_class=self.none_class,
+                pre_vectors=pre_vectors,
+            )
+            state["global_metrics_per_constraint_type"] = state["global_metrics"].get("per_constraint_type", {})
 
         return _postprocess, state
 
@@ -145,6 +196,77 @@ def _split_by_action(triples: Iterable[tuple[str, int, int, int]]) -> dict[str, 
     return buckets
 
 
+def _normalize_precomputed_predictions(predictions: torch.Tensor | Iterable, none_class: int) -> torch.Tensor:
+    if isinstance(predictions, torch.Tensor):
+        tensor = predictions.detach().cpu()
+    else:
+        tensor = torch.tensor(list(predictions), dtype=torch.long)
+
+    if tensor.dim() == 1 and tensor.numel() == 6:
+        tensor = tensor.view(1, 6)
+    if tensor.dim() == 3:
+        tensor = tensor.argmax(dim=-1)
+    if tensor.dim() != 2 or tensor.size(-1) != 6:
+        raise ValueError(f"Precomputed predictions must have shape (N,6); got {tuple(tensor.shape)}")
+    tensor = tensor.to(dtype=torch.long)
+    if (tensor < 0).any():
+        raise ValueError("Precomputed predictions contain negative indices.")
+    if none_class < 0:
+        raise ValueError("none_class must be non-negative.")
+    return tensor
+
+
+def _load_reranker_predictions(path: Path) -> torch.Tensor:
+    if not path.exists():
+        raise FileNotFoundError(f"Reranker predictions not found at {path}")
+
+    suffix = path.suffix.lower()
+    payload: object
+    if suffix in {".pt", ".pth"}:
+        payload = torch.load(path, map_location="cpu")
+    elif suffix in {".json", ".jsonl"}:
+        if suffix == ".jsonl":
+            rows = []
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rows.append(json.loads(line))
+            payload = rows
+        else:
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+    else:
+        raise ValueError("Unsupported reranker predictions format; expected .pt/.pth/.json/.jsonl")
+
+    if isinstance(payload, dict):
+        for key in ("predictions", "candidate_slots", "edits", "chosen_edits"):
+            if key in payload:
+                payload = payload[key]
+                break
+
+    if isinstance(payload, torch.Tensor):
+        return payload
+    if isinstance(payload, list):
+        if not payload:
+            return torch.empty((0, 6), dtype=torch.long)
+        if isinstance(payload[0], (list, tuple)):
+            return torch.tensor(payload, dtype=torch.long)
+        if isinstance(payload[0], dict):
+            rows = []
+            for entry in payload:
+                add = entry.get("add")
+                delete = entry.get("del") or entry.get("delete")
+                if add is None:
+                    add = [NONE_CLASS_INDEX, NONE_CLASS_INDEX, NONE_CLASS_INDEX]
+                if delete is None:
+                    delete = [NONE_CLASS_INDEX, NONE_CLASS_INDEX, NONE_CLASS_INDEX]
+                rows.append(list(add) + list(delete))
+            return torch.tensor(rows, dtype=torch.long)
+    raise ValueError("Unsupported reranker predictions payload structure.")
+
+
 def _maybe_prepare_repair_support(
     dataset_variant: str,
     min_occurrence: int,
@@ -174,6 +296,51 @@ def _maybe_prepare_repair_support(
     )
 
     return RepairSupport(contexts=contexts, heuristics=heuristics, none_class=none_class)
+
+
+def _maybe_prepare_global_support(
+    dataset_variant: str,
+    min_occurrence: int,
+    *,
+    split: str,
+    none_class: int,
+    constraint_scope: str = "local",
+) -> GlobalMetricsSupport | None:
+    variant_dir = dataset_variant
+    suffix = f"_minocc{min_occurrence}"
+    if not variant_dir.endswith(suffix):
+        variant_dir = f"{variant_dir}{suffix}"
+
+    interim_base = Path("data/interim") / variant_dir
+    encoder_path = interim_base / "globalintencoder.txt"
+    registry_path = Path("data/interim") / f"constraint_registry_{dataset_variant}.parquet"
+
+    if not registry_path.exists():
+        logging.warning("Constraint registry not found at %s; skipping global metrics.", registry_path)
+        return None
+    if not encoder_path.exists():
+        logging.warning("Global encoder not found at %s; skipping global metrics.", encoder_path)
+        return None
+
+    try:
+        rows = load_global_eval_rows(interim_base, split)
+    except FileNotFoundError as exc:
+        logging.warning("Global eval rows unavailable: %s", exc)
+        return None
+
+    encoder = GlobalIntEncoder()
+    encoder.load(encoder_path)
+    encoder.freeze()
+
+    evaluator = CandidateConstraintEvaluator(
+        str(registry_path),
+        encoder=encoder,
+        assume_complete=True,
+        constraint_scope=constraint_scope,
+        use_encoded_ids=True,
+    )
+
+    return GlobalMetricsSupport(rows=rows, evaluator=evaluator, none_class=none_class)
 
 
 def _aggregate_counts(
@@ -238,12 +405,13 @@ def _metrics_from_counts(counts: TripleCounts) -> dict[str, float]:
 
 @torch.no_grad()
 def eval(
-    model: BaseGraphModel,
+    model: BaseGraphModel | None,
     test_data: list[Data],
     batch_size: int = 16,
     device: torch.device | str = torch.device("cpu"),
     none_class: int = NONE_CLASS_INDEX,
     postprocess: Callable[[torch.Tensor, torch.Tensor, list[str]], None] | None = None,
+    precomputed_predictions: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Evaluate a model and return Bass-style precision/recall/F1 metrics."""
     if isinstance(device, str):
@@ -253,16 +421,36 @@ def eval(
 
     kinds: list[str] = [(getattr(d, "constraint_type", None) or "UNKNOWN") for d in test_data]
 
-    model.eval()
+    if precomputed_predictions is None and model is None:
+        raise ValueError("Either a model or precomputed_predictions must be provided.")
+    if precomputed_predictions is None and model is not None:
+        model.eval()
     predictions, targets = [], []
+    output_logged = False
     for data in tqdm(test_loader, desc="Test Batches"):
-        data = data.to(device)
-        out = model(data)  # raw logits expected
-        out = out.argmax(dim=-1)  # class predictions per action
-        predictions.append(out.cpu())
+        if precomputed_predictions is None:
+            data = data.to(device)
+            out = model(data)  # raw logits expected
+            if isinstance(out, dict):
+                if not output_logged:
+                    logging.info("Model forward returned dict outputs; using edit_logits.")
+                    output_logged = True
+                logits = out.get("edit_logits")
+                if logits is None:
+                    raise KeyError("Model output dict missing 'edit_logits'.")
+            else:
+                if not output_logged:
+                    logging.info("Model forward returned tensor outputs.")
+                    output_logged = True
+                logits = out
+            out = logits.argmax(dim=-1)  # class predictions per action
+            predictions.append(out.cpu())
         targets.append(data.y.cpu())
 
-    predictions = torch.cat(predictions, dim=0)
+    if precomputed_predictions is None:
+        predictions = torch.cat(predictions, dim=0)
+    else:
+        predictions = precomputed_predictions
     targets = torch.cat(targets, dim=0)
 
     if predictions.shape[0] != len(kinds):
@@ -341,6 +529,7 @@ def eval(
             "fp": global_counts.fp,
             "fn": global_counts.fn,
         },
+        "support_per_constraint_type": dict(Counter(kinds)),
         "per_constraint_type": per_type_metrics,
     }
 
@@ -392,14 +581,31 @@ def _run_and_save(
     *,
     postprocess: Callable[[torch.Tensor, torch.Tensor, list[str]], None] | None = None,
     postprocess_state: dict[str, object] | None = None,
+    precomputed_predictions: torch.Tensor | None = None,
+    write_per_constraint_csv: bool = False,
 ) -> dict[str, object]:
-    metrics = eval(model, test_data, device=device, postprocess=postprocess)
+    normalized_predictions = None
+    if precomputed_predictions is not None:
+        normalized_predictions = _normalize_precomputed_predictions(precomputed_predictions, NONE_CLASS_INDEX)
+    metrics = eval(
+        model,
+        test_data,
+        device=device,
+        postprocess=postprocess,
+        precomputed_predictions=normalized_predictions,
+    )
     if postprocess_state and "repair_metrics" in postprocess_state:
         metrics["repair_metrics"] = postprocess_state["repair_metrics"]
+    if postprocess_state and "global_metrics" in postprocess_state:
+        metrics["global_metrics"] = postprocess_state["global_metrics"]
+    if postprocess_state and "global_metrics_per_constraint_type" in postprocess_state:
+        metrics["global_metrics_per_constraint_type"] = postprocess_state["global_metrics_per_constraint_type"]
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "model.json"
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4)
+    if write_per_constraint_csv:
+        _write_per_constraint_csv(metrics, output_dir)
     return metrics
 
 
@@ -440,6 +646,100 @@ def _safe_constraint_type(value: object) -> str:
     if isinstance(value, float) and math.isnan(value):
         return "UNKNOWN"
     return str(value)
+
+
+def _data_has_factor_fields(test_data: Sequence[Data]) -> bool:
+    if not test_data:
+        return False
+    sample = test_data[0]
+    return hasattr(sample, "factor_satisfied_pre") or hasattr(sample, "factor_checkable_pre")
+
+
+def _summarize_repair_per_type(repair_metrics: dict[str, object] | None) -> dict[str, dict[str, float | int]]:
+    if not repair_metrics:
+        return {}
+    per_type = repair_metrics.get("per_constraint_type") or {}
+    summary: dict[str, dict[str, float | int]] = {}
+    for constraint_type, actions in per_type.items():
+        if not isinstance(actions, dict):
+            continue
+        totals = {"total": 0, "exact": 0, "alternative": 0, "missing": 0, "failed": 0}
+        for action_counts in actions.values():
+            if not isinstance(action_counts, dict):
+                continue
+            for key in totals:
+                totals[key] += int(action_counts.get(key, 0))
+        total = totals["total"]
+        exact = totals["exact"]
+        alternative = totals["alternative"]
+        summary[constraint_type] = {
+            "total": total,
+            "exact": exact,
+            "alternative": alternative,
+            "fix_rate": float(exact + alternative) / total if total else 0.0,
+            "exact_rate": float(exact) / total if total else 0.0,
+            "alternative_rate": float(alternative) / total if total else 0.0,
+        }
+    return summary
+
+
+def _write_per_constraint_csv(metrics: dict[str, object], output_dir: Path) -> None:
+    per_type_metrics = metrics.get("per_constraint_type") or {}
+    support_counts = metrics.get("support_per_constraint_type") or {}
+    repair_summary = _summarize_repair_per_type(metrics.get("repair_metrics"))
+    global_per_type = metrics.get("global_metrics_per_constraint_type") or {}
+
+    rows: list[dict[str, object]] = []
+    for constraint_type, type_metrics in per_type_metrics.items():
+        micro = type_metrics.get("micro", {})
+        global_metrics = global_per_type.get(constraint_type, {})
+        disruption = global_metrics.get("disruption", {}) if isinstance(global_metrics, dict) else {}
+        repair = repair_summary.get(constraint_type, {})
+        rows.append(
+            {
+                "constraint_type": constraint_type,
+                "support": int(support_counts.get(constraint_type, 0)),
+                "fidelity_micro_f1": float(micro.get("f1", 0.0)),
+                "primary_fix_rate": float(repair.get("fix_rate", 0.0)),
+                "primary_exact_rate": float(repair.get("exact_rate", 0.0)),
+                "primary_alternative_rate": float(repair.get("alternative_rate", 0.0)),
+                "primary_total": int(repair.get("total", 0)),
+                "gfr": float(global_metrics.get("gfr", 0.0)) if isinstance(global_metrics, dict) else 0.0,
+                "srr": float(global_metrics.get("srr", 0.0)) if isinstance(global_metrics, dict) else 0.0,
+                "sir": float(global_metrics.get("sir", 0.0)) if isinstance(global_metrics, dict) else 0.0,
+                "disruption_add_mean": float(disruption.get("added_triples_mean", 0.0)),
+                "disruption_del_mean": float(disruption.get("deleted_triples_mean", 0.0)),
+                "disruption_total_ops_mean": float(disruption.get("total_ops_mean", 0.0)),
+                "disruption_changed_mean": float(disruption.get("changed_triples_mean", 0.0)),
+            }
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "per_constraint.csv"
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+
+def _smoke_check_global_metrics(
+    support: GlobalMetricsSupport,
+    test_data: Sequence[Data],
+    *,
+    none_class: int,
+) -> None:
+    sample_count = min(3, len(test_data), len(support.rows))
+    if sample_count == 0:
+        logging.info("Skipping global metrics smoke check (no samples).")
+        return
+    preds = torch.cat([test_data[i].y for i in range(sample_count)], dim=0)
+    kinds = [(getattr(test_data[i], "constraint_type", None) or "UNKNOWN") for i in range(sample_count)]
+    samples = _repair_samples_from_predictions(preds, preds, kinds, none_class)
+    evaluate_global_repair_samples(
+        samples=samples,
+        rows=support.rows[:sample_count],
+        evaluator=support.evaluator,
+        none_class=none_class,
+        pre_vectors=None,
+    )
+    logging.info("Global metrics smoke check passed for %d samples.", sample_count)
 
 
 def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[Data], int]:
@@ -523,43 +823,47 @@ def evaluate_trained_model(
     test_data: list[Data],
     postprocess: Callable[[torch.Tensor, torch.Tensor, list[str]], None] | None = None,
     postprocess_state: dict[str, object] | None = None,
+    precomputed_predictions: torch.Tensor | None = None,
+    write_per_constraint_csv: bool = False,
 ) -> None:
     checkpoint_path = get_checkpoint_path(run_directory)
 
-    if not checkpoint_path.exists():
+    if precomputed_predictions is None and not checkpoint_path.exists():
         raise FileNotFoundError(f"Trained model not found at {checkpoint_path}")
 
-    logging.info("Using model artifacts in %s", run_directory)
-    logging.info("Loading checkpoint from %s", checkpoint_path)
+    model = None
+    if precomputed_predictions is None:
+        logging.info("Using model artifacts in %s", run_directory)
+        logging.info("Loading checkpoint from %s", checkpoint_path)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    if isinstance(checkpoint, BaseGraphModel):
-        model = checkpoint.to(device)
-    elif isinstance(checkpoint, dict):
-        model_name = checkpoint.get("model_name") or model_cfg.model
-        num_graph_nodes = checkpoint.get("num_graph_nodes")
-        state_dict = checkpoint.get("model_state")
-        if num_graph_nodes is None or state_dict is None:
-            raise ValueError("Checkpoint is missing required fields: 'num_graph_nodes' or 'model_state'.")
+        if isinstance(checkpoint, BaseGraphModel):
+            model = checkpoint.to(device)
+        elif isinstance(checkpoint, dict):
+            model_name = checkpoint.get("model_name") or model_cfg.model
+            num_graph_nodes = checkpoint.get("num_graph_nodes")
+            state_dict = checkpoint.get("model_state")
+            if num_graph_nodes is None or state_dict is None:
+                raise ValueError("Checkpoint is missing required fields: 'num_graph_nodes' or 'model_state'.")
 
-        checkpoint_model_cfg = checkpoint.get("model_cfg", {})
-        if checkpoint_model_cfg:
-            effective_model_cfg = ModelConfig.from_mapping(checkpoint_model_cfg)
+            checkpoint_model_cfg = checkpoint.get("model_cfg", {})
+            if checkpoint_model_cfg:
+                effective_model_cfg = ModelConfig.from_mapping(checkpoint_model_cfg)
+            else:
+                effective_model_cfg = model_cfg
+
+            model = build_model(
+                model_name,
+                int(num_graph_nodes),
+                effective_model_cfg,
+            )
+            model.load_state_dict(state_dict)
+            model.to(device)
+            printable_config = {k: v for k, v in effective_model_cfg.to_dict().items() if k != "entity_class_ids"}
+            logging.info("Loaded checkpoint with config: %s", printable_config)
         else:
-            effective_model_cfg = model_cfg
-
-        model = build_model(
-            model_name,
-            int(num_graph_nodes),
-            effective_model_cfg,
-        )
-        model.load_state_dict(state_dict)
-        model.to(device)
-        printable_config = {k: v for k, v in effective_model_cfg.to_dict().items() if k != "entity_class_ids"}
-        logging.info("Loaded checkpoint with config: %s", printable_config)
-    else:
-        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)!r}")
+            raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)!r}")
 
     _run_and_save(
         model=model,
@@ -568,6 +872,8 @@ def evaluate_trained_model(
         output_dir=evaluations_dir(run_directory, create=True),
         postprocess=postprocess,
         postprocess_state=postprocess_state,
+        precomputed_predictions=precomputed_predictions,
+        write_per_constraint_csv=write_per_constraint_csv,
     )
 
 
@@ -600,6 +906,21 @@ def parse_args():
         choices=["INFO", "DEBUG"],
         help="Verbosity level for logging output.",
     )
+    parser.add_argument(
+        "--global-metrics",
+        action="store_true",
+        help="Compute global constraint metrics when possible.",
+    )
+    parser.add_argument(
+        "--per-constraint-csv",
+        action="store_true",
+        help="Write per-constraint breakdown CSV in the evaluations directory.",
+    )
+    parser.add_argument(
+        "--reranker-predictions",
+        type=Path,
+        help="Optional path to reranker predictions to evaluate without a model forward pass.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -611,6 +932,8 @@ def parse_args():
     if args.run_baselines:
         if not args.dataset:
             raise ValueError("--run-baselines requires --dataset.")
+        if args.reranker_predictions:
+            raise ValueError("--reranker-predictions is only supported for trained model evaluation.")
         return args
 
     if args.run_directory is None:
@@ -658,8 +981,9 @@ def main():
         base_path = Path("data/processed") / f"{model_cfg.dataset_variant}_minocc{model_cfg.min_occurrence}"
         test_data = load_split(base_path, model_cfg.encoding, "test")
 
-        repair_postprocess = None
-        repair_state: dict[str, object] | None = None
+        postprocess_fns: list[Callable[[torch.Tensor, torch.Tensor, list[str]], None]] = []
+        postprocess_states: list[dict[str, object]] = []
+
         repair_support = _maybe_prepare_repair_support(
             model_cfg.dataset_variant,
             model_cfg.min_occurrence,
@@ -668,14 +992,53 @@ def main():
         )
         if repair_support:
             repair_postprocess, repair_state = repair_support.build_postprocess()
+            postprocess_fns.append(repair_postprocess)
+            postprocess_states.append(repair_state)
+
+        global_support = None
+        global_metrics_enabled = args.global_metrics or _data_has_factor_fields(test_data)
+        if global_metrics_enabled:
+            global_support = _maybe_prepare_global_support(
+                model_cfg.dataset_variant,
+                model_cfg.min_occurrence,
+                split="test",
+                none_class=NONE_CLASS_INDEX,
+            )
+        if global_support:
+            global_postprocess, global_state = global_support.build_postprocess(test_data)
+            postprocess_fns.append(global_postprocess)
+            postprocess_states.append(global_state)
+            _smoke_check_global_metrics(global_support, test_data, none_class=NONE_CLASS_INDEX)
+        elif global_metrics_enabled:
+            logging.warning("Global metrics requested but could not be prepared; skipping.")
+
+        postprocess = None
+        postprocess_state: dict[str, object] | None = None
+        if postprocess_fns:
+            combined_state: dict[str, object] = {}
+
+            def postprocess(predictions: torch.Tensor, targets: torch.Tensor, kinds: list[str]) -> None:
+                for fn in postprocess_fns:
+                    fn(predictions, targets, kinds)
+                for state in postprocess_states:
+                    combined_state.update(state)
+
+            postprocess_state = combined_state
+
+        precomputed_predictions = None
+        if args.reranker_predictions:
+            precomputed_predictions = _load_reranker_predictions(Path(args.reranker_predictions))
+            logging.info("Loaded reranker predictions from %s", args.reranker_predictions)
 
         evaluate_trained_model(
             run_directory=run_directory,
             model_cfg=model_cfg,
             device=device,
             test_data=test_data,
-            postprocess=repair_postprocess,
-            postprocess_state=repair_state,
+            postprocess=postprocess,
+            postprocess_state=postprocess_state,
+            precomputed_predictions=precomputed_predictions,
+            write_per_constraint_csv=args.per_constraint_csv or global_metrics_enabled,
         )
 
     else:  # Evaluate baselines
@@ -699,11 +1062,41 @@ def main():
             none_class=NONE_CLASS_INDEX,
         )
 
+        global_support = None
+        global_metrics_enabled = args.global_metrics
+        if global_metrics_enabled:
+            global_support = _maybe_prepare_global_support(
+                args.dataset,
+                args.min_occurrence,
+                split="test",
+                none_class=NONE_CLASS_INDEX,
+            )
+            if not global_support:
+                logging.warning("Global metrics requested but could not be prepared; skipping.")
+
         repair_builder = None
-        if repair_support:
+        if repair_support or global_support:
 
             def repair_builder():
-                return repair_support.build_postprocess()
+                postprocess_fns: list[Callable[[torch.Tensor, torch.Tensor, list[str]], None]] = []
+                postprocess_states: list[dict[str, object]] = []
+                if repair_support:
+                    fn, state = repair_support.build_postprocess()
+                    postprocess_fns.append(fn)
+                    postprocess_states.append(state)
+                if global_support:
+                    fn, state = global_support.build_postprocess(test_data)
+                    postprocess_fns.append(fn)
+                    postprocess_states.append(state)
+                combined_state: dict[str, object] = {}
+
+                def postprocess(predictions: torch.Tensor, targets: torch.Tensor, kinds: list[str]) -> None:
+                    for fn in postprocess_fns:
+                        fn(predictions, targets, kinds)
+                    for state in postprocess_states:
+                        combined_state.update(state)
+
+                return postprocess, combined_state
 
         def save_run(name: str, model: BaseGraphModel) -> dict[str, object]:
             postprocess = None
@@ -713,6 +1106,10 @@ def main():
             metrics = eval(model, test_data, device=device, postprocess=postprocess)
             if state and "repair_metrics" in state:
                 metrics["repair_metrics"] = state["repair_metrics"]
+            if state and "global_metrics" in state:
+                metrics["global_metrics"] = state["global_metrics"]
+            if state and "global_metrics_per_constraint_type" in state:
+                metrics["global_metrics_per_constraint_type"] = state["global_metrics_per_constraint_type"]
             return metrics
 
         evaluate_baselines(

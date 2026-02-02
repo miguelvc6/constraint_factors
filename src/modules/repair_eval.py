@@ -8,6 +8,7 @@ from typing import Iterable, Sequence
 import pandas as pd
 
 from modules.data_encoders import GlobalIntEncoder
+from modules.reranker_eval import CandidateConstraintEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,47 @@ def load_violation_contexts(base_path: Path, split: str, *, none_class: int = 0)
 
     del dataframe
     return contexts
+
+
+def load_global_eval_rows(base_path: Path, split: str) -> list:
+    """Load parquet rows with enough metadata for global repair metrics."""
+    base_path = Path(base_path)
+    path = base_path / f"df_{split}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Parquet split not found at {path}")
+
+    columns = [
+        "constraint_id",
+        "constraint_type",
+        "subject",
+        "predicate",
+        "object",
+        "other_subject",
+        "other_predicate",
+        "other_object",
+        "constraint_predicates",
+        "constraint_objects",
+        "subject_predicates",
+        "subject_objects",
+        "object_predicates",
+        "object_objects",
+        "other_entity_predicates",
+        "other_entity_objects",
+        "local_constraint_ids",
+        "local_constraint_ids_focus",
+        "factor_checkable_pre",
+        "factor_satisfied_pre",
+        "primary_factor_index",
+        "factor_constraint_ids",
+        "factor_types",
+    ]
+    dataframe = pd.read_parquet(path)
+    existing = [col for col in columns if col in dataframe.columns]
+    if existing:
+        dataframe = dataframe[existing]
+    rows = list(dataframe.itertuples(index=False))
+    del dataframe
+    return rows
 
 
 @dataclass
@@ -609,6 +651,271 @@ def evaluate_repair_samples(
             outcome = _classify_triple(triple, gold, patterns)
             aggregator.add(sample.constraint_type, action, outcome)
     return aggregator.as_dict()
+
+
+@dataclass
+class GlobalMetricsAccumulator:
+    support: int = 0
+    gfr_sum: float = 0.0
+    srr_sum: float = 0.0
+    sir_sum: float = 0.0
+    srr_denom: int = 0
+    sir_denom: int = 0
+    srr_num: int = 0
+    sir_num: int = 0
+    add_sum: int = 0
+    del_sum: int = 0
+    total_ops_sum: int = 0
+    changed_sum: int = 0
+
+    def update(
+        self,
+        *,
+        gfr: float,
+        srr: float,
+        sir: float,
+        srr_num: int,
+        srr_denom: int,
+        sir_num: int,
+        sir_denom: int,
+        add_count: int,
+        del_count: int,
+    ) -> None:
+        self.support += 1
+        self.gfr_sum += gfr
+        self.srr_sum += srr
+        self.sir_sum += sir
+        self.srr_num += srr_num
+        self.srr_denom += srr_denom
+        self.sir_num += sir_num
+        self.sir_denom += sir_denom
+        self.add_sum += add_count
+        self.del_sum += del_count
+        ops = add_count + del_count
+        self.total_ops_sum += ops
+        self.changed_sum += ops
+
+    def as_dict(self) -> dict[str, object]:
+        support = self.support or 1
+        return {
+            "support": self.support,
+            "gfr": self.gfr_sum / support,
+            "srr": self.srr_sum / support,
+            "sir": self.sir_sum / support,
+            "srr_total": self.srr_num,
+            "srr_denom_total": self.srr_denom,
+            "sir_total": self.sir_num,
+            "sir_denom_total": self.sir_denom,
+            "disruption": {
+                "added_triples_mean": self.add_sum / support,
+                "deleted_triples_mean": self.del_sum / support,
+                "total_ops_mean": self.total_ops_sum / support,
+                "changed_triples_mean": self.changed_sum / support,
+                "added_triples_total": self.add_sum,
+                "deleted_triples_total": self.del_sum,
+                "total_ops_total": self.total_ops_sum,
+                "changed_triples_total": self.changed_sum,
+            },
+        }
+
+
+def _coerce_factor_sequence(value: object) -> list[int] | list[bool] | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if hasattr(value, "tolist"):
+        try:
+            return list(value.tolist())  # type: ignore[call-arg]
+        except Exception:
+            pass
+    return [value]
+
+
+def _candidate_slots_from_sample(sample: RepairSample, none_class: int) -> tuple[int, int, int, int, int, int]:
+    add = sample.predicted.get("add")
+    delete = sample.predicted.get("del")
+    if add is None:
+        add_slot = (none_class, none_class, none_class)
+    else:
+        add_slot = add
+    if delete is None:
+        del_slot = (none_class, none_class, none_class)
+    else:
+        del_slot = delete
+    return (
+        int(add_slot[0]),
+        int(add_slot[1]),
+        int(add_slot[2]),
+        int(del_slot[0]),
+        int(del_slot[1]),
+        int(del_slot[2]),
+    )
+
+
+def _resolve_primary_index_from_row(row: object, local_constraint_ids: Sequence[int]) -> int:
+    value = getattr(row, "primary_factor_index", None)
+    if value is not None:
+        try:
+            idx = int(value)
+            if 0 <= idx < len(local_constraint_ids):
+                return idx
+        except (TypeError, ValueError):
+            pass
+    constraint_id = getattr(row, "constraint_id", None)
+    try:
+        constraint_id = int(constraint_id)
+    except (TypeError, ValueError):
+        return -1
+    try:
+        return list(local_constraint_ids).index(constraint_id)
+    except ValueError:
+        return -1
+
+
+def evaluate_global_repair_samples(
+    *,
+    samples: Sequence[RepairSample],
+    rows: Sequence[object],
+    evaluator: CandidateConstraintEvaluator,
+    none_class: int,
+    pre_vectors: Sequence[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    if len(samples) != len(rows):
+        raise ValueError(
+            f"Mismatch between prediction samples ({len(samples)}) and parquet rows ({len(rows)})."
+        )
+
+    per_sample_gfr: list[float] = []
+    per_sample_srr: list[float] = []
+    per_sample_sir: list[float] = []
+    per_sample_disruption: list[dict[str, int]] = []
+
+    overall = GlobalMetricsAccumulator()
+    per_constraint: dict[str, GlobalMetricsAccumulator] = {}
+
+    asserted_length_match = False
+
+    for idx, (sample, row) in enumerate(zip(samples, rows)):
+        candidate_slots = _candidate_slots_from_sample(sample, none_class)
+        details = evaluator.evaluate_full(row, candidate_slots=candidate_slots)
+
+        local_constraint_ids = details["local_constraint_ids"]
+        primary_index = details["primary_factor_index"]
+
+        pre_checkable = details["pre_checkable"]
+        pre_satisfied = details["pre_satisfied"]
+
+        if pre_vectors is not None and idx < len(pre_vectors):
+            override = pre_vectors[idx]
+            pre_checkable_override = _coerce_factor_sequence(override.get("pre_checkable"))
+            pre_satisfied_override = _coerce_factor_sequence(override.get("pre_satisfied"))
+            if pre_checkable_override is not None and pre_satisfied_override is not None:
+                pre_checkable = [bool(v) for v in pre_checkable_override]
+                pre_satisfied = [int(v) for v in pre_satisfied_override]
+            primary_override = override.get("primary_factor_index")
+            if primary_override is not None:
+                try:
+                    primary_index = int(primary_override)
+                except (TypeError, ValueError):
+                    pass
+
+        if primary_index < 0:
+            primary_index = _resolve_primary_index_from_row(row, local_constraint_ids)
+
+        post_checkable = details["post_checkable"]
+        post_satisfied = details["post_satisfied"]
+
+        if not asserted_length_match and len(post_checkable) > 0:
+            if len(pre_checkable) != len(post_checkable):
+                raise AssertionError(
+                    "Pre/post factor arrays length mismatch while computing global metrics."
+                )
+            asserted_length_match = True
+
+        checkable_total = sum(1 for flag in post_checkable if flag)
+        if checkable_total:
+            gfr = sum(
+                post_satisfied[i] for i, flag in enumerate(post_checkable) if flag
+            ) / float(checkable_total)
+        else:
+            gfr = 0.0
+
+        srr_num = 0
+        srr_denom = 0
+        sir_num = 0
+        sir_denom = 0
+        for i in range(len(post_checkable)):
+            if i == primary_index:
+                continue
+            if i >= len(pre_checkable):
+                continue
+            if not pre_checkable[i]:
+                continue
+            if not post_checkable[i]:
+                continue
+            if pre_satisfied[i]:
+                srr_denom += 1
+                if not post_satisfied[i]:
+                    srr_num += 1
+            else:
+                sir_denom += 1
+                if post_satisfied[i]:
+                    sir_num += 1
+
+        srr = float(srr_num) / srr_denom if srr_denom else 0.0
+        sir = float(sir_num) / sir_denom if sir_denom else 0.0
+
+        add_count = 1 if sample.predicted.get("add") is not None else 0
+        del_count = 1 if sample.predicted.get("del") is not None else 0
+
+        per_sample_gfr.append(gfr)
+        per_sample_srr.append(srr)
+        per_sample_sir.append(sir)
+        per_sample_disruption.append(
+            {
+                "added_triples": add_count,
+                "deleted_triples": del_count,
+                "total_ops": add_count + del_count,
+                "changed_triples": add_count + del_count,
+            }
+        )
+
+        overall.update(
+            gfr=gfr,
+            srr=srr,
+            sir=sir,
+            srr_num=srr_num,
+            srr_denom=srr_denom,
+            sir_num=sir_num,
+            sir_denom=sir_denom,
+            add_count=add_count,
+            del_count=del_count,
+        )
+
+        bucket = per_constraint.setdefault(sample.constraint_type, GlobalMetricsAccumulator())
+        bucket.update(
+            gfr=gfr,
+            srr=srr,
+            sir=sir,
+            srr_num=srr_num,
+            srr_denom=srr_denom,
+            sir_num=sir_num,
+            sir_denom=sir_denom,
+            add_count=add_count,
+            del_count=del_count,
+        )
+
+    return {
+        "overall": overall.as_dict(),
+        "per_constraint_type": {k: v.as_dict() for k, v in sorted(per_constraint.items())},
+        "per_sample": {
+            "gfr": per_sample_gfr,
+            "srr": per_sample_srr,
+            "sir": per_sample_sir,
+            "disruption": per_sample_disruption,
+        },
+    }
 
 
 class RepairOutcome:

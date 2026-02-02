@@ -454,6 +454,24 @@ class CandidateConstraintEvaluator:
         candidate_slots: Sequence[int],
         primary_factor_index: int,
     ) -> CandidateMetrics:
+        details = self.evaluate_full(
+            row,
+            candidate_slots=candidate_slots,
+            primary_factor_index=primary_factor_index,
+        )
+        return CandidateMetrics(
+            primary_satisfied=details["primary_satisfied"],
+            global_satisfied_fraction=details["global_satisfied_fraction"],
+            secondary_regressions=details["secondary_regressions"],
+        )
+
+    def evaluate_full(
+        self,
+        row: Any,
+        *,
+        candidate_slots: Sequence[int],
+        primary_factor_index: int | None = None,
+    ) -> Dict[str, Any]:
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
         facts_by_entity, predicates_present = _build_facts_state(
             row,
@@ -513,7 +531,18 @@ class CandidateConstraintEvaluator:
             constraint_ids_raw = getattr(row, "local_constraint_ids", None)
         local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=self._use_encoded_ids)
         if not local_constraint_ids:
-            return CandidateMetrics(primary_satisfied=0, global_satisfied_fraction=0.0, secondary_regressions=0)
+            return {
+                "local_constraint_ids": [],
+                "primary_factor_index": -1,
+                "pre_checkable": [],
+                "pre_satisfied": [],
+                "post_checkable": [],
+                "post_satisfied": [],
+                "primary_satisfied": 0,
+                "global_satisfied_fraction": 0.0,
+                "secondary_regressions": 0,
+                "secondary_improvements": 0,
+            }
 
         pre_checkable: List[bool] = []
         pre_satisfied: List[int] = []
@@ -535,9 +564,19 @@ class CandidateConstraintEvaluator:
             post_checkable.append(bool(checkable_post))
             post_satisfied.append(int(satisfied_post))
 
+        resolved_primary_index = -1
+        if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
+            resolved_primary_index = int(primary_factor_index)
+        else:
+            constraint_id = _coerce_value(getattr(row, "constraint_id", None), cast_int=self._use_encoded_ids)
+            try:
+                resolved_primary_index = local_constraint_ids.index(constraint_id)
+            except ValueError:
+                resolved_primary_index = -1
+
         primary_satisfied = 0
-        if 0 <= primary_factor_index < len(post_satisfied):
-            primary_satisfied = post_satisfied[primary_factor_index]
+        if 0 <= resolved_primary_index < len(post_satisfied):
+            primary_satisfied = post_satisfied[resolved_primary_index]
 
         checkable_total = sum(1 for flag in post_checkable if flag)
         if checkable_total:
@@ -546,15 +585,25 @@ class CandidateConstraintEvaluator:
             global_satisfied_fraction = 0.0
 
         secondary_regressions = 0
+        secondary_improvements = 0
         for idx in range(len(local_constraint_ids)):
-            if idx == primary_factor_index:
+            if idx == resolved_primary_index:
                 continue
-            if pre_checkable[idx] and pre_satisfied[idx]:
-                if post_checkable[idx] and not post_satisfied[idx]:
+            if pre_checkable[idx]:
+                if pre_satisfied[idx] and post_checkable[idx] and not post_satisfied[idx]:
                     secondary_regressions += 1
+                if (not pre_satisfied[idx]) and post_checkable[idx] and post_satisfied[idx]:
+                    secondary_improvements += 1
 
-        return CandidateMetrics(
-            primary_satisfied=primary_satisfied,
-            global_satisfied_fraction=global_satisfied_fraction,
-            secondary_regressions=secondary_regressions,
-        )
+        return {
+            "local_constraint_ids": local_constraint_ids,
+            "primary_factor_index": resolved_primary_index,
+            "pre_checkable": pre_checkable,
+            "pre_satisfied": pre_satisfied,
+            "post_checkable": post_checkable,
+            "post_satisfied": post_satisfied,
+            "primary_satisfied": primary_satisfied,
+            "global_satisfied_fraction": global_satisfied_fraction,
+            "secondary_regressions": secondary_regressions,
+            "secondary_improvements": secondary_improvements,
+        }
