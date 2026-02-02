@@ -189,6 +189,11 @@ def create_graph(
     subj_local_to_pred_global_to_pred_local_ids: dict[int, dict[int, list[int]]] = {}
     debug_entries: list[dict[str, Any]] = []
     primary_factor_focus_scope_ok: bool | None = None
+    factor_checkable_pre_tensor: torch.Tensor | None = None
+    factor_satisfied_pre_tensor: torch.Tensor | None = None
+    factor_checkable_post_gold_tensor: torch.Tensor | None = None
+    factor_satisfied_post_gold_tensor: torch.Tensor | None = None
+    factor_types_tensor: torch.Tensor | None = None
 
     def _resolve_registry_id(raw_id: str) -> int | None:
         raw = raw_id.strip()
@@ -512,6 +517,59 @@ def create_graph(
     if not factor_ids:
         factor_ids = [int(graph["constraint_id"])]
 
+    required_factor_fields = (
+        "factor_checkable_pre",
+        "factor_satisfied_pre",
+        "factor_checkable_post_gold",
+        "factor_satisfied_post_gold",
+        "factor_types",
+        "factor_constraint_ids",
+    )
+    if all(graph.get(field) is not None for field in required_factor_fields):
+        expected_len = len(factor_ids)
+
+        def _normalize_factor_list(value: Any, name: str) -> list[Any]:
+            if isinstance(value, list):
+                items = value
+            elif isinstance(value, tuple):
+                items = list(value)
+            elif _is_id_iterable(value):
+                items = list(value)
+            else:
+                items = [value]
+            if len(items) != expected_len:
+                raise AssertionError(
+                    f"Factor label length mismatch for {name}: expected {expected_len}, got {len(items)}."
+                )
+            return items
+
+        factor_ids_from_row = _normalize_factor_list(graph.get("factor_constraint_ids"), "factor_constraint_ids")
+        if factor_ids_from_row and [int(cid) for cid in factor_ids_from_row] != factor_ids:
+            raise AssertionError(
+                "Factor constraint id order mismatch between labeled data and graph builder."
+            )
+
+        factor_checkable_pre_tensor = torch.tensor(
+            _normalize_factor_list(graph.get("factor_checkable_pre"), "factor_checkable_pre"),
+            dtype=torch.bool,
+        )
+        factor_satisfied_pre_tensor = torch.tensor(
+            _normalize_factor_list(graph.get("factor_satisfied_pre"), "factor_satisfied_pre"),
+            dtype=torch.long,
+        )
+        factor_checkable_post_gold_tensor = torch.tensor(
+            _normalize_factor_list(graph.get("factor_checkable_post_gold"), "factor_checkable_post_gold"),
+            dtype=torch.bool,
+        )
+        factor_satisfied_post_gold_tensor = torch.tensor(
+            _normalize_factor_list(graph.get("factor_satisfied_post_gold"), "factor_satisfied_post_gold"),
+            dtype=torch.long,
+        )
+        factor_types_tensor = torch.tensor(
+            _normalize_factor_list(graph.get("factor_types"), "factor_types"),
+            dtype=torch.long,
+        )
+
     for idx, constraint_id in enumerate(factor_ids):
         constraint_token = global_int_encoder._decoding.get(constraint_id)
         if constraint_token in (None, "", "unknown") or constraint_id == unknown_global_id:
@@ -772,6 +830,12 @@ def create_graph(
     data_graph.factor_constraint_ids = torch.tensor(factor_constraint_ids, dtype=torch.long)
     data_graph.primary_factor_index = int(primary_factor_index)
     data_graph.factor_constraint_types = factor_constraint_types
+    if factor_checkable_pre_tensor is not None:
+        data_graph.factor_checkable_pre = factor_checkable_pre_tensor
+        data_graph.factor_satisfied_pre = factor_satisfied_pre_tensor
+        data_graph.factor_checkable_post_gold = factor_checkable_post_gold_tensor
+        data_graph.factor_satisfied_post_gold = factor_satisfied_post_gold_tensor
+        data_graph.factor_types = factor_types_tensor
     if debug_factor_wiring:
         data_graph.factor_wiring_debug = {
             "constraint_id": int(graph["constraint_id"]),
