@@ -381,8 +381,16 @@ def main() -> int:
                 eval_flags.append("--per-constraint-csv")
             if args.paper_suite and "--strict-global-metrics" not in eval_flags:
                 eval_flags.append("--strict-global-metrics")
+            chooser_enabled = bool(
+                cfg.get("training_config", {}).get("chooser", {}).get("enabled", False)
+            )
+            policy_enabled = bool(cfg.get("model_config", {}).get("enable_policy_choice", False))
 
             if kind == "proposal":
+                if chooser_enabled:
+                    eval_flags.append("--use-chooser")
+                if policy_enabled:
+                    eval_flags.append("--use-policy-choice")
                 eval_command = [
                     sys.executable,
                     "src/09_eval.py",

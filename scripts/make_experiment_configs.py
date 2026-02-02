@@ -105,6 +105,8 @@ class ProposalExperiment:
     factor_weight_pre: float = 0.1
     enable_policy_choice: bool = False
     policy_num_classes: int = 6
+    chooser_enabled: bool = False
+    chooser_loss_mode: str = "fix1"
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,90 @@ def main() -> None:
             enable_policy_choice=True,
             policy_num_classes=6,
         ),
+        ProposalExperiment(
+            name="p0_imitation",
+            model_name="GIN",
+            factor_loss_enabled=False,
+            pressure_enabled=False,
+            pressure_type_conditioning="none",
+            fix_prob_enabled=False,
+            validate_factor_labels=False,
+            enable_policy_choice=False,
+        ),
+        ProposalExperiment(
+            name="p1_factor_loss",
+            model_name="GIN",
+            factor_loss_enabled=True,
+            pressure_enabled=False,
+            pressure_type_conditioning="none",
+            fix_prob_enabled=False,
+            validate_factor_labels=True,
+            factor_weight_pre=0.1,
+            enable_policy_choice=False,
+        ),
+        ProposalExperiment(
+            name="p2_typed_pressure",
+            model_name="GIN_PRESSURE",
+            factor_loss_enabled=False,
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            fix_prob_enabled=False,
+            validate_factor_labels=False,
+            enable_policy_choice=False,
+        ),
+        ProposalExperiment(
+            name="p3_chooser_fix1",
+            model_name="GIN_PRESSURE",
+            factor_loss_enabled=True,
+            pressure_enabled=False,
+            pressure_type_conditioning="none",
+            fix_prob_enabled=False,
+            validate_factor_labels=True,
+            factor_weight_pre=0.1,
+            enable_policy_choice=False,
+            chooser_enabled=True,
+            chooser_loss_mode="fix1",
+        ),
+        ProposalExperiment(
+            name="p4_chooser_fix1_typed_pressure",
+            model_name="GIN_PRESSURE",
+            factor_loss_enabled=True,
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            fix_prob_enabled=False,
+            validate_factor_labels=True,
+            factor_weight_pre=0.1,
+            enable_policy_choice=False,
+            chooser_enabled=True,
+            chooser_loss_mode="fix1",
+        ),
+        ProposalExperiment(
+            name="p5_policy_choice",
+            model_name="GIN_PRESSURE",
+            factor_loss_enabled=True,
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            fix_prob_enabled=False,
+            validate_factor_labels=True,
+            factor_weight_pre=0.1,
+            enable_policy_choice=True,
+            policy_num_classes=6,
+            chooser_enabled=False,
+        ),
+        ProposalExperiment(
+            name="p6_policy_choice_with_chooser",
+            model_name="GIN_PRESSURE",
+            factor_loss_enabled=True,
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            fix_prob_enabled=False,
+            validate_factor_labels=True,
+            factor_weight_pre=0.1,
+            enable_policy_choice=True,
+            policy_num_classes=6,
+            chooser_enabled=True,
+            chooser_loss_mode="fix1",
+        ),
     ]
 
     if args.include_ablations:
@@ -222,18 +308,18 @@ def main() -> None:
             )
         )
         proposal_exps.append(
-            ProposalExperiment(
-                name="a4_pressure_typed",
-                model_name="GIN_PRESSURE",
-                factor_loss_enabled=True,
-                pressure_enabled=True,
-                pressure_type_conditioning="concat",
-                fix_prob_enabled=False,
-                validate_factor_labels=True,
-                factor_weight_pre=0.1,
-                enable_policy_choice=False,
-            )
+        ProposalExperiment(
+            name="a4_pressure_typed",
+            model_name="GIN_PRESSURE",
+            factor_loss_enabled=True,
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            fix_prob_enabled=False,
+            validate_factor_labels=True,
+            factor_weight_pre=0.1,
+            enable_policy_choice=False,
         )
+    )
 
     reranker_exps: list[RerankerExperiment] = [
         # M1 reranker: Fix 1 (imitation + no-regression vs gold)
@@ -305,6 +391,10 @@ def main() -> None:
                         # keep defaults: only_checkable=True, per_graph_reduction="mean"
                     },
                     "policy_filter_strict": True,
+                    "chooser": {
+                        "enabled": bool(exp.chooser_enabled),
+                        "loss_mode": exp.chooser_loss_mode,
+                    },
                 },
             }
             _write_json(cfg_path, payload)
