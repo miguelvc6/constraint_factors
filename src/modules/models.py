@@ -146,6 +146,9 @@ class BaseGraphModel(nn.Module, ABC):
         self._head_hidden = head_hidden
         self._branch_hidden = branch_hidden
         self._num_layers = int(num_layers)
+        self._chooser_enabled = False
+        self._candidate_id_embeddings: nn.Embedding | None = None
+        self._chooser_head: nn.Sequential | None = None
         self._num_factor_types = int(num_factor_types)
         self._factor_type_embedding_dim = int(factor_type_embedding_dim)
         self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
@@ -194,6 +197,43 @@ class BaseGraphModel(nn.Module, ABC):
     @property
     def role_embedding_dim(self) -> int:
         return self._role_embedding_dim
+
+    @property
+    def chooser_enabled(self) -> bool:
+        return bool(self._chooser_enabled)
+
+    def enable_chooser(self) -> None:
+        if self._chooser_enabled:
+            return
+        device = next(self.parameters()).device
+        candidate_emb = nn.Embedding(self.num_target_ids, self._head_hidden).to(device)
+        chooser_head = nn.Sequential(
+            nn.Linear(self._head_hidden * 2, self._head_hidden),
+            nn.ReLU(),
+            nn.Linear(self._head_hidden, 1),
+        ).to(device)
+        self._candidate_id_embeddings = candidate_emb
+        self._chooser_head = chooser_head
+        self._chooser_enabled = True
+
+    def score_candidates(self, graph_emb: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+        if not self._chooser_enabled or self._candidate_id_embeddings is None or self._chooser_head is None:
+            raise RuntimeError("Chooser head not enabled; call enable_chooser() before scoring candidates.")
+        if candidates.dim() == 1:
+            candidates = candidates.view(1, -1)
+        if candidates.size(-1) != 6:
+            raise ValueError(f"Expected candidate slots shape (*,6), got {tuple(candidates.shape)}")
+        candidates = candidates.to(device=graph_emb.device, dtype=torch.long)
+        candidate_emb = self._candidate_id_embeddings(
+            candidates.clamp(min=0, max=self.num_target_ids - 1)
+        )
+        candidate_repr = candidate_emb.mean(dim=1)
+        if graph_emb.dim() == 1:
+            graph_emb = graph_emb.view(1, -1)
+        graph_expand = graph_emb.expand(candidate_repr.size(0), -1)
+        joint = torch.cat([graph_expand, candidate_repr], dim=-1)
+        scores = self._chooser_head(joint).squeeze(-1)
+        return scores
 
     @abstractmethod
     def create_conv_layer(self, in_channels: int, out_channels: int) -> nn.Module:

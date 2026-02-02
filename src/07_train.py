@@ -13,6 +13,7 @@ from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
+from modules.candidates import CandidateConfig, build_candidates
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import (
     GlobalIntEncoder,
@@ -29,6 +30,7 @@ from modules.model_store import (
 )
 from modules.models import BaseGraphModel, build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
+from modules.reranker_eval import CandidateConstraintEvaluator
 from modules.training_utils import (
     ConstraintMetricsAccumulator,
     DynamicConstraintWeighter,
@@ -134,6 +136,46 @@ def derive_factor_type_count(
             update_from_tensor(torch.as_tensor(factor_types))
 
     return max_type + 1 if max_type >= 0 else 0
+
+
+def _load_encoder(interim_path: Path) -> GlobalIntEncoder:
+    encoder = GlobalIntEncoder()
+    encoder.load(interim_path / "globalintencoder.txt")
+    encoder.freeze()
+    return encoder
+
+
+def _load_parquet_rows(interim_path: Path, split: str) -> list:
+    import pandas as pd
+
+    path = interim_path / f"df_{split}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Parquet split not found at {path}")
+    columns = [
+        "constraint_id",
+        "constraint_type",
+        "subject",
+        "predicate",
+        "object",
+        "other_subject",
+        "other_predicate",
+        "other_object",
+        "constraint_predicates",
+        "constraint_objects",
+        "subject_predicates",
+        "subject_objects",
+        "object_predicates",
+        "object_objects",
+        "other_entity_predicates",
+        "other_entity_objects",
+        "local_constraint_ids",
+        "local_constraint_ids_focus",
+    ]
+    df = pd.read_parquet(path)
+    existing = [col for col in columns if col in df.columns]
+    if existing:
+        df = df[existing]
+    return list(df.itertuples(index=False))
 
 
 def _assert_factor_labels(graph: Data, graph_index: int | None = None) -> None:
@@ -272,6 +314,7 @@ def train(
     train_cfg: TrainingConfig,
     device: torch.device | str = torch.device("cpu"),
     fix_loss_state: dict[str, object] | None = None,
+    chooser_state: dict[str, object] | None = None,
 ):
     # Normalise the device argument because config may pass strings.
     if isinstance(device, str):
@@ -288,6 +331,24 @@ def train(
         fix_heuristics = cast(ConstraintRepairHeuristics | None, fix_loss_state.get("heuristics"))
         train_contexts = cast(list[ViolationContext] | None, fix_loss_state.get("train_contexts"))
         val_contexts = cast(list[ViolationContext] | None, fix_loss_state.get("val_contexts"))
+
+    chooser_cfg = train_cfg.chooser
+    chooser_enabled = bool(chooser_cfg.enabled)
+    chooser_heuristics = None
+    chooser_train_rows = None
+    chooser_val_rows = None
+    chooser_train_contexts = None
+    chooser_val_contexts = None
+    chooser_evaluator = None
+    chooser_candidate_cfg = None
+    if chooser_enabled and chooser_state:
+        chooser_heuristics = cast(ConstraintRepairHeuristics | None, chooser_state.get("heuristics"))
+        chooser_train_rows = cast(list | None, chooser_state.get("train_rows"))
+        chooser_val_rows = cast(list | None, chooser_state.get("val_rows"))
+        chooser_train_contexts = cast(list[ViolationContext] | None, chooser_state.get("train_contexts"))
+        chooser_val_contexts = cast(list[ViolationContext] | None, chooser_state.get("val_contexts"))
+        chooser_evaluator = cast(CandidateConstraintEvaluator | None, chooser_state.get("evaluator"))
+        chooser_candidate_cfg = cast(CandidateConfig | None, chooser_state.get("candidate_cfg"))
 
     # Unpack training configuration.
     batch_size = train_cfg.batch_size
@@ -403,6 +464,8 @@ def train(
         train_factor_loss_sum = 0.0
         train_factor_count = 0
         train_factor_correct = 0
+        train_chooser_loss_sum = 0.0
+        train_chooser_count = 0
 
         train_constraint_metrics = ConstraintMetricsAccumulator()
         data_iter = progress_bar(train_loader, desc="Training Batches", leave=False)
@@ -547,6 +610,106 @@ def train(
                     targets_long = factor_targets.to(dtype=torch.long)
                     train_factor_correct += int((preds[active_mask] == targets_long[active_mask]).sum().item())
 
+            if chooser_enabled:
+                if chooser_evaluator is None or chooser_heuristics is None:
+                    raise RuntimeError("Chooser enabled but evaluator/heuristics are not initialized.")
+                if chooser_candidate_cfg is None:
+                    chooser_candidate_cfg = CandidateConfig(
+                        topk_candidates=chooser_cfg.topk_candidates,
+                        max_candidates_total=chooser_cfg.max_candidates_total,
+                    )
+                graph_emb = outputs.get("graph_emb")
+                if graph_emb is None:
+                    raise RuntimeError("Model output missing graph_emb required for chooser.")
+                graphs = data.to_data_list()
+                chooser_losses = torch.zeros(
+                    graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                )
+                for idx, graph in enumerate(graphs):
+                    context_index = int(getattr(graph, "context_index", idx))
+                    if chooser_train_contexts is None or chooser_train_rows is None:
+                        raise RuntimeError("Chooser enabled but training contexts/rows are missing.")
+                    if context_index >= len(chooser_train_contexts) or context_index >= len(chooser_train_rows):
+                        raise RuntimeError("Chooser context index out of bounds.")
+                    context = chooser_train_contexts[context_index]
+                    row = chooser_train_rows[context_index]
+                    candidates, gold_index = build_candidates(
+                        graph=graph,
+                        context=context,
+                        heuristics=chooser_heuristics,
+                        proposal_logits=out[idx].detach(),
+                        cfg=chooser_candidate_cfg,
+                        placeholder_ids=set(chooser_heuristics.placeholder_ids.values()),
+                        num_target_ids=model.num_target_ids,
+                    )
+                    candidate_tensor = torch.tensor(
+                        candidates, dtype=torch.long, device=graph_loss.device
+                    )
+                    scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+                    log_probs = F.log_softmax(scores, dim=0)
+                    probs = log_probs.exp()
+                    details = chooser_evaluator.evaluate_candidates(
+                        row,
+                        candidates=candidates,
+                        primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                    )
+                    loss_mode = chooser_cfg.loss_mode
+                    if loss_mode == "global_fix":
+                        satisfaction = torch.tensor(
+                            [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
+                            dtype=graph_loss.dtype,
+                            device=graph_loss.device,
+                        )
+                        chooser_loss = -torch.sum(probs * satisfaction)
+                    else:
+                        ce_loss = -log_probs[gold_index]
+                        gold_details = details[gold_index]
+                        gold_post = gold_details.get("post_satisfied", [])
+                        gold_post_checkable = gold_details.get("post_checkable", [])
+                        primary_idx = int(getattr(graph, "primary_factor_index", 0))
+                        regression_rates: list[float] = []
+                        primary_flags: list[float] = []
+                        for detail in details:
+                            post = detail.get("post_satisfied", [])
+                            post_checkable = detail.get("post_checkable", [])
+                            regress = 0
+                            denom = 0
+                            for j in range(min(len(post), len(gold_post))):
+                                if j == primary_idx:
+                                    continue
+                                if j >= len(post_checkable) or j >= len(gold_post_checkable):
+                                    continue
+                                if not post_checkable[j] or not gold_post_checkable[j]:
+                                    continue
+                                if gold_post[j]:
+                                    denom += 1
+                                    if not post[j]:
+                                        regress += 1
+                            rate = float(regress) / denom if denom else 0.0
+                            regression_rates.append(rate)
+                            primary_flags.append(float(detail.get("primary_satisfied", 0)))
+                        chooser_loss = ce_loss
+                        if loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0:
+                            regression_tensor = torch.tensor(
+                                regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
+                            )
+                            gold_regression = regression_tensor[gold_index]
+                            reg_penalty = torch.sum(
+                                probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
+                            )
+                            chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
+                        if chooser_cfg.gamma_primary > 0:
+                            primary_tensor = torch.tensor(
+                                primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
+                            )
+                            primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
+                            chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
+                    chooser_losses[idx] = chooser_loss
+
+                graph_loss = graph_loss + chooser_losses
+                train_chooser_loss_sum += float(chooser_losses.sum().item())
+                train_chooser_count += chooser_losses.numel()
+
             # Optional - Rebalance weights based on constraint types
             constraint_types = extract_constraint_types(data, loss_matrix.size(0))
             sample_weights = dynamic_weighter.weights_for(constraint_types)
@@ -631,6 +794,9 @@ def train(
                     "factor_loss": f"{train_factor_loss_sum / max(train_factor_count, 1):.4f}"
                     if factor_cfg.enabled
                     else "n/a",
+                    "chooser_loss": f"{train_chooser_loss_sum / max(train_chooser_count, 1):.4f}"
+                    if chooser_enabled
+                    else "n/a",
                 }
             )
 
@@ -645,6 +811,7 @@ def train(
         train_per_constraint = train_constraint_metrics.as_epoch_metrics()
         train_factor_loss = train_factor_loss_sum / max(train_factor_count, 1)
         train_factor_acc = 100 * train_factor_correct / max(train_factor_count, 1)
+        train_chooser_loss = train_chooser_loss_sum / max(train_chooser_count, 1)
 
         # ------- Validation -------
         model.eval()
@@ -662,6 +829,8 @@ def train(
         val_factor_loss_sum = 0.0
         val_factor_count = 0
         val_factor_correct = 0
+        val_chooser_loss_sum = 0.0
+        val_chooser_count = 0
 
         with torch.no_grad():
             for batch_idx, data in enumerate(
@@ -791,6 +960,106 @@ def train(
                         targets_long = factor_targets.to(dtype=torch.long)
                         val_factor_correct += int((preds[active_mask] == targets_long[active_mask]).sum().item())
 
+                if chooser_enabled:
+                    if chooser_evaluator is None or chooser_heuristics is None:
+                        raise RuntimeError("Chooser enabled but evaluator/heuristics are not initialized.")
+                    if chooser_candidate_cfg is None:
+                        chooser_candidate_cfg = CandidateConfig(
+                            topk_candidates=chooser_cfg.topk_candidates,
+                            max_candidates_total=chooser_cfg.max_candidates_total,
+                        )
+                    graph_emb = outputs.get("graph_emb")
+                    if graph_emb is None:
+                        raise RuntimeError("Model output missing graph_emb required for chooser.")
+                    graphs = data.to_data_list()
+                    chooser_losses = torch.zeros(
+                        graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                    )
+                    for idx, graph in enumerate(graphs):
+                        context_index = int(getattr(graph, "context_index", idx))
+                        if chooser_val_contexts is None or chooser_val_rows is None:
+                            raise RuntimeError("Chooser enabled but validation contexts/rows are missing.")
+                        if context_index >= len(chooser_val_contexts) or context_index >= len(chooser_val_rows):
+                            raise RuntimeError("Chooser context index out of bounds.")
+                        context = chooser_val_contexts[context_index]
+                        row = chooser_val_rows[context_index]
+                        candidates, gold_index = build_candidates(
+                            graph=graph,
+                            context=context,
+                            heuristics=chooser_heuristics,
+                            proposal_logits=out[idx].detach(),
+                            cfg=chooser_candidate_cfg,
+                            placeholder_ids=set(chooser_heuristics.placeholder_ids.values()),
+                            num_target_ids=model.num_target_ids,
+                        )
+                        candidate_tensor = torch.tensor(
+                            candidates, dtype=torch.long, device=graph_loss.device
+                        )
+                        scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+                        log_probs = F.log_softmax(scores, dim=0)
+                        probs = log_probs.exp()
+                        details = chooser_evaluator.evaluate_candidates(
+                            row,
+                            candidates=candidates,
+                            primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                        )
+                        loss_mode = chooser_cfg.loss_mode
+                        if loss_mode == "global_fix":
+                            satisfaction = torch.tensor(
+                                [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
+                                dtype=graph_loss.dtype,
+                                device=graph_loss.device,
+                            )
+                            chooser_loss = -torch.sum(probs * satisfaction)
+                        else:
+                            ce_loss = -log_probs[gold_index]
+                            gold_details = details[gold_index]
+                            gold_post = gold_details.get("post_satisfied", [])
+                            gold_post_checkable = gold_details.get("post_checkable", [])
+                            primary_idx = int(getattr(graph, "primary_factor_index", 0))
+                            regression_rates: list[float] = []
+                            primary_flags: list[float] = []
+                            for detail in details:
+                                post = detail.get("post_satisfied", [])
+                                post_checkable = detail.get("post_checkable", [])
+                                regress = 0
+                                denom = 0
+                                for j in range(min(len(post), len(gold_post))):
+                                    if j == primary_idx:
+                                        continue
+                                    if j >= len(post_checkable) or j >= len(gold_post_checkable):
+                                        continue
+                                    if not post_checkable[j] or not gold_post_checkable[j]:
+                                        continue
+                                    if gold_post[j]:
+                                        denom += 1
+                                        if not post[j]:
+                                            regress += 1
+                                rate = float(regress) / denom if denom else 0.0
+                                regression_rates.append(rate)
+                                primary_flags.append(float(detail.get("primary_satisfied", 0)))
+                            chooser_loss = ce_loss
+                            if loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0:
+                                regression_tensor = torch.tensor(
+                                    regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
+                                )
+                                gold_regression = regression_tensor[gold_index]
+                                reg_penalty = torch.sum(
+                                    probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
+                                )
+                                chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
+                            if chooser_cfg.gamma_primary > 0:
+                                primary_tensor = torch.tensor(
+                                    primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
+                                )
+                                primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
+                                chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
+                        chooser_losses[idx] = chooser_loss
+
+                    graph_loss = graph_loss + chooser_losses
+                    val_chooser_loss_sum += float(chooser_losses.sum().item())
+                    val_chooser_count += chooser_losses.numel()
+
                 # Accumulate validation metrics
                 val_graph_loss_sum += graph_loss.sum().item()
                 val_graph_count += graph_loss.numel()
@@ -854,6 +1123,7 @@ def train(
         val_per_constraint = val_constraint_metrics.as_epoch_metrics()
         val_factor_loss = val_factor_loss_sum / max(val_factor_count, 1)
         val_factor_acc = 100 * val_factor_correct / max(val_factor_count, 1)
+        val_chooser_loss = val_chooser_loss_sum / max(val_chooser_count, 1)
 
         logger.info(
             "Epoch %s samples | train=%s validation=%s",
@@ -871,6 +1141,8 @@ def train(
         history["val_acc_all6"].append(val_acc_all6)
         history["train_acc_slot"].append(train_acc_slot)
         history["val_acc_slot"].append(val_acc_slot)
+        history.setdefault("train_chooser_loss", []).append(train_chooser_loss)
+        history.setdefault("val_chooser_loss", []).append(val_chooser_loss)
 
         # Record per-slot diagnostics (helps inspect slot-specific drift).
         per_slot_history = history.setdefault("per_slot", {})
@@ -1140,6 +1412,60 @@ def main():
     else:
         fix_scheduler = None
 
+    chooser_state: dict[str, object] | None = None
+    chooser_cfg = training_cfg.chooser
+    if chooser_cfg.enabled:
+        if not isinstance(train_data, list) or not isinstance(val_data, list):
+            raise RuntimeError("Chooser training requires in-memory datasets (list[Data]).")
+        placeholder_ids = placeholder_ids_from_encoder(encoder)
+        chooser_heuristics = ConstraintRepairHeuristics(
+            encoder=encoder,
+            placeholder_ids=placeholder_ids,
+            none_class=NONE_CLASS_INDEX,
+        )
+        train_contexts = load_violation_contexts(interim_path, "train", none_class=NONE_CLASS_INDEX)
+        val_contexts = load_violation_contexts(interim_path, "val", none_class=NONE_CLASS_INDEX)
+        if len(train_contexts) != len(train_data) or len(val_contexts) != len(val_data):
+            raise RuntimeError("Mismatch between graph dataset size and violation contexts for chooser.")
+        for idx, graph in enumerate(train_data):
+            setattr(graph, "context_index", idx)
+        for idx, graph in enumerate(val_data):
+            setattr(graph, "context_index", idx)
+        train_rows = _load_parquet_rows(interim_path, "train")
+        val_rows = _load_parquet_rows(interim_path, "val")
+        if len(train_rows) != len(train_data) or len(val_rows) != len(val_data):
+            raise RuntimeError("Mismatch between parquet rows and graph dataset size for chooser.")
+        registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
+        if not registry_path.exists():
+            raise FileNotFoundError(f"Constraint registry not found at {registry_path}")
+        evaluator = CandidateConstraintEvaluator(
+            str(registry_path),
+            encoder=encoder,
+            assume_complete=True,
+            constraint_scope="local",
+            use_encoded_ids=True,
+        )
+        candidate_cfg = CandidateConfig(
+            topk_candidates=chooser_cfg.topk_candidates,
+            max_candidates_total=chooser_cfg.max_candidates_total,
+            include_gold=True,
+        )
+        chooser_state = {
+            "heuristics": chooser_heuristics,
+            "train_rows": train_rows,
+            "val_rows": val_rows,
+            "train_contexts": train_contexts,
+            "val_contexts": val_contexts,
+            "evaluator": evaluator,
+            "candidate_cfg": candidate_cfg,
+        }
+        logger.info(
+            "Chooser enabled | topk_candidates=%s max_candidates_total=%s loss_mode=%s",
+            chooser_cfg.topk_candidates,
+            chooser_cfg.max_candidates_total,
+            chooser_cfg.loss_mode,
+        )
+
     # Select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Selected compute device: %s", device)
@@ -1158,6 +1484,8 @@ def main():
         model_cfg,
     )
     model.to(device)
+    if chooser_cfg.enabled:
+        model.enable_chooser()
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model parameters | total=%s trainable=%s", total_params, trainable_params)
@@ -1192,6 +1520,7 @@ def main():
         train_cfg=training_cfg,
         device=device,
         fix_loss_state=fix_loss_state,
+        chooser_state=chooser_state,
     )
 
     if device.type == "cuda":

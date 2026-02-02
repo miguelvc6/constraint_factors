@@ -223,6 +223,54 @@ class FactorLossConfig:
 
 
 @dataclass
+class ChooserConfig:
+    enabled: bool = False
+    topk_candidates: int = 20
+    max_candidates_total: int = 80
+    beta_no_regression: float = 0.5
+    gamma_primary: float = 0.0
+    loss_mode: str = "fix1"  # fix1 | primary_only | global_fix
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ChooserConfig":
+        instance = cls()
+        return instance.updated(data or {})
+
+    def updated(self, data: Mapping[str, Any] | None = None, **overrides: Any) -> "ChooserConfig":
+        payload = dict(data or {})
+        payload.update(overrides)
+        filtered = _filter_fields(type(self), payload)
+
+        if "enabled" in filtered and filtered["enabled"] is not None:
+            filtered["enabled"] = bool(filtered["enabled"])
+        for key in ("topk_candidates", "max_candidates_total"):
+            if key in filtered and filtered[key] is not None:
+                filtered[key] = int(filtered[key])
+        for key in ("beta_no_regression", "gamma_primary"):
+            if key in filtered and filtered[key] is not None:
+                filtered[key] = float(filtered[key])
+        if "loss_mode" in filtered and filtered["loss_mode"] is not None:
+            value = str(filtered["loss_mode"]).lower()
+            if value not in {"fix1", "primary_only", "global_fix"}:
+                raise ValueError("ChooserConfig.loss_mode must be 'fix1', 'primary_only', or 'global_fix'")
+            filtered["loss_mode"] = value
+
+        current = {f.name: getattr(self, f.name) for f in fields(type(self))}
+        current.update(filtered)
+        return type(self)(**current)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "topk_candidates": self.topk_candidates,
+            "max_candidates_total": self.max_candidates_total,
+            "beta_no_regression": self.beta_no_regression,
+            "gamma_primary": self.gamma_primary,
+            "loss_mode": self.loss_mode,
+        }
+
+
+@dataclass
 class ModelConfig:
     dataset_variant: str = "full" 
     """Which intermediate dataset variant to consume."""
@@ -331,6 +379,7 @@ class TrainingConfig:
     constraint_loss: ConstraintLossConfig = field(default_factory=ConstraintLossConfig)
     fix_probability_loss: FixProbabilityLossConfig = field(default_factory=FixProbabilityLossConfig)
     factor_loss: FactorLossConfig = field(default_factory=FactorLossConfig)
+    chooser: ChooserConfig = field(default_factory=ChooserConfig)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "TrainingConfig":
@@ -353,6 +402,7 @@ class TrainingConfig:
         constraint_update = filtered.pop("constraint_loss", None)
         fix_loss_update = filtered.pop("fix_probability_loss", None)
         factor_loss_update = filtered.pop("factor_loss", None)
+        chooser_update = filtered.pop("chooser", None)
 
         if dynamic_fallback is not None:
             if constraint_update is None:
@@ -386,6 +436,11 @@ class TrainingConfig:
                 current["factor_loss"] = factor_loss_update
             else:
                 current["factor_loss"] = self.factor_loss.updated(factor_loss_update)
+        if chooser_update is not None:
+            if isinstance(chooser_update, ChooserConfig):
+                current["chooser"] = chooser_update
+            else:
+                current["chooser"] = self.chooser.updated(chooser_update)
 
         return type(self)(**current)
 
@@ -394,6 +449,7 @@ class TrainingConfig:
         payload["constraint_loss"] = self.constraint_loss.to_dict()
         payload["fix_probability_loss"] = self.fix_probability_loss.to_dict()
         payload["factor_loss"] = self.factor_loss.to_dict()
+        payload["chooser"] = self.chooser.to_dict()
         return payload
 
 
@@ -404,4 +460,5 @@ __all__ = [
     "DynamicReweightingConfig",
     "FixProbabilityLossConfig",
     "FactorLossConfig",
+    "ChooserConfig",
 ]

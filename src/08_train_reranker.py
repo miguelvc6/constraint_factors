@@ -31,6 +31,7 @@ from modules.model_store import (
 )
 from modules.models import build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
+from modules.candidates import CandidateConfig, build_candidates
 from modules.reranker import CandidateReranker, RerankerConfig, build_reranker
 from modules.reranker_eval import CandidateConstraintEvaluator, _metrics_from_details
 from modules.training_utils import (
@@ -337,66 +338,23 @@ def _build_candidates(
     placeholder_ids: set[int],
     num_target_ids: int,
 ) -> tuple[list[tuple[int, int, int, int, int, int]], int]:
-    candidates: list[tuple[int, int, int, int, int, int]] = []
-
-    if cfg.include_gold:
-        candidates.append(_gold_candidate(graph))
-
-    candidate_map = heuristics.candidates_for(context)
-    add_triples = _instantiate_patterns(
-        candidate_map.add,
-        placeholder_ids=placeholder_ids,
-        none_class=NONE_CLASS_INDEX,
-        max_values=cfg.heuristic_max_values,
-        max_candidates=cfg.heuristic_max_candidates,
-    )
-    del_triples = _instantiate_patterns(
-        candidate_map.delete,
-        placeholder_ids=placeholder_ids,
-        none_class=NONE_CLASS_INDEX,
-        max_values=cfg.heuristic_max_values,
-        max_candidates=cfg.heuristic_max_candidates,
-    )
-    candidates.extend(_candidate_from_triple(triple, action="add") for triple in add_triples)
-    candidates.extend(_candidate_from_triple(triple, action="delete") for triple in del_triples)
-
-    add_slots = (0, 1, 2)
-    del_slots = (3, 4, 5)
-    add_topk = _topk_triples_from_logits(
-        proposal_logits,
-        slots=add_slots,
-        topk_triples=cfg.topk_candidates,
+    candidate_cfg = CandidateConfig(
+        topk_candidates=cfg.topk_candidates,
         topk_per_slot=cfg.topk_per_slot,
+        heuristic_max_candidates=cfg.heuristic_max_candidates,
+        heuristic_max_values=cfg.heuristic_max_values,
+        include_gold=cfg.include_gold,
+        max_candidates_total=cfg.max_candidates_total,
     )
-    del_topk = _topk_triples_from_logits(
-        proposal_logits,
-        slots=del_slots,
-        topk_triples=cfg.topk_candidates,
-        topk_per_slot=cfg.topk_per_slot,
+    return build_candidates(
+        graph=graph,
+        context=context,
+        heuristics=heuristics,
+        proposal_logits=proposal_logits,
+        cfg=candidate_cfg,
+        placeholder_ids=placeholder_ids,
+        num_target_ids=num_target_ids,
     )
-    candidates.extend(_candidate_from_triple(triple, action="add") for triple in add_topk)
-    candidates.extend(_candidate_from_triple(triple, action="delete") for triple in del_topk)
-
-    deduped: list[tuple[int, int, int, int, int, int]] = []
-    seen: set[tuple[int, int, int, int, int, int]] = set()
-    for cand in candidates:
-        if any(v < 0 or v >= num_target_ids for v in cand):
-            continue
-        if cand in seen:
-            continue
-        seen.add(cand)
-        deduped.append(cand)
-        if len(deduped) >= cfg.max_candidates_total:
-            break
-
-    gold = _gold_candidate(graph)
-    if any(v < 0 or v >= num_target_ids for v in gold):
-        raise ValueError("Gold candidate contains out-of-range ids for target vocabulary.")
-    if gold not in seen:
-        deduped.insert(0, gold)
-    gold_index = deduped.index(gold)
-
-    return deduped, gold_index
 
 
 def _evaluate_candidate_set(

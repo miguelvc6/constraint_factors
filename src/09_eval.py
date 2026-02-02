@@ -32,7 +32,8 @@ from torch_geometric.loader import DataLoader
 from tqdm.autonotebook import tqdm
 
 from modules.baselines import evaluate_baselines
-from modules.config import ModelConfig
+from modules.candidates import CandidateConfig, build_candidates
+from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import GlobalIntEncoder
 from modules.model_store import baseline_dir, config_copy_path, evaluations_dir, get_checkpoint_path
 from modules.models import BaseGraphModel, build_model
@@ -138,6 +139,13 @@ class GlobalMetricsSupport:
             state["global_metrics_per_constraint_type"] = state["global_metrics"].get("per_constraint_type", {})
 
         return _postprocess, state
+
+
+@dataclass
+class ChooserSupport:
+    contexts: Sequence[ViolationContext]
+    heuristics: ConstraintRepairHeuristics
+    candidate_cfg: CandidateConfig
 
 
 def _repair_samples_from_predictions(
@@ -444,6 +452,7 @@ def eval(
     none_class: int = NONE_CLASS_INDEX,
     postprocess: Callable[[torch.Tensor, torch.Tensor, list[str]], None] | None = None,
     precomputed_predictions: torch.Tensor | None = None,
+    chooser_support: ChooserSupport | None = None,
 ) -> dict[str, object]:
     """Evaluate a model and return Bass-style precision/recall/F1 metrics."""
     if isinstance(device, str):
@@ -455,6 +464,8 @@ def eval(
 
     if precomputed_predictions is None and model is None:
         raise ValueError("Either a model or precomputed_predictions must be provided.")
+    if precomputed_predictions is not None and chooser_support is not None:
+        raise ValueError("Chooser support cannot be used with precomputed predictions.")
     if precomputed_predictions is None and model is not None:
         model.eval()
     predictions, targets = [], []
@@ -468,6 +479,7 @@ def eval(
                     logging.info("Model forward returned dict outputs; using edit_logits.")
                     output_logged = True
                 logits = out.get("edit_logits")
+                graph_emb = out.get("graph_emb")
                 if logits is None:
                     raise KeyError("Model output dict missing 'edit_logits'.")
             else:
@@ -475,8 +487,36 @@ def eval(
                     logging.info("Model forward returned tensor outputs.")
                     output_logged = True
                 logits = out
-            out = logits.argmax(dim=-1)  # class predictions per action
-            predictions.append(out.cpu())
+                graph_emb = None
+            if chooser_support is not None:
+                if graph_emb is None:
+                    raise RuntimeError("Chooser mode requires graph_emb from model outputs.")
+                graphs = data.to_data_list()
+                batch_preds = []
+                for idx, graph in enumerate(graphs):
+                    context_index = int(getattr(graph, "context_index", idx))
+                    if context_index >= len(chooser_support.contexts):
+                        raise RuntimeError("Chooser context index out of bounds.")
+                    context = chooser_support.contexts[context_index]
+                    candidates, _ = build_candidates(
+                        graph=graph,
+                        context=context,
+                        heuristics=chooser_support.heuristics,
+                        proposal_logits=logits[idx].detach(),
+                        cfg=chooser_support.candidate_cfg,
+                        placeholder_ids=set(chooser_support.heuristics.placeholder_ids.values()),
+                        num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
+                    )
+                    candidate_tensor = torch.tensor(
+                        candidates, dtype=torch.long, device=logits.device
+                    )
+                    scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+                    best_idx = int(torch.argmax(scores).item())
+                    batch_preds.append(list(candidates[best_idx]))
+                predictions.append(torch.tensor(batch_preds, dtype=torch.long))
+            else:
+                out = logits.argmax(dim=-1)  # class predictions per action
+                predictions.append(out.cpu())
         targets.append(data.y.cpu())
 
     if precomputed_predictions is None:
@@ -615,6 +655,7 @@ def _run_and_save(
     postprocess_state: dict[str, object] | None = None,
     precomputed_predictions: torch.Tensor | None = None,
     write_per_constraint_csv: bool = False,
+    chooser_support: ChooserSupport | None = None,
 ) -> dict[str, object]:
     normalized_predictions = None
     if precomputed_predictions is not None:
@@ -625,6 +666,7 @@ def _run_and_save(
         device=device,
         postprocess=postprocess,
         precomputed_predictions=normalized_predictions,
+        chooser_support=chooser_support,
     )
     metrics["global_metrics_computed"] = bool(
         postprocess_state and isinstance(postprocess_state, dict) and "global_metrics" in postprocess_state
@@ -879,6 +921,7 @@ def evaluate_trained_model(
     postprocess_state: dict[str, object] | None = None,
     precomputed_predictions: torch.Tensor | None = None,
     write_per_constraint_csv: bool = False,
+    chooser_support: ChooserSupport | None = None,
 ) -> None:
     checkpoint_path = get_checkpoint_path(run_directory)
 
@@ -894,6 +937,8 @@ def evaluate_trained_model(
 
         if isinstance(checkpoint, BaseGraphModel):
             model = checkpoint.to(device)
+            if chooser_support is not None and not model.chooser_enabled:
+                model.enable_chooser()
         elif isinstance(checkpoint, dict):
             model_name = checkpoint.get("model_name") or model_cfg.model
             num_graph_nodes = checkpoint.get("num_graph_nodes")
@@ -912,6 +957,8 @@ def evaluate_trained_model(
                 int(num_graph_nodes),
                 effective_model_cfg,
             )
+            if chooser_support is not None:
+                model.enable_chooser()
             model.load_state_dict(state_dict)
             model.to(device)
             printable_config = {k: v for k, v in effective_model_cfg.to_dict().items() if k != "entity_class_ids"}
@@ -928,6 +975,7 @@ def evaluate_trained_model(
         postprocess_state=postprocess_state,
         precomputed_predictions=precomputed_predictions,
         write_per_constraint_csv=write_per_constraint_csv,
+        chooser_support=chooser_support,
     )
 
 
@@ -985,6 +1033,11 @@ def parse_args():
         type=Path,
         help="Optional path to reranker predictions to evaluate without a model forward pass.",
     )
+    parser.add_argument(
+        "--use-chooser",
+        action="store_true",
+        help="Use proposal chooser head to select candidate edits instead of slot-wise argmax.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1033,6 +1086,7 @@ def main():
             experiment_config = json.load(f)
 
         model_cfg = ModelConfig.from_mapping(experiment_config["model_config"])
+        training_cfg = TrainingConfig.from_mapping(experiment_config.get("training_config", {}))
         config_tag = _infer_config_tag_from_run_dir(run_directory)
         strict_global = bool(args.strict_global_metrics or (config_tag in PAPER_SUITE_TAGS))
         if strict_global and args.no_global_metrics:
@@ -1040,6 +1094,8 @@ def main():
                 "Strict global metrics cannot be combined with --no-global-metrics. "
                 "Remove --no-global-metrics or disable strict mode."
             )
+        if args.use_chooser and args.reranker_predictions:
+            raise RuntimeError("--use-chooser cannot be combined with --reranker-predictions.")
 
         logging.info(
             "Evaluating dataset=%s min_occurrence=%s | encoding=%s model=%s",
@@ -1054,6 +1110,7 @@ def main():
 
         postprocess_fns: list[Callable[[torch.Tensor, torch.Tensor, list[str]], None]] = []
         postprocess_states: list[dict[str, object]] = []
+        chooser_support: ChooserSupport | None = None
 
         repair_support = _maybe_prepare_repair_support(
             model_cfg.dataset_variant,
@@ -1065,6 +1122,38 @@ def main():
             repair_postprocess, repair_state = repair_support.build_postprocess()
             postprocess_fns.append(repair_postprocess)
             postprocess_states.append(repair_state)
+
+        if args.use_chooser:
+            if not training_cfg.chooser.enabled:
+                raise RuntimeError("Chooser evaluation requested but chooser is disabled in training config.")
+            interim_base = Path("data/interim") / f"{model_cfg.dataset_variant}_minocc{model_cfg.min_occurrence}"
+            encoder_path = interim_base / "globalintencoder.txt"
+            if not encoder_path.exists():
+                raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
+            encoder = GlobalIntEncoder()
+            encoder.load(encoder_path)
+            encoder.freeze()
+            placeholder_ids = load_placeholder_ids(encoder_path)
+            heuristics = ConstraintRepairHeuristics(
+                encoder=encoder,
+                placeholder_ids=placeholder_ids,
+                none_class=NONE_CLASS_INDEX,
+            )
+            contexts = load_violation_contexts(interim_base, "test", none_class=NONE_CLASS_INDEX)
+            if len(contexts) != len(test_data):
+                raise RuntimeError("Mismatch between test graphs and violation contexts for chooser evaluation.")
+            for idx, graph in enumerate(test_data):
+                setattr(graph, "context_index", idx)
+            candidate_cfg = CandidateConfig(
+                topk_candidates=training_cfg.chooser.topk_candidates,
+                max_candidates_total=training_cfg.chooser.max_candidates_total,
+                include_gold=True,
+            )
+            chooser_support = ChooserSupport(
+                contexts=contexts,
+                heuristics=heuristics,
+                candidate_cfg=candidate_cfg,
+            )
 
         global_support = None
         if strict_global and not _data_has_factor_fields(test_data):
@@ -1123,9 +1212,12 @@ def main():
             postprocess_state=postprocess_state,
             precomputed_predictions=precomputed_predictions,
             write_per_constraint_csv=True if strict_global else (args.per_constraint_csv or global_metrics_enabled),
+            chooser_support=chooser_support,
         )
 
     else:  # Evaluate baselines
+        if args.use_chooser:
+            raise RuntimeError("--use-chooser is only supported for trained model evaluation.")
         logging.info(
             "Evaluating baselines dataset=%s min_occurrence=%s using interim parquet data",
             args.dataset,

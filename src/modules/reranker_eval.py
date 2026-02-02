@@ -643,6 +643,201 @@ class CandidateConstraintEvaluator:
             "del_count": del_count,
         }
 
+    def evaluate_candidates(
+        self,
+        row: Any,
+        *,
+        candidates: Sequence[Sequence[int]],
+        primary_factor_index: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        if not candidates:
+            return []
+        p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
+        facts_by_entity, predicates_present = _build_facts_state(
+            row,
+            p_local=p_local,
+            assume_complete=self._assume_complete,
+            cast_int=self._use_encoded_ids,
+        )
+        subject = _coerce_value(getattr(row, "subject", 0), cast_int=self._use_encoded_ids)
+        predicate = _coerce_value(getattr(row, "predicate", 0), cast_int=self._use_encoded_ids)
+        obj = _coerce_value(getattr(row, "object", 0), cast_int=self._use_encoded_ids)
+        other_subject = _coerce_value(getattr(row, "other_subject", 0), cast_int=self._use_encoded_ids)
+        other_predicate = _coerce_value(getattr(row, "other_predicate", 0), cast_int=self._use_encoded_ids)
+        other_object = _coerce_value(getattr(row, "other_object", 0), cast_int=self._use_encoded_ids)
+
+        pre_state = EvidenceState(
+            facts_by_entity=facts_by_entity,
+            predicates_present=predicates_present,
+            assume_complete=self._assume_complete,
+            missing_edits=set(),
+            focus_subject=subject,
+            focus_predicate=predicate,
+            focus_object=obj,
+            other_subject=other_subject,
+            other_predicate=other_predicate,
+            other_object=other_object,
+        )
+
+        if self._constraint_scope == "focus":
+            constraint_ids_raw = getattr(row, "local_constraint_ids_focus", None)
+            if constraint_ids_raw is None:
+                constraint_ids_raw = getattr(row, "local_constraint_ids", None)
+        else:
+            constraint_ids_raw = getattr(row, "local_constraint_ids", None)
+        local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=self._use_encoded_ids)
+        if not local_constraint_ids:
+            return [
+                {
+                    "local_constraint_ids": [],
+                    "primary_factor_index": -1,
+                    "pre_checkable": [],
+                    "pre_satisfied": [],
+                    "post_checkable": [],
+                    "post_satisfied": [],
+                    "primary_satisfied": 0,
+                    "global_satisfied_fraction": 0.0,
+                    "secondary_regressions": 0,
+                    "secondary_improvements": 0,
+                    "secondary_regressions_denom": 0,
+                    "secondary_improvements_denom": 0,
+                    "srr": 0.0,
+                    "sir": 0.0,
+                    "add_count": 0,
+                    "del_count": 0,
+                }
+                for _ in candidates
+            ]
+
+        constraint_instances: List[ConstraintInstance | None] = [
+            self._get_constraint_instance(cid) for cid in local_constraint_ids
+        ]
+        pre_checkable: List[bool] = []
+        pre_satisfied: List[int] = []
+        for instance in constraint_instances:
+            if instance is None:
+                pre_checkable.append(False)
+                pre_satisfied.append(0)
+            else:
+                checkable_pre, satisfied_pre = evaluate_constraint(pre_state, instance, set(p_local))
+                pre_checkable.append(bool(checkable_pre))
+                pre_satisfied.append(int(satisfied_pre))
+
+        resolved_primary_index = -1
+        if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
+            resolved_primary_index = int(primary_factor_index)
+        else:
+            constraint_id = _coerce_value(getattr(row, "constraint_id", None), cast_int=self._use_encoded_ids)
+            try:
+                resolved_primary_index = local_constraint_ids.index(constraint_id)
+            except ValueError:
+                resolved_primary_index = -1
+
+        placeholder_map = _build_placeholder_map(self._encoder, row)
+        results: List[Dict[str, Any]] = []
+
+        for candidate_slots in candidates:
+            post_facts = {
+                ent: {pred: set(values) for pred, values in facts.items()}
+                for ent, facts in facts_by_entity.items()
+            }
+            post_predicates = {ent: set(preds) for ent, preds in predicates_present.items()}
+            missing_edits = _apply_candidate_edit(
+                post_facts,
+                post_predicates,
+                p_local,
+                candidate_slots=candidate_slots,
+                placeholder_map=placeholder_map,
+                assume_complete=self._assume_complete,
+            )
+            post_state = EvidenceState(
+                facts_by_entity=post_facts,
+                predicates_present=post_predicates,
+                assume_complete=self._assume_complete,
+                missing_edits=missing_edits,
+                focus_subject=subject,
+                focus_predicate=predicate,
+                focus_object=obj,
+                other_subject=other_subject,
+                other_predicate=other_predicate,
+                other_object=other_object,
+            )
+
+            post_checkable: List[bool] = []
+            post_satisfied: List[int] = []
+            for instance in constraint_instances:
+                if instance is None:
+                    post_checkable.append(False)
+                    post_satisfied.append(0)
+                else:
+                    checkable_post, satisfied_post = evaluate_constraint(post_state, instance, set(p_local))
+                    post_checkable.append(bool(checkable_post))
+                    post_satisfied.append(int(satisfied_post))
+
+            primary_satisfied = 0
+            if 0 <= resolved_primary_index < len(post_satisfied):
+                primary_satisfied = post_satisfied[resolved_primary_index]
+
+            checkable_total = sum(1 for flag in post_checkable if flag)
+            if checkable_total:
+                global_satisfied_fraction = sum(post_satisfied) / float(checkable_total)
+            else:
+                global_satisfied_fraction = 0.0
+
+            secondary_regressions = 0
+            secondary_improvements = 0
+            secondary_regressions_denom = 0
+            secondary_improvements_denom = 0
+            for idx in range(len(local_constraint_ids)):
+                if idx == resolved_primary_index:
+                    continue
+                if not pre_checkable[idx]:
+                    continue
+                if not post_checkable[idx]:
+                    continue
+                if pre_satisfied[idx]:
+                    secondary_regressions_denom += 1
+                    if not post_satisfied[idx]:
+                        secondary_regressions += 1
+                else:
+                    secondary_improvements_denom += 1
+                    if post_satisfied[idx]:
+                        secondary_improvements += 1
+
+            srr = float(secondary_regressions) / secondary_regressions_denom if secondary_regressions_denom else 0.0
+            sir = float(secondary_improvements) / secondary_improvements_denom if secondary_improvements_denom else 0.0
+
+            add_count = 0
+            del_count = 0
+            if len(candidate_slots) >= 6:
+                if all(int(v) != 0 for v in candidate_slots[:3]):
+                    add_count = 1
+                if all(int(v) != 0 for v in candidate_slots[3:6]):
+                    del_count = 1
+
+            results.append(
+                {
+                    "local_constraint_ids": local_constraint_ids,
+                    "primary_factor_index": resolved_primary_index,
+                    "pre_checkable": pre_checkable,
+                    "pre_satisfied": pre_satisfied,
+                    "post_checkable": post_checkable,
+                    "post_satisfied": post_satisfied,
+                    "primary_satisfied": primary_satisfied,
+                    "global_satisfied_fraction": global_satisfied_fraction,
+                    "secondary_regressions": secondary_regressions,
+                    "secondary_improvements": secondary_improvements,
+                    "secondary_regressions_denom": secondary_regressions_denom,
+                    "secondary_improvements_denom": secondary_improvements_denom,
+                    "srr": srr,
+                    "sir": sir,
+                    "add_count": add_count,
+                    "del_count": del_count,
+                }
+            )
+
+        return results
+
 
 def _metrics_from_details(details: Dict[str, Any]) -> CandidateMetrics:
     return CandidateMetrics(
