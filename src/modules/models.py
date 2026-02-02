@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Callable, Sequence
+from typing import Callable, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -302,8 +302,6 @@ class BaseGraphModel(nn.Module, ABC):
         factor_mask_pre = None
         factor_graph_index = None
         factor_checkable = getattr(data, "factor_checkable_pre", None)
-        factor_node_index = getattr(data, "factor_node_index", None)
-        factor_node_mask = getattr(data, "is_factor_node", None)
         factor_types = getattr(data, "factor_types", None)
 
         if factor_checkable is not None:
@@ -311,16 +309,7 @@ class BaseGraphModel(nn.Module, ABC):
                 factor_checkable, dtype=torch.bool, device=graph_emb.device
             ).view(-1)
 
-        if factor_node_index is not None:
-            factor_node_index = torch.as_tensor(factor_node_index, device=graph_emb.device).view(-1)
-            factor_node_emb = node_emb.index_select(0, factor_node_index)
-            factor_graph_index = batch.index_select(0, factor_node_index)
-        elif factor_node_mask is not None:
-            factor_node_mask = torch.as_tensor(factor_node_mask, dtype=torch.bool, device=graph_emb.device).view(-1)
-            factor_node_emb = node_emb[factor_node_mask]
-            factor_graph_index = batch[factor_node_mask]
-        else:
-            factor_node_emb = None
+        factor_node_emb, factor_graph_index = _select_factor_nodes(node_emb, data)
 
         if factor_node_emb is not None and factor_node_emb.numel() > 0:
             factor_hidden = F.relu(self.shared_projection(factor_node_emb))
@@ -628,8 +617,6 @@ class RepairGINFactorPressure(BaseGraphModel):
         factor_mask_pre = None
         factor_graph_index = None
         factor_checkable = getattr(data, "factor_checkable_pre", None)
-        factor_node_index = getattr(data, "factor_node_index", None)
-        factor_node_mask = getattr(data, "is_factor_node", None)
         factor_types = getattr(data, "factor_types", None)
 
         if factor_checkable is not None:
@@ -637,16 +624,7 @@ class RepairGINFactorPressure(BaseGraphModel):
                 factor_checkable, dtype=torch.bool, device=graph_emb.device
             ).view(-1)
 
-        if factor_node_index is not None:
-            factor_node_index = torch.as_tensor(factor_node_index, device=graph_emb.device).view(-1)
-            factor_node_emb = node_emb.index_select(0, factor_node_index)
-            factor_graph_index = batch.index_select(0, factor_node_index)
-        elif factor_node_mask is not None:
-            factor_node_mask = torch.as_tensor(factor_node_mask, dtype=torch.bool, device=graph_emb.device).view(-1)
-            factor_node_emb = node_emb[factor_node_mask]
-            factor_graph_index = batch[factor_node_mask]
-        else:
-            factor_node_emb = None
+        factor_node_emb, factor_graph_index = _select_factor_nodes(node_emb, data)
 
         if factor_node_emb is not None and factor_node_emb.numel() > 0:
             factor_hidden = F.relu(self.shared_projection(factor_node_emb))
@@ -678,6 +656,84 @@ class RepairGINFactorPressure(BaseGraphModel):
             "factor_mask_pre": factor_mask_pre,
             "factor_graph_index": factor_graph_index,
         }
+
+
+def _select_factor_nodes(
+    node_emb: torch.Tensor,
+    data,
+) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+    factor_node_index = getattr(data, "factor_node_index", None)
+    factor_node_mask = getattr(data, "is_factor_node", None)
+    batch = getattr(data, "batch", None)
+    if batch is None:
+        return None, None
+
+    factor_node_emb = None
+    factor_graph_index = None
+
+    mask = None
+    if factor_node_mask is not None:
+        mask = torch.as_tensor(
+            factor_node_mask, dtype=torch.bool, device=node_emb.device
+        ).view(-1)
+        if mask.numel() != node_emb.size(0):
+            mask = None
+
+    if mask is not None and mask.any():
+        factor_global_indices = torch.nonzero(mask, as_tuple=False).view(-1)
+        factor_node_emb = node_emb.index_select(0, factor_global_indices)
+        factor_graph_index = batch.index_select(0, factor_global_indices)
+
+        ptr = getattr(data, "ptr", None)
+        if factor_node_index is not None and ptr is not None:
+            factor_node_index = torch.as_tensor(
+                factor_node_index, device=node_emb.device
+            ).view(-1)
+            ptr = torch.as_tensor(ptr, device=node_emb.device).view(-1)
+            local_indices = factor_global_indices - ptr[factor_graph_index]
+
+            if factor_node_index.numel() == factor_node_emb.size(0):
+                order: list[torch.Tensor] = []
+                offset = 0
+                num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+                for graph_id in range(num_graphs):
+                    graph_mask = factor_graph_index == graph_id
+                    count = int(graph_mask.sum().item())
+                    if count == 0:
+                        continue
+                    expected = factor_node_index[offset : offset + count]
+                    offset += count
+                    local_g = local_indices[graph_mask]
+                    if expected.numel() != count:
+                        idxs = torch.argsort(local_g)
+                    else:
+                        local_list = local_g.tolist()
+                        pos = {val: i for i, val in enumerate(local_list)}
+                        if any(val not in pos for val in expected.tolist()):
+                            idxs = torch.argsort(local_g)
+                        else:
+                            idxs = torch.tensor(
+                                [pos[val] for val in expected.tolist()],
+                                device=node_emb.device,
+                                dtype=torch.long,
+                            )
+                    factor_indices_g = torch.nonzero(graph_mask, as_tuple=False).view(-1)
+                    order.append(factor_indices_g.index_select(0, idxs))
+                if order:
+                    perm = torch.cat(order, dim=0)
+                    factor_node_emb = factor_node_emb.index_select(0, perm)
+                    factor_graph_index = factor_graph_index.index_select(0, perm)
+        return factor_node_emb, factor_graph_index
+
+    if factor_node_index is not None:
+        factor_node_index = torch.as_tensor(
+            factor_node_index, device=node_emb.device
+        ).view(-1)
+        factor_node_emb = node_emb.index_select(0, factor_node_index)
+        factor_graph_index = batch.index_select(0, factor_node_index)
+        return factor_node_emb, factor_graph_index
+
+    return None, None
 
 
 class RepairGCN(BaseGraphModel):

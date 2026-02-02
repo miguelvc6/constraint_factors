@@ -183,6 +183,44 @@ def _assert_factor_labels_batch(data: Data) -> None:
         _assert_factor_labels(graph, idx)
 
 
+def _assert_factor_logit_alignment(
+    data: Data,
+    factor_logits: torch.Tensor,
+    factor_graph_index: torch.Tensor,
+) -> None:
+    graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
+    offset = 0
+    for graph_idx, graph in enumerate(graphs):
+        factor_ids = getattr(graph, "factor_constraint_ids", None)
+        if factor_ids is None:
+            continue
+        factor_ids = torch.as_tensor(factor_ids).view(-1)
+        count = int(factor_ids.numel())
+        if count == 0:
+            continue
+        end = offset + count
+        assert end <= factor_logits.numel(), (
+            f"factor_logits_pre length {factor_logits.numel()} too small for graph {graph_idx}"
+        )
+        slice_graph = factor_graph_index[offset:end]
+        assert torch.all(slice_graph == graph_idx), (
+            f"factor logits order mismatch for graph {graph_idx} (expected index {graph_idx})"
+        )
+        primary_idx = getattr(graph, "primary_factor_index", None)
+        assert primary_idx is not None, f"missing primary_factor_index for graph {graph_idx}"
+        if torch.is_tensor(primary_idx):
+            primary_idx = int(primary_idx.item())
+        else:
+            primary_idx = int(primary_idx)
+        assert 0 <= primary_idx < count, (
+            f"primary_factor_index {primary_idx} out of range for graph {graph_idx} with {count} factors"
+        )
+        primary_logit = factor_logits[offset + primary_idx]
+        assert torch.isfinite(primary_logit).item(), "primary factor logit is not finite"
+        offset = end
+    assert offset == factor_logits.numel(), "factor_logits_pre length does not match factor label total"
+
+
 def _log_factor_debug(
     data: Data,
     factor_logits: torch.Tensor,
@@ -451,6 +489,12 @@ def train(
                 assert factor_logits.numel() == factor_targets.numel(), (
                     "factor_logits_pre length must match factor_satisfied_pre length."
                 )
+                if train_cfg.validate_factor_labels and factor_graph_index is not None:
+                    _assert_factor_logit_alignment(
+                        data,
+                        factor_logits,
+                        torch.as_tensor(factor_graph_index, device=graph_loss.device).view(-1),
+                    )
                 if factor_cfg.only_checkable:
                     checkable = getattr(data, "factor_checkable_pre", None)
                     if checkable is None:
@@ -689,6 +733,12 @@ def train(
                     assert factor_logits.numel() == factor_targets.numel(), (
                         "factor_logits_pre length must match factor_satisfied_pre length."
                     )
+                    if train_cfg.validate_factor_labels and factor_graph_index is not None:
+                        _assert_factor_logit_alignment(
+                            data,
+                            factor_logits,
+                            torch.as_tensor(factor_graph_index, device=graph_loss.device).view(-1),
+                        )
                     if factor_cfg.only_checkable:
                         checkable = getattr(data, "factor_checkable_pre", None)
                         if checkable is None:
