@@ -32,7 +32,7 @@ from modules.model_store import (
 from modules.models import build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
 from modules.reranker import CandidateReranker, RerankerConfig, build_reranker
-from modules.reranker_eval import CandidateConstraintEvaluator
+from modules.reranker_eval import CandidateConstraintEvaluator, _metrics_from_details
 from modules.training_utils import (
     load_graph_dataset,
     placeholder_ids_from_encoder,
@@ -75,6 +75,8 @@ class RerankerTrainingConfig:
         objective = str(payload.get("objective", cls.objective)).lower()
         if objective not in {"main", "global_fix"}:
             raise ValueError("training_config.objective must be 'main' or 'global_fix'")
+        if "beta" in payload and "regression_weight" not in payload:
+            payload["regression_weight"] = payload.get("beta")
         constraint_scope = str(payload.get("constraint_scope", cls.constraint_scope)).lower()
         if constraint_scope not in {"local", "focus"}:
             raise ValueError("training_config.constraint_scope must be 'local' or 'focus'")
@@ -406,7 +408,7 @@ def _evaluate_candidate_set(
 ) -> list:
     metrics: list = []
     for cand in candidates:
-        metrics.append(evaluator.evaluate(row, candidate_slots=cand, primary_factor_index=primary_index))
+        metrics.append(evaluator.evaluate_full(row, candidate_slots=cand, primary_factor_index=primary_index))
     return metrics
 
 
@@ -475,14 +477,15 @@ def _run_epoch(
                 candidates=candidates,
                 primary_index=int(getattr(graph, "primary_factor_index", 0)),
             )
+            metrics_summary = [_metrics_from_details(detail) for detail in metrics]
 
-            primary_oracle = max(m.primary_satisfied for m in metrics)
-            global_oracle = max(m.global_satisfied_fraction for m in metrics)
+            primary_oracle = max(m.primary_satisfied for m in metrics_summary)
+            global_oracle = max(m.global_satisfied_fraction for m in metrics_summary)
 
             best_idx = int(torch.argmax(scores).item())
-            primary_best = metrics[best_idx].primary_satisfied
-            global_best = metrics[best_idx].global_satisfied_fraction
-            regress_best = metrics[best_idx].secondary_regressions
+            primary_best = metrics_summary[best_idx].primary_satisfied
+            global_best = metrics_summary[best_idx].global_satisfied_fraction
+            regress_best = metrics_summary[best_idx].secondary_regressions
 
             record = {
                 "primary_oracle": primary_oracle,
@@ -496,7 +499,7 @@ def _run_epoch(
 
             if cfg.objective == "global_fix":
                 satisfaction = torch.tensor(
-                    [m.global_satisfied_fraction for m in metrics],
+                    [m.global_satisfied_fraction for m in metrics_summary],
                     dtype=torch.float32,
                     device=device,
                 )
@@ -504,13 +507,36 @@ def _run_epoch(
                 loss = -expected_satisfaction
             else:
                 ce_loss = -log_probs[gold_index]
-                regressions = torch.tensor(
-                    [m.secondary_regressions for m in metrics],
-                    dtype=torch.float32,
-                    device=device,
+                gold_details = metrics[gold_index]
+                gold_post = gold_details.get("post_satisfied", [])
+                gold_post_checkable = gold_details.get("post_checkable", [])
+                primary_idx = int(getattr(graph, "primary_factor_index", 0))
+                regression_rates: list[float] = []
+                for detail in metrics:
+                    post = detail.get("post_satisfied", [])
+                    post_checkable = detail.get("post_checkable", [])
+                    regress = 0
+                    denom = 0
+                    for idx in range(min(len(post), len(gold_post))):
+                        if idx == primary_idx:
+                            continue
+                        if idx >= len(post_checkable) or idx >= len(gold_post_checkable):
+                            continue
+                        if not post_checkable[idx] or not gold_post_checkable[idx]:
+                            continue
+                        if gold_post[idx]:
+                            denom += 1
+                            if not post[idx]:
+                                regress += 1
+                    rate = float(regress) / denom if denom else 0.0
+                    regression_rates.append(rate)
+                regression_tensor = torch.tensor(
+                    regression_rates, dtype=torch.float32, device=device
                 )
-                gold_regression = regressions[gold_index]
-                reg_penalty = torch.sum(probs * torch.clamp(regressions - gold_regression, min=0.0))
+                gold_regression = regression_tensor[gold_index]
+                reg_penalty = torch.sum(
+                    probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
+                )
                 loss = ce_loss + cfg.regression_weight * reg_penalty
 
             total_loss += loss

@@ -33,6 +33,13 @@ class CandidateMetrics:
     primary_satisfied: int
     global_satisfied_fraction: float
     secondary_regressions: int
+    secondary_regressions_denom: int
+    secondary_improvements: int
+    secondary_improvements_denom: int
+    srr: float
+    sir: float
+    add_count: int
+    del_count: int
 
 
 def _load_registry(path: str | None) -> Dict[str, RegistryEntry]:
@@ -459,11 +466,7 @@ class CandidateConstraintEvaluator:
             candidate_slots=candidate_slots,
             primary_factor_index=primary_factor_index,
         )
-        return CandidateMetrics(
-            primary_satisfied=details["primary_satisfied"],
-            global_satisfied_fraction=details["global_satisfied_fraction"],
-            secondary_regressions=details["secondary_regressions"],
-        )
+        return _metrics_from_details(details)
 
     def evaluate_full(
         self,
@@ -542,6 +545,12 @@ class CandidateConstraintEvaluator:
                 "global_satisfied_fraction": 0.0,
                 "secondary_regressions": 0,
                 "secondary_improvements": 0,
+                "secondary_regressions_denom": 0,
+                "secondary_improvements_denom": 0,
+                "srr": 0.0,
+                "sir": 0.0,
+                "add_count": 0,
+                "del_count": 0,
             }
 
         pre_checkable: List[bool] = []
@@ -586,14 +595,34 @@ class CandidateConstraintEvaluator:
 
         secondary_regressions = 0
         secondary_improvements = 0
+        secondary_regressions_denom = 0
+        secondary_improvements_denom = 0
         for idx in range(len(local_constraint_ids)):
             if idx == resolved_primary_index:
                 continue
-            if pre_checkable[idx]:
-                if pre_satisfied[idx] and post_checkable[idx] and not post_satisfied[idx]:
+            if not pre_checkable[idx]:
+                continue
+            if not post_checkable[idx]:
+                continue
+            if pre_satisfied[idx]:
+                secondary_regressions_denom += 1
+                if not post_satisfied[idx]:
                     secondary_regressions += 1
-                if (not pre_satisfied[idx]) and post_checkable[idx] and post_satisfied[idx]:
+            else:
+                secondary_improvements_denom += 1
+                if post_satisfied[idx]:
                     secondary_improvements += 1
+
+        srr = float(secondary_regressions) / secondary_regressions_denom if secondary_regressions_denom else 0.0
+        sir = float(secondary_improvements) / secondary_improvements_denom if secondary_improvements_denom else 0.0
+
+        add_count = 0
+        del_count = 0
+        if len(candidate_slots) >= 6:
+            if all(int(v) != 0 for v in candidate_slots[:3]):
+                add_count = 1
+            if all(int(v) != 0 for v in candidate_slots[3:6]):
+                del_count = 1
 
         return {
             "local_constraint_ids": local_constraint_ids,
@@ -606,4 +635,25 @@ class CandidateConstraintEvaluator:
             "global_satisfied_fraction": global_satisfied_fraction,
             "secondary_regressions": secondary_regressions,
             "secondary_improvements": secondary_improvements,
+            "secondary_regressions_denom": secondary_regressions_denom,
+            "secondary_improvements_denom": secondary_improvements_denom,
+            "srr": srr,
+            "sir": sir,
+            "add_count": add_count,
+            "del_count": del_count,
         }
+
+
+def _metrics_from_details(details: Dict[str, Any]) -> CandidateMetrics:
+    return CandidateMetrics(
+        primary_satisfied=int(details.get("primary_satisfied", 0)),
+        global_satisfied_fraction=float(details.get("global_satisfied_fraction", 0.0)),
+        secondary_regressions=int(details.get("secondary_regressions", 0)),
+        secondary_regressions_denom=int(details.get("secondary_regressions_denom", 0)),
+        secondary_improvements=int(details.get("secondary_improvements", 0)),
+        secondary_improvements_denom=int(details.get("secondary_improvements_denom", 0)),
+        srr=float(details.get("srr", 0.0)),
+        sir=float(details.get("sir", 0.0)),
+        add_count=int(details.get("add_count", 0)),
+        del_count=int(details.get("del_count", 0)),
+    )
