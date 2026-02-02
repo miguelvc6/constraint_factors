@@ -78,7 +78,7 @@ Each instance includes:
 ### Locally applicable constraint set `C_local`
 Two viable definitions (start with the conservative one):
 
-**(A) Predicate-scope constraints (recommended v1):**  
+**(A) Predicate-scope constraints:**  
 Include constraint instances attached to the properties appearing in the focus/conflicting triples.
 
 **(B) Local closure (broader):**  
