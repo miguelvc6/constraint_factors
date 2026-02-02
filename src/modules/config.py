@@ -258,6 +258,10 @@ class ModelConfig:
     """Optional vocabulary subset for entity targets."""
     predicate_class_ids: tuple[int, ...] | None = None  
     """Optional vocabulary subset for predicate targets."""
+    num_factor_types: int = 0
+    """Number of distinct factor type ids (0 disables type conditioning)."""
+    factor_type_embedding_dim: int = 8
+    """Embedding dim for factor type conditioning."""
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ModelConfig":
@@ -287,6 +291,10 @@ class ModelConfig:
             filtered["num_role_types"] = int(filtered["num_role_types"])
         if "use_role_embeddings" in filtered and filtered["use_role_embeddings"] is not None:
             filtered["use_role_embeddings"] = bool(filtered["use_role_embeddings"])
+        if "num_factor_types" in filtered and filtered["num_factor_types"] is not None:
+            filtered["num_factor_types"] = int(filtered["num_factor_types"])
+        if "factor_type_embedding_dim" in filtered and filtered["factor_type_embedding_dim"] is not None:
+            filtered["factor_type_embedding_dim"] = int(filtered["factor_type_embedding_dim"])
 
         current = asdict(self)
         current.update(filtered)

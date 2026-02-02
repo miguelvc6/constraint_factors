@@ -106,6 +106,35 @@ def derive_target_class_ids(
     return entity_sorted, predicate_sorted
 
 
+def derive_factor_type_count(
+    *datasets: list[Data] | GraphStreamDataset | None,
+) -> int:
+    """Return max factor type id + 1 across datasets (0 if absent)."""
+    max_type = -1
+
+    def update_from_tensor(values: torch.Tensor) -> None:
+        nonlocal max_type
+        if values.numel() == 0:
+            return
+        if values.dtype not in (torch.long, torch.int64, torch.int32):
+            values = values.to(dtype=torch.long)
+        current_max = int(values.max().item())
+        if current_max > max_type:
+            max_type = current_max
+
+    for dataset in datasets:
+        if dataset is None:
+            continue
+        iterator = dataset if isinstance(dataset, list) else iter(dataset)
+        for graph in iterator:
+            factor_types = getattr(graph, "factor_types", None)
+            if factor_types is None:
+                continue
+            update_from_tensor(torch.as_tensor(factor_types))
+
+    return max_type + 1 if max_type >= 0 else 0
+
+
 def _assert_factor_labels(graph: Data, graph_index: int | None = None) -> None:
     prefix = f"graph[{graph_index}] " if graph_index is not None else ""
 
@@ -151,6 +180,52 @@ def _assert_factor_labels_batch(data: Data) -> None:
     graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
     for idx, graph in enumerate(graphs):
         _assert_factor_labels(graph, idx)
+
+
+def _log_factor_debug(
+    data: Data,
+    factor_logits: torch.Tensor,
+    factor_graph_index: torch.Tensor,
+    max_per_graph: int = 3,
+) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    if factor_logits.numel() == 0:
+        return
+    graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
+    total_graphs = len(graphs)
+    for graph_idx in range(total_graphs):
+        mask = factor_graph_index == graph_idx
+        if not mask.any():
+            continue
+        local_logits = factor_logits[mask]
+        probs = torch.sigmoid(local_logits)
+        k = min(max_per_graph, local_logits.numel())
+        if k == 0:
+            continue
+        values, indices = torch.topk(1.0 - probs, k=k)
+        factor_ids = getattr(graphs[graph_idx], "factor_constraint_ids", None)
+        if factor_ids is None:
+            continue
+        factor_ids = torch.as_tensor(factor_ids).view(-1)
+        primary_idx = getattr(graphs[graph_idx], "primary_factor_index", None)
+        try:
+            primary_idx = int(primary_idx)
+        except Exception:
+            primary_idx = None
+        entries = []
+        for rank, (score, local_idx) in enumerate(zip(values.tolist(), indices.tolist()), start=1):
+            global_factor_idx = int(local_idx)
+            if global_factor_idx >= factor_ids.numel():
+                continue
+            cid = int(factor_ids[global_factor_idx].item())
+            tag = "PRIMARY" if primary_idx is not None and global_factor_idx == primary_idx else ""
+            entries.append(f"{rank}:{cid}:{score:.3f}{':' + tag if tag else ''}")
+        logger.debug(
+            "Graph %s factor violations: %s",
+            graph_idx,
+            ", ".join(entries) if entries else "none",
+        )
 
 
 def train(
@@ -372,21 +447,6 @@ def train(
                     factor_mask = torch.as_tensor(
                         factor_mask, dtype=torch.bool, device=graph_loss.device
                     ).view(-1)
-                if factor_graph_index is None and hasattr(data, "to_data_list"):
-                    graphs = data.to_data_list()
-                    sizes: list[int] = []
-                    for graph in graphs:
-                        graph_mask = getattr(graph, "factor_checkable_pre", None)
-                        if graph_mask is None:
-                            graph_ids = getattr(graph, "factor_constraint_ids", None)
-                            sizes.append(int(torch.as_tensor(graph_ids).numel()) if graph_ids is not None else 0)
-                        else:
-                            sizes.append(int(torch.as_tensor(graph_mask).numel()))
-                    if sizes and sum(sizes) == int(factor_targets.numel()):
-                        index = torch.arange(len(sizes), device=graph_loss.device, dtype=torch.long)
-                        factor_graph_index = index.repeat_interleave(
-                            torch.tensor(sizes, device=graph_loss.device, dtype=torch.long)
-                        )
                 assert factor_logits is not None, "Model output missing factor_logits_pre."
                 factor_logits = torch.as_tensor(factor_logits, device=graph_loss.device).view(-1)
                 assert factor_logits.numel() == factor_targets.numel(), (
@@ -410,6 +470,8 @@ def train(
                         )
                     else:
                         raise AssertionError("factor_graph_index is required for batched factor loss.")
+                factor_graph_index = torch.as_tensor(factor_graph_index, device=graph_loss.device).view(-1)
+                _log_factor_debug(data, factor_logits, factor_graph_index)
 
                 graph_loss_add = torch.zeros(
                     graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
@@ -612,21 +674,6 @@ def train(
                         factor_mask = torch.as_tensor(
                             factor_mask, dtype=torch.bool, device=graph_loss.device
                         ).view(-1)
-                    if factor_graph_index is None and hasattr(data, "to_data_list"):
-                        graphs = data.to_data_list()
-                        sizes: list[int] = []
-                        for graph in graphs:
-                            graph_mask = getattr(graph, "factor_checkable_pre", None)
-                            if graph_mask is None:
-                                graph_ids = getattr(graph, "factor_constraint_ids", None)
-                                sizes.append(int(torch.as_tensor(graph_ids).numel()) if graph_ids is not None else 0)
-                            else:
-                                sizes.append(int(torch.as_tensor(graph_mask).numel()))
-                        if sizes and sum(sizes) == int(factor_targets.numel()):
-                            index = torch.arange(len(sizes), device=graph_loss.device, dtype=torch.long)
-                            factor_graph_index = index.repeat_interleave(
-                                torch.tensor(sizes, device=graph_loss.device, dtype=torch.long)
-                            )
                     assert factor_logits is not None, "Model output missing factor_logits_pre."
                     factor_logits = torch.as_tensor(factor_logits, device=graph_loss.device).view(-1)
                     assert factor_logits.numel() == factor_targets.numel(), (
@@ -650,6 +697,8 @@ def train(
                             )
                         else:
                             raise AssertionError("factor_graph_index is required for batched factor loss.")
+                    factor_graph_index = torch.as_tensor(factor_graph_index, device=graph_loss.device).view(-1)
+                    _log_factor_debug(data, factor_logits, factor_graph_index)
 
                     graph_loss_add = torch.zeros(
                         graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
@@ -951,6 +1000,9 @@ def main():
         use_role_embeddings=role_spec.enabled,
         num_role_types=role_spec.num_types if role_spec.enabled else 0,
     )
+    num_factor_types = derive_factor_type_count(train_data, val_data)
+    if num_factor_types > 0:
+        model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
 
     # Load and freeze int encoder
     encoder = GlobalIntEncoder()

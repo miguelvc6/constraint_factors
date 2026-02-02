@@ -183,6 +183,7 @@ def create_graph(
     focus_local_nodes: dict[str, int] = {}
     factor_constraint_ids: list[int] = []
     factor_constraint_types: list[str] = []
+    factor_local_ids: list[int] = []
     primary_factor_index: int = -1
     pred_global_to_local_triples: dict[int, list[tuple[int, int, int]]] = {}
     pred_global_to_pred_local_ids: dict[int, list[int]] = {}
@@ -595,6 +596,7 @@ def create_graph(
         )
 
         factor_constraint_ids.append(constraint_id)
+        factor_local_ids.append(factor_local_id)
         constraint_type = str(registry_entry.get("constraint_type", ""))
         factor_constraint_types.append(constraint_type)
         if constraint_id == int(graph["constraint_id"]):
@@ -828,6 +830,7 @@ def create_graph(
     # Standardize on `constraint_type` across the pipeline
     data_graph.constraint_type = str(graph["constraint_type"])
     data_graph.factor_constraint_ids = torch.tensor(factor_constraint_ids, dtype=torch.long)
+    data_graph.factor_node_index = torch.tensor(factor_local_ids, dtype=torch.long)
     data_graph.primary_factor_index = int(primary_factor_index)
     data_graph.factor_constraint_types = factor_constraint_types
     if factor_checkable_pre_tensor is not None:
@@ -847,6 +850,11 @@ def create_graph(
             "other_predicate_global_id": int(graph.get("other_predicate") or 0),
             "factors": debug_entries,
         }
+
+    if factor_local_ids:
+        is_factor_node = torch.zeros(num_nodes, dtype=torch.bool)
+        is_factor_node[data_graph.factor_node_index] = True
+        data_graph.is_factor_node = is_factor_node
 
     return data_graph
 

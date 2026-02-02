@@ -34,6 +34,8 @@ class BaseGraphModel(nn.Module, ABC):
         use_edge_subtraction: bool = False,
         entity_class_ids: Sequence[int] | torch.Tensor | None = None,
         predicate_class_ids: Sequence[int] | torch.Tensor | None = None,
+        num_factor_types: int = 0,
+        factor_type_embedding_dim: int = 8,
     ):
         super().__init__()
         self._num_input_graph_nodes = int(num_input_graph_nodes)
@@ -140,7 +142,21 @@ class BaseGraphModel(nn.Module, ABC):
         self._head_hidden = head_hidden
         self._branch_hidden = branch_hidden
         self._num_layers = int(num_layers)
-        self.factor_pre_head = nn.Linear(head_hidden, 1)
+        self._num_factor_types = int(num_factor_types)
+        self._factor_type_embedding_dim = int(factor_type_embedding_dim)
+        if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0:
+            self.factor_type_embeddings = nn.Embedding(
+                self._num_factor_types, self._factor_type_embedding_dim
+            )
+            factor_input_dim = head_hidden + self._factor_type_embedding_dim
+        else:
+            self.factor_type_embeddings = None
+            factor_input_dim = head_hidden
+        self.factor_pre_head = nn.Sequential(
+            nn.Linear(factor_input_dim, head_hidden),
+            nn.ReLU(),
+            nn.Linear(head_hidden, 1),
+        )
 
     @property
     def num_input_graph_nodes(self) -> int:
@@ -280,45 +296,38 @@ class BaseGraphModel(nn.Module, ABC):
         factor_mask_pre = None
         factor_graph_index = None
         factor_checkable = getattr(data, "factor_checkable_pre", None)
-        factor_ids = getattr(data, "factor_constraint_ids", None)
-        if factor_checkable is not None or factor_ids is not None:
-            if factor_checkable is not None:
-                factor_mask_pre = torch.as_tensor(
-                    factor_checkable, dtype=torch.bool, device=graph_emb.device
-                ).view(-1)
-                factor_count = int(factor_mask_pre.numel())
-            else:
-                factor_ids_tensor = torch.as_tensor(factor_ids)
-                factor_count = int(factor_ids_tensor.numel())
-                factor_mask_pre = torch.ones(
-                    factor_count, dtype=torch.bool, device=graph_emb.device
-                )
-            if factor_count > 0:
-                if hasattr(data, "to_data_list"):
-                    graphs = data.to_data_list()
-                    sizes: list[int] = []
-                    for graph in graphs:
-                        graph_mask = getattr(graph, "factor_checkable_pre", None)
-                        if graph_mask is None:
-                            graph_ids = getattr(graph, "factor_constraint_ids", None)
-                            sizes.append(int(torch.as_tensor(graph_ids).numel()) if graph_ids is not None else 0)
-                        else:
-                            sizes.append(int(torch.as_tensor(graph_mask).numel()))
-                    if sizes and sum(sizes) == factor_count:
-                        index = torch.arange(len(sizes), device=graph_emb.device, dtype=torch.long)
-                        factor_graph_index = index.repeat_interleave(
-                            torch.tensor(sizes, device=graph_emb.device, dtype=torch.long)
-                        )
+        factor_node_index = getattr(data, "factor_node_index", None)
+        factor_node_mask = getattr(data, "is_factor_node", None)
+        factor_types = getattr(data, "factor_types", None)
 
-                if factor_graph_index is not None:
-                    factor_logits_pre = self.factor_pre_head(shared).squeeze(-1)
-                    factor_logits_pre = factor_logits_pre.index_select(0, factor_graph_index)
-                elif graph_emb.size(0) == 1:
-                    factor_graph_index = torch.zeros(
-                        factor_count, device=graph_emb.device, dtype=torch.long
-                    )
-                    factor_logits_pre = self.factor_pre_head(shared).squeeze(-1)
-                    factor_logits_pre = factor_logits_pre.index_select(0, factor_graph_index)
+        if factor_checkable is not None:
+            factor_mask_pre = torch.as_tensor(
+                factor_checkable, dtype=torch.bool, device=graph_emb.device
+            ).view(-1)
+
+        if factor_node_index is not None:
+            factor_node_index = torch.as_tensor(factor_node_index, device=graph_emb.device).view(-1)
+            factor_node_emb = node_emb.index_select(0, factor_node_index)
+            factor_graph_index = batch.index_select(0, factor_node_index)
+        elif factor_node_mask is not None:
+            factor_node_mask = torch.as_tensor(factor_node_mask, dtype=torch.bool, device=graph_emb.device).view(-1)
+            factor_node_emb = node_emb[factor_node_mask]
+            factor_graph_index = batch[factor_node_mask]
+        else:
+            factor_node_emb = None
+
+        if factor_node_emb is not None and factor_node_emb.numel() > 0:
+            factor_hidden = F.relu(self.shared_projection(factor_node_emb))
+            factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
+            if self.factor_type_embeddings is not None and factor_types is not None:
+                factor_types_tensor = torch.as_tensor(
+                    factor_types, dtype=torch.long, device=graph_emb.device
+                ).view(-1)
+                factor_type_emb = self.factor_type_embeddings(
+                    factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
+                )
+                factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
+            factor_logits_pre = self.factor_pre_head(factor_hidden).squeeze(-1)
 
         return {
             "edit_logits": prediction,
@@ -434,6 +443,8 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         use_edge_subtraction=config.use_edge_subtraction,
         entity_class_ids=config.entity_class_ids,
         predicate_class_ids=config.predicate_class_ids,
+        num_factor_types=config.num_factor_types,
+        factor_type_embedding_dim=config.factor_type_embedding_dim,
     )
 
 
