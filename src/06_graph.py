@@ -172,6 +172,9 @@ def create_graph(
     EDGE_FACTOR_TO_LOCAL_PREDICATE = 4
     EDGE_FACTOR_TO_LOCAL_SUBJECT = 5
     EDGE_FACTOR_TO_LOCAL_OBJECT = 6
+    EDGE_LOCAL_PREDICATE_TO_FACTOR = 7
+    EDGE_LOCAL_SUBJECT_TO_FACTOR = 8
+    EDGE_LOCAL_OBJECT_TO_FACTOR = 9
 
     edges: List[tuple[int, int]] = []
     edge_types: List[int] = []
@@ -726,6 +729,8 @@ def create_graph(
         for pred_local_id in scope_pred_local_ids:
             edges.append((factor_local_id, pred_local_id))
             edge_types.append(EDGE_FACTOR_TO_LOCAL_PREDICATE)
+            edges.append((pred_local_id, factor_local_id))
+            edge_types.append(EDGE_LOCAL_PREDICATE_TO_FACTOR)
             wiring_edges_created += 1
             if focus_local_nodes.get("predicate") == pred_local_id:
                 matched_focus_predicate = True
@@ -735,8 +740,12 @@ def create_graph(
             for subject_id, predicate_id, object_id in local_triples:
                 edges.append((factor_local_id, subject_id))
                 edge_types.append(EDGE_FACTOR_TO_LOCAL_SUBJECT)
+                edges.append((subject_id, factor_local_id))
+                edge_types.append(EDGE_LOCAL_SUBJECT_TO_FACTOR)
                 edges.append((factor_local_id, object_id))
                 edge_types.append(EDGE_FACTOR_TO_LOCAL_OBJECT)
+                edges.append((object_id, factor_local_id))
+                edge_types.append(EDGE_LOCAL_OBJECT_TO_FACTOR)
                 wiring_edges_created += 2
                 if focus_local_nodes.get("predicate") == predicate_id:
                     matched_focus_predicate = True
@@ -778,6 +787,19 @@ def create_graph(
     assert primary_factor_index >= 0, "Primary constraint_id missing from factor list."
     if debug_factor_wiring and primary_factor_focus_scope_ok is not None:
         assert primary_factor_focus_scope_ok, "Primary factor missing scope edge to focus predicate."
+        if factor_local_ids:
+            factor_set = set(factor_local_ids)
+            reverse_edge_types = {
+                EDGE_LOCAL_PREDICATE_TO_FACTOR,
+                EDGE_LOCAL_SUBJECT_TO_FACTOR,
+                EDGE_LOCAL_OBJECT_TO_FACTOR,
+            }
+            has_incoming = False
+            for (src, dst), etype in zip(edges, edge_types):
+                if dst in factor_set and etype in reverse_edge_types:
+                    has_incoming = True
+                    break
+            assert has_incoming, "Factor nodes missing incoming variable edges."
 
     # --- Finalise -----------------------------------------------------------
     num_nodes = len(global_to_local_id_encoder.local_attributes)
