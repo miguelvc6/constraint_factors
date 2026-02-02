@@ -214,6 +214,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write per-constraint evaluation CSV.",
     )
+    parser.add_argument(
+        "--paper-suite",
+        action="store_true",
+        help="Enable strict global metrics and per-constraint CSV for paper experiments.",
+    )
     return parser.parse_args()
 
 
@@ -374,6 +379,8 @@ def main() -> int:
                 eval_flags.append("--global-metrics")
             if args.eval_per_constraint_csv or "--per-constraint-csv" not in eval_flags:
                 eval_flags.append("--per-constraint-csv")
+            if args.paper_suite and "--strict-global-metrics" not in eval_flags:
+                eval_flags.append("--strict-global-metrics")
 
             if kind == "proposal":
                 eval_command = [

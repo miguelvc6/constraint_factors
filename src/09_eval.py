@@ -49,6 +49,12 @@ from modules.reranker_eval import CandidateConstraintEvaluator
 
 NONE_CLASS_INDEX = 0  # Bass-style datasets reserve class 0 for "no triple"
 ACTIONS = ("add", "del")
+PAPER_SUITE_TAGS: set[str] = {
+    "m0_eswc_like",
+    "m1_main_fix1",
+    "m1_fix1_reranker",
+    "m2_global_fix_reranker",
+}
 
 # --- EVALUATION METRICS DEFINITIONS --- #
 
@@ -305,6 +311,7 @@ def _maybe_prepare_global_support(
     split: str,
     none_class: int,
     constraint_scope: str = "local",
+    strict: bool = False,
 ) -> GlobalMetricsSupport | None:
     variant_dir = dataset_variant
     suffix = f"_minocc{min_occurrence}"
@@ -316,15 +323,31 @@ def _maybe_prepare_global_support(
     registry_path = Path("data/interim") / f"constraint_registry_{dataset_variant}.parquet"
 
     if not registry_path.exists():
-        logging.warning("Constraint registry not found at %s; skipping global metrics.", registry_path)
+        message = f"Constraint registry not found at {registry_path}."
+        if strict:
+            raise RuntimeError(
+                message
+                + " Strict global metrics require the registry; rebuild interim data or disable strict mode."
+            )
+        logging.warning("%s Skipping global metrics.", message)
         return None
     if not encoder_path.exists():
-        logging.warning("Global encoder not found at %s; skipping global metrics.", encoder_path)
+        message = f"Global encoder not found at {encoder_path}."
+        if strict:
+            raise RuntimeError(
+                message + " Strict global metrics require the encoder; rebuild interim data or disable strict mode."
+            )
+        logging.warning("%s Skipping global metrics.", message)
         return None
 
     try:
         rows = load_global_eval_rows(interim_base, split)
     except FileNotFoundError as exc:
+        if strict:
+            raise RuntimeError(
+                f"Global eval rows unavailable at {interim_base}: {exc}. "
+                "Strict global metrics require parquet rows with factor fields."
+            ) from exc
         logging.warning("Global eval rows unavailable: %s", exc)
         return None
 
@@ -332,13 +355,22 @@ def _maybe_prepare_global_support(
     encoder.load(encoder_path)
     encoder.freeze()
 
-    evaluator = CandidateConstraintEvaluator(
-        str(registry_path),
-        encoder=encoder,
-        assume_complete=True,
-        constraint_scope=constraint_scope,
-        use_encoded_ids=True,
-    )
+    try:
+        evaluator = CandidateConstraintEvaluator(
+            str(registry_path),
+            encoder=encoder,
+            assume_complete=True,
+            constraint_scope=constraint_scope,
+            use_encoded_ids=True,
+        )
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(
+                "Failed to construct constraint evaluator for strict global metrics. "
+                "Verify registry format and encoder compatibility."
+            ) from exc
+        logging.warning("Constraint evaluator unavailable: %s", exc)
+        return None
 
     return GlobalMetricsSupport(rows=rows, evaluator=evaluator, none_class=none_class)
 
@@ -594,6 +626,9 @@ def _run_and_save(
         postprocess=postprocess,
         precomputed_predictions=normalized_predictions,
     )
+    metrics["global_metrics_computed"] = bool(
+        postprocess_state and isinstance(postprocess_state, dict) and "global_metrics" in postprocess_state
+    )
     if postprocess_state and "repair_metrics" in postprocess_state:
         metrics["repair_metrics"] = postprocess_state["repair_metrics"]
     if postprocess_state and "global_metrics" in postprocess_state:
@@ -665,6 +700,13 @@ def _data_has_factor_fields(test_data: Sequence[Data]) -> bool:
     has_ids = hasattr(sample, "factor_constraint_ids")
     has_labels = hasattr(sample, "factor_satisfied_pre") or hasattr(sample, "factor_checkable_pre")
     return has_ids and has_labels
+
+
+def _infer_config_tag_from_run_dir(run_directory: Path) -> str:
+    name = run_directory.name
+    if "_" in name:
+        return name.rsplit("_", 1)[-1]
+    return name
 
 
 def _summarize_repair_per_type(repair_metrics: dict[str, object] | None) -> dict[str, dict[str, float | int]]:
@@ -934,6 +976,11 @@ def parse_args():
         help="Write per-constraint breakdown CSV in the evaluations directory.",
     )
     parser.add_argument(
+        "--strict-global-metrics",
+        action="store_true",
+        help="Fail fast unless global metrics (GFR/SRR/SIR/disruption) can be computed.",
+    )
+    parser.add_argument(
         "--reranker-predictions",
         type=Path,
         help="Optional path to reranker predictions to evaluate without a model forward pass.",
@@ -986,6 +1033,13 @@ def main():
             experiment_config = json.load(f)
 
         model_cfg = ModelConfig.from_mapping(experiment_config["model_config"])
+        config_tag = _infer_config_tag_from_run_dir(run_directory)
+        strict_global = bool(args.strict_global_metrics or (config_tag in PAPER_SUITE_TAGS))
+        if strict_global and args.no_global_metrics:
+            raise RuntimeError(
+                "Strict global metrics cannot be combined with --no-global-metrics. "
+                "Remove --no-global-metrics or disable strict mode."
+            )
 
         logging.info(
             "Evaluating dataset=%s min_occurrence=%s | encoding=%s model=%s",
@@ -1013,7 +1067,12 @@ def main():
             postprocess_states.append(repair_state)
 
         global_support = None
-        global_metrics_enabled = (not args.no_global_metrics) and (
+        if strict_global and not _data_has_factor_fields(test_data):
+            raise RuntimeError(
+                "Strict global metrics require factor fields on test graphs. "
+                "Rebuild graphs with factor labels (factor_* fields) or disable strict mode."
+            )
+        global_metrics_enabled = True if strict_global else (not args.no_global_metrics) and (
             args.global_metrics or _data_has_factor_fields(test_data)
         )
         if global_metrics_enabled:
@@ -1022,6 +1081,7 @@ def main():
                 model_cfg.min_occurrence,
                 split="test",
                 none_class=NONE_CLASS_INDEX,
+                strict=strict_global,
             )
         if global_support:
             global_postprocess, global_state = global_support.build_postprocess(test_data)
@@ -1029,6 +1089,11 @@ def main():
             postprocess_states.append(global_state)
             _smoke_check_global_metrics(global_support, test_data, none_class=NONE_CLASS_INDEX)
         elif global_metrics_enabled:
+            if strict_global:
+                raise RuntimeError(
+                    "Strict global metrics requested but could not be prepared. "
+                    "Verify registry/encoder availability and factor fields."
+                )
             logging.warning("Global metrics requested but could not be prepared; skipping.")
 
         postprocess = None
@@ -1057,7 +1122,7 @@ def main():
             postprocess=postprocess,
             postprocess_state=postprocess_state,
             precomputed_predictions=precomputed_predictions,
-            write_per_constraint_csv=args.per_constraint_csv or global_metrics_enabled,
+            write_per_constraint_csv=True if strict_global else (args.per_constraint_csv or global_metrics_enabled),
         )
 
     else:  # Evaluate baselines
@@ -1082,15 +1147,27 @@ def main():
         )
 
         global_support = None
-        global_metrics_enabled = not args.no_global_metrics
+        strict_global = bool(args.strict_global_metrics)
+        if strict_global and args.no_global_metrics:
+            raise RuntimeError(
+                "Strict global metrics cannot be combined with --no-global-metrics. "
+                "Remove --no-global-metrics or disable strict mode."
+            )
+        global_metrics_enabled = True if strict_global else not args.no_global_metrics
         if global_metrics_enabled:
             global_support = _maybe_prepare_global_support(
                 args.dataset,
                 args.min_occurrence,
                 split="test",
                 none_class=NONE_CLASS_INDEX,
+                strict=strict_global,
             )
             if not global_support:
+                if strict_global:
+                    raise RuntimeError(
+                        "Strict global metrics requested but could not be prepared. "
+                        "Verify registry/encoder availability and factor fields."
+                    )
                 logging.warning("Global metrics requested but could not be prepared; skipping.")
 
         repair_builder = None
@@ -1144,7 +1221,7 @@ def main():
             output_path = output_root / f"{name}.json"
             with output_path.open("w", encoding="utf-8") as handle:
                 json.dump(metrics, handle, indent=4)
-            if args.per_constraint_csv or global_metrics_enabled:
+            if strict_global or args.per_constraint_csv or global_metrics_enabled:
                 _write_per_constraint_csv(metrics, output_root / name)
             return metrics
 
