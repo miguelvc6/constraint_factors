@@ -31,6 +31,7 @@ from modules.model_store import (
 from modules.models import BaseGraphModel, build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
 from modules.reranker_eval import CandidateConstraintEvaluator
+from modules.policy import POLICY_NAMES, derive_policy_label
 from modules.training_utils import (
     ConstraintMetricsAccumulator,
     DynamicConstraintWeighter,
@@ -315,6 +316,7 @@ def train(
     device: torch.device | str = torch.device("cpu"),
     fix_loss_state: dict[str, object] | None = None,
     chooser_state: dict[str, object] | None = None,
+    policy_state: dict[str, object] | None = None,
 ):
     # Normalise the device argument because config may pass strings.
     if isinstance(device, str):
@@ -349,6 +351,13 @@ def train(
         chooser_val_contexts = cast(list[ViolationContext] | None, chooser_state.get("val_contexts"))
         chooser_evaluator = cast(CandidateConstraintEvaluator | None, chooser_state.get("evaluator"))
         chooser_candidate_cfg = cast(CandidateConfig | None, chooser_state.get("candidate_cfg"))
+
+    policy_enabled = bool(getattr(model, "_policy_enabled", False))
+    policy_train_contexts = None
+    policy_val_contexts = None
+    if policy_enabled and policy_state:
+        policy_train_contexts = cast(list[ViolationContext] | None, policy_state.get("train_contexts"))
+        policy_val_contexts = cast(list[ViolationContext] | None, policy_state.get("val_contexts"))
 
     # Unpack training configuration.
     batch_size = train_cfg.batch_size
@@ -466,6 +475,9 @@ def train(
         train_factor_correct = 0
         train_chooser_loss_sum = 0.0
         train_chooser_count = 0
+        train_policy_loss_sum = 0.0
+        train_policy_count = 0
+        train_policy_correct = 0
 
         train_constraint_metrics = ConstraintMetricsAccumulator()
         data_iter = progress_bar(train_loader, desc="Training Batches", leave=False)
@@ -510,6 +522,31 @@ def train(
             per_slot_loss = criterion(out_flat, targets_flat)
             loss_matrix = per_slot_loss.view(-1, NUM_SLOTS)
             graph_loss = loss_matrix.mean(dim=1)
+
+            if policy_enabled:
+                policy_logits = outputs.get("policy_logits")
+                if policy_logits is None:
+                    raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
+                if policy_train_contexts is None:
+                    raise RuntimeError("Policy choice enabled but training contexts are missing.")
+                graphs = data.to_data_list()
+                policy_labels = []
+                for idx, graph in enumerate(graphs):
+                    context_index = int(getattr(graph, "context_index", idx))
+                    if context_index >= len(policy_train_contexts):
+                        raise RuntimeError("Policy context index out of bounds.")
+                    context = policy_train_contexts[context_index]
+                    gold = graph.y
+                    if gold.dim() == 2:
+                        gold = gold[0]
+                    decision = derive_policy_label(gold.tolist(), context, none_class=NONE_CLASS_INDEX)
+                    policy_labels.append(int(decision.policy_id))
+                policy_targets = torch.tensor(policy_labels, dtype=torch.long, device=graph_loss.device)
+                policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets, reduction="none")
+                graph_loss = graph_loss + policy_loss
+                train_policy_loss_sum += float(policy_loss.sum().item())
+                train_policy_count += policy_loss.numel()
+                train_policy_correct += int((policy_logits.argmax(dim=-1) == policy_targets).sum().item())
 
             # Optional - Constraint-is-fixed loss term
             fix_weight = 0.0
@@ -797,6 +834,9 @@ def train(
                     "chooser_loss": f"{train_chooser_loss_sum / max(train_chooser_count, 1):.4f}"
                     if chooser_enabled
                     else "n/a",
+                    "policy_loss": f"{train_policy_loss_sum / max(train_policy_count, 1):.4f}"
+                    if policy_enabled
+                    else "n/a",
                 }
             )
 
@@ -812,6 +852,8 @@ def train(
         train_factor_loss = train_factor_loss_sum / max(train_factor_count, 1)
         train_factor_acc = 100 * train_factor_correct / max(train_factor_count, 1)
         train_chooser_loss = train_chooser_loss_sum / max(train_chooser_count, 1)
+        train_policy_loss = train_policy_loss_sum / max(train_policy_count, 1)
+        train_policy_acc = 100 * train_policy_correct / max(train_policy_count, 1)
 
         # ------- Validation -------
         model.eval()
@@ -831,6 +873,9 @@ def train(
         val_factor_correct = 0
         val_chooser_loss_sum = 0.0
         val_chooser_count = 0
+        val_policy_loss_sum = 0.0
+        val_policy_count = 0
+        val_policy_correct = 0
 
         with torch.no_grad():
             for batch_idx, data in enumerate(
@@ -861,6 +906,31 @@ def train(
                 per_slot_loss = criterion(out_flat, targets_flat)
                 loss_matrix = per_slot_loss.view(-1, NUM_SLOTS)
                 graph_loss = loss_matrix.mean(dim=1)
+
+                if policy_enabled:
+                    policy_logits = outputs.get("policy_logits")
+                    if policy_logits is None:
+                        raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
+                    if policy_val_contexts is None:
+                        raise RuntimeError("Policy choice enabled but validation contexts are missing.")
+                    graphs = data.to_data_list()
+                    policy_labels = []
+                    for idx, graph in enumerate(graphs):
+                        context_index = int(getattr(graph, "context_index", idx))
+                        if context_index >= len(policy_val_contexts):
+                            raise RuntimeError("Policy context index out of bounds.")
+                        context = policy_val_contexts[context_index]
+                        gold = graph.y
+                        if gold.dim() == 2:
+                            gold = gold[0]
+                        decision = derive_policy_label(gold.tolist(), context, none_class=NONE_CLASS_INDEX)
+                        policy_labels.append(int(decision.policy_id))
+                    policy_targets = torch.tensor(policy_labels, dtype=torch.long, device=graph_loss.device)
+                    policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets, reduction="none")
+                    graph_loss = graph_loss + policy_loss
+                    val_policy_loss_sum += float(policy_loss.sum().item())
+                    val_policy_count += policy_loss.numel()
+                    val_policy_correct += int((policy_logits.argmax(dim=-1) == policy_targets).sum().item())
 
                 # Optional - Constraint-is-fixed loss term
                 if (
@@ -1124,6 +1194,8 @@ def train(
         val_factor_loss = val_factor_loss_sum / max(val_factor_count, 1)
         val_factor_acc = 100 * val_factor_correct / max(val_factor_count, 1)
         val_chooser_loss = val_chooser_loss_sum / max(val_chooser_count, 1)
+        val_policy_loss = val_policy_loss_sum / max(val_policy_count, 1)
+        val_policy_acc = 100 * val_policy_correct / max(val_policy_count, 1)
 
         logger.info(
             "Epoch %s samples | train=%s validation=%s",
@@ -1143,6 +1215,10 @@ def train(
         history["val_acc_slot"].append(val_acc_slot)
         history.setdefault("train_chooser_loss", []).append(train_chooser_loss)
         history.setdefault("val_chooser_loss", []).append(val_chooser_loss)
+        history.setdefault("train_policy_loss", []).append(train_policy_loss)
+        history.setdefault("val_policy_loss", []).append(val_policy_loss)
+        history.setdefault("train_policy_acc", []).append(train_policy_acc)
+        history.setdefault("val_policy_acc", []).append(val_policy_acc)
 
         # Record per-slot diagnostics (helps inspect slot-specific drift).
         per_slot_history = history.setdefault("per_slot", {})
@@ -1466,6 +1542,30 @@ def main():
             chooser_cfg.loss_mode,
         )
 
+    policy_state: dict[str, object] | None = None
+    if model_cfg.enable_policy_choice:
+        if not isinstance(train_data, list) or not isinstance(val_data, list):
+            raise RuntimeError("Policy choice training requires in-memory datasets (list[Data]).")
+        train_contexts = load_violation_contexts(interim_path, "train", none_class=NONE_CLASS_INDEX)
+        val_contexts = load_violation_contexts(interim_path, "val", none_class=NONE_CLASS_INDEX)
+        if len(train_contexts) != len(train_data) or len(val_contexts) != len(val_data):
+            raise RuntimeError("Mismatch between graph dataset size and violation contexts for policy choice.")
+        for idx, graph in enumerate(train_data):
+            if not hasattr(graph, "context_index"):
+                setattr(graph, "context_index", idx)
+        for idx, graph in enumerate(val_data):
+            if not hasattr(graph, "context_index"):
+                setattr(graph, "context_index", idx)
+        policy_state = {
+            "train_contexts": train_contexts,
+            "val_contexts": val_contexts,
+        }
+        logger.info(
+            "Policy choice enabled | classes=%s | policies=%s",
+            model_cfg.policy_num_classes,
+            ", ".join(POLICY_NAMES),
+        )
+
     # Select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Selected compute device: %s", device)
@@ -1521,6 +1621,7 @@ def main():
         device=device,
         fix_loss_state=fix_loss_state,
         chooser_state=chooser_state,
+        policy_state=policy_state,
     )
 
     if device.type == "cuda":

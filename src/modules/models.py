@@ -38,6 +38,8 @@ class BaseGraphModel(nn.Module, ABC):
         factor_type_embedding_dim: int = 8,
         pressure_enabled: bool = False,
         pressure_type_conditioning: str = "none",
+        enable_policy_choice: bool = False,
+        policy_num_classes: int = 6,
     ):
         super().__init__()
         self._num_input_graph_nodes = int(num_input_graph_nodes)
@@ -165,6 +167,14 @@ class BaseGraphModel(nn.Module, ABC):
             nn.ReLU(),
             nn.Linear(head_hidden, 1),
         )
+        self._policy_enabled = bool(enable_policy_choice)
+        self._policy_num_classes = int(policy_num_classes)
+        if self._policy_enabled:
+            if self._policy_num_classes <= 0:
+                raise ValueError("policy_num_classes must be positive when policy choice is enabled.")
+            self.policy_head = nn.Linear(head_hidden, self._policy_num_classes)
+        else:
+            self.policy_head = None
 
     @property
     def num_input_graph_nodes(self) -> int:
@@ -321,6 +331,14 @@ class BaseGraphModel(nn.Module, ABC):
         predicate_features = self.predicate_branch(shared)
         predicate_features = F.dropout(predicate_features, p=self._dropout, training=self.training)
 
+        policy_logits = None
+        if self._policy_enabled and self.policy_head is not None:
+            policy_logits = self.policy_head(shared)
+
+        policy_logits = None
+        if self._policy_enabled and self.policy_head is not None:
+            policy_logits = self.policy_head(shared)
+
         # Entity logits exclude predicate IDs
         # Here we expand to prediction size (filling excluded with negative values)
         # TODO: this materializes large tensors (size=num_target_ids), though most entries never appear. Reducing the size requires adapting the training script (and evaluation), by remapping the targets.
@@ -382,6 +400,7 @@ class BaseGraphModel(nn.Module, ABC):
             "factor_logits_pre": factor_logits_pre,
             "factor_mask_pre": factor_mask_pre,
             "factor_graph_index": factor_graph_index,
+            "policy_logits": policy_logits,
         }
 
     @staticmethod
@@ -749,6 +768,7 @@ class RepairGINFactorPressure(BaseGraphModel):
             "factor_logits_pre": factor_logits_pre,
             "factor_mask_pre": factor_mask_pre,
             "factor_graph_index": factor_graph_index,
+            "policy_logits": policy_logits,
         }
 
 
@@ -869,6 +889,8 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         factor_type_embedding_dim=config.factor_type_embedding_dim,
         pressure_enabled=config.pressure_enabled,
         pressure_type_conditioning=getattr(config, "pressure_type_conditioning", "none"),
+        enable_policy_choice=getattr(config, "enable_policy_choice", False),
+        policy_num_classes=getattr(config, "policy_num_classes", 6),
     )
 
 

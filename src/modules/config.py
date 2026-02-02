@@ -314,6 +314,10 @@ class ModelConfig:
     """Toggle factor pressure injection during message passing."""
     pressure_type_conditioning: str = "none"
     """Condition pressure messages on factor types: none|concat|gate."""
+    enable_policy_choice: bool = False
+    """Enable policy choice head over graph embeddings."""
+    policy_num_classes: int = 6
+    """Number of policy classes for policy choice head."""
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ModelConfig":
@@ -354,6 +358,14 @@ class ModelConfig:
             if value not in {"none", "concat", "gate"}:
                 raise ValueError("pressure_type_conditioning must be 'none', 'concat', or 'gate'")
             filtered["pressure_type_conditioning"] = value
+        if "enable_policy_choice" in filtered and filtered["enable_policy_choice"] is not None:
+            filtered["enable_policy_choice"] = bool(filtered["enable_policy_choice"])
+        if "policy_num_classes" in filtered and filtered["policy_num_classes"] is not None:
+            filtered["policy_num_classes"] = int(filtered["policy_num_classes"])
+
+        if filtered.get("enable_policy_choice") and "policy_num_classes" in filtered:
+            if int(filtered["policy_num_classes"]) < 6:
+                raise ValueError("policy_num_classes must be >= 6 for default policy set.")
 
         current = asdict(self)
         current.update(filtered)
@@ -380,6 +392,7 @@ class TrainingConfig:
     fix_probability_loss: FixProbabilityLossConfig = field(default_factory=FixProbabilityLossConfig)
     factor_loss: FactorLossConfig = field(default_factory=FactorLossConfig)
     chooser: ChooserConfig = field(default_factory=ChooserConfig)
+    policy_filter_strict: bool = True
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "TrainingConfig":
@@ -403,6 +416,8 @@ class TrainingConfig:
         fix_loss_update = filtered.pop("fix_probability_loss", None)
         factor_loss_update = filtered.pop("factor_loss", None)
         chooser_update = filtered.pop("chooser", None)
+        if "policy_filter_strict" in filtered and filtered["policy_filter_strict"] is not None:
+            filtered["policy_filter_strict"] = bool(filtered["policy_filter_strict"])
 
         if dynamic_fallback is not None:
             if constraint_update is None:
@@ -450,6 +465,7 @@ class TrainingConfig:
         payload["fix_probability_loss"] = self.fix_probability_loss.to_dict()
         payload["factor_loss"] = self.factor_loss.to_dict()
         payload["chooser"] = self.chooser.to_dict()
+        payload["policy_filter_strict"] = self.policy_filter_strict
         return payload
 
 

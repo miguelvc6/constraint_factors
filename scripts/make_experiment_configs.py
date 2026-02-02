@@ -103,6 +103,8 @@ class ProposalExperiment:
     fix_prob_enabled: bool
     validate_factor_labels: bool = False
     factor_weight_pre: float = 0.1
+    enable_policy_choice: bool = False
+    policy_num_classes: int = 6
 
 
 @dataclass(frozen=True)
@@ -149,6 +151,7 @@ def main() -> None:
             pressure_type_conditioning="none",
             fix_prob_enabled=True,
             validate_factor_labels=False,
+            enable_policy_choice=False,
         ),
         # M1: Main model (Fix 1): factor loss + pressure
         ProposalExperiment(
@@ -160,6 +163,19 @@ def main() -> None:
             fix_prob_enabled=False,
             validate_factor_labels=True,  # required for factor loss + global metrics
             factor_weight_pre=0.1,
+            enable_policy_choice=False,
+        ),
+        ProposalExperiment(
+            name="m3_policy_choice",
+            model_name="GIN_PRESSURE",
+            factor_loss_enabled=True,
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            fix_prob_enabled=False,
+            validate_factor_labels=True,
+            factor_weight_pre=0.1,
+            enable_policy_choice=True,
+            policy_num_classes=6,
         ),
     ]
 
@@ -175,6 +191,7 @@ def main() -> None:
                 fix_prob_enabled=False,
                 validate_factor_labels=True,
                 factor_weight_pre=0.1,
+                enable_policy_choice=False,
             )
         )
         # Ablation: pressure ON, factor loss OFF (tests whether auxiliary labels matter)
@@ -187,6 +204,7 @@ def main() -> None:
                 pressure_type_conditioning="none",
                 fix_prob_enabled=False,
                 validate_factor_labels=False,
+                enable_policy_choice=False,
             )
         )
         # Ablation: pressure typed vs untyped (keep loss same as main model)
@@ -200,6 +218,7 @@ def main() -> None:
                 fix_prob_enabled=False,
                 validate_factor_labels=True,
                 factor_weight_pre=0.1,
+                enable_policy_choice=False,
             )
         )
         proposal_exps.append(
@@ -212,6 +231,7 @@ def main() -> None:
                 fix_prob_enabled=False,
                 validate_factor_labels=True,
                 factor_weight_pre=0.1,
+                enable_policy_choice=False,
             )
         )
 
@@ -269,6 +289,8 @@ def main() -> None:
                     "num_factor_types": int(num_factor_types),
                     "pressure_enabled": bool(exp.pressure_enabled),
                     "pressure_type_conditioning": exp.pressure_type_conditioning,
+                    "enable_policy_choice": bool(exp.enable_policy_choice),
+                    "policy_num_classes": int(exp.policy_num_classes),
                     # optional: "factor_type_embedding_dim": 16,
                 },
                 "training_config": {
@@ -282,6 +304,7 @@ def main() -> None:
                         "weight_pre": float(exp.factor_weight_pre),
                         # keep defaults: only_checkable=True, per_graph_reduction="mean"
                     },
+                    "policy_filter_strict": True,
                 },
             }
             _write_json(cfg_path, payload)

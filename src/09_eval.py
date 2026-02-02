@@ -47,6 +47,11 @@ from modules.repair_eval import (
     load_violation_contexts,
 )
 from modules.reranker_eval import CandidateConstraintEvaluator
+from modules.policy import (
+    POLICY_NAMES,
+    PolicyDecision,
+    filter_candidates_by_policy,
+)
 
 NONE_CLASS_INDEX = 0  # Bass-style datasets reserve class 0 for "no triple"
 ACTIONS = ("add", "del")
@@ -146,6 +151,14 @@ class ChooserSupport:
     contexts: Sequence[ViolationContext]
     heuristics: ConstraintRepairHeuristics
     candidate_cfg: CandidateConfig
+
+
+@dataclass
+class PolicySupport:
+    contexts: Sequence[ViolationContext]
+    heuristics: ConstraintRepairHeuristics
+    candidate_cfg: CandidateConfig
+    filter_strict: bool = True
 
 
 def _repair_samples_from_predictions(
@@ -453,6 +466,7 @@ def eval(
     postprocess: Callable[[torch.Tensor, torch.Tensor, list[str]], None] | None = None,
     precomputed_predictions: torch.Tensor | None = None,
     chooser_support: ChooserSupport | None = None,
+    policy_support: PolicySupport | None = None,
 ) -> dict[str, object]:
     """Evaluate a model and return Bass-style precision/recall/F1 metrics."""
     if isinstance(device, str):
@@ -466,6 +480,8 @@ def eval(
         raise ValueError("Either a model or precomputed_predictions must be provided.")
     if precomputed_predictions is not None and chooser_support is not None:
         raise ValueError("Chooser support cannot be used with precomputed predictions.")
+    if precomputed_predictions is not None and policy_support is not None:
+        raise ValueError("Policy support cannot be used with precomputed predictions.")
     if precomputed_predictions is None and model is not None:
         model.eval()
     predictions, targets = [], []
@@ -488,7 +504,54 @@ def eval(
                     output_logged = True
                 logits = out
                 graph_emb = None
-            if chooser_support is not None:
+            if policy_support is not None:
+                if graph_emb is None:
+                    raise RuntimeError("Policy choice requires graph_emb from model outputs.")
+                policy_logits = out.get("policy_logits") if isinstance(out, dict) else None
+                if policy_logits is None:
+                    raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
+                graphs = data.to_data_list()
+                batch_preds = []
+                for idx, graph in enumerate(graphs):
+                    context_index = int(getattr(graph, "context_index", idx))
+                    if context_index >= len(policy_support.contexts):
+                        raise RuntimeError("Policy context index out of bounds.")
+                    context = policy_support.contexts[context_index]
+                    policy_id = int(torch.argmax(policy_logits[idx]).item())
+                    candidates, _ = build_candidates(
+                        graph=graph,
+                        context=context,
+                        heuristics=policy_support.heuristics,
+                        proposal_logits=logits[idx].detach(),
+                        cfg=policy_support.candidate_cfg,
+                        placeholder_ids=set(policy_support.heuristics.placeholder_ids.values()),
+                        num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
+                    )
+                    candidates_filtered, match_mask = filter_candidates_by_policy(
+                        candidates,
+                        policy_id,
+                        context,
+                        strict=policy_support.filter_strict,
+                        none_class=NONE_CLASS_INDEX,
+                    )
+                    if chooser_support is not None:
+                        candidate_tensor = torch.tensor(
+                            candidates_filtered, dtype=torch.long, device=logits.device
+                        )
+                        scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+                        if not policy_support.filter_strict:
+                            mask_tensor = torch.tensor(
+                                match_mask[: len(candidates_filtered)],
+                                dtype=scores.dtype,
+                                device=scores.device,
+                            )
+                            scores = scores + (mask_tensor - 1.0)
+                        best_idx = int(torch.argmax(scores).item())
+                        batch_preds.append(list(candidates_filtered[best_idx]))
+                    else:
+                        batch_preds.append(list(candidates_filtered[0]))
+                predictions.append(torch.tensor(batch_preds, dtype=torch.long).cpu())
+            elif chooser_support is not None:
                 if graph_emb is None:
                     raise RuntimeError("Chooser mode requires graph_emb from model outputs.")
                 graphs = data.to_data_list()
@@ -513,7 +576,7 @@ def eval(
                     scores = model.score_candidates(graph_emb[idx], candidate_tensor)
                     best_idx = int(torch.argmax(scores).item())
                     batch_preds.append(list(candidates[best_idx]))
-                predictions.append(torch.tensor(batch_preds, dtype=torch.long))
+                predictions.append(torch.tensor(batch_preds, dtype=torch.long).cpu())
             else:
                 out = logits.argmax(dim=-1)  # class predictions per action
                 predictions.append(out.cpu())
@@ -656,6 +719,7 @@ def _run_and_save(
     precomputed_predictions: torch.Tensor | None = None,
     write_per_constraint_csv: bool = False,
     chooser_support: ChooserSupport | None = None,
+    policy_support: PolicySupport | None = None,
 ) -> dict[str, object]:
     normalized_predictions = None
     if precomputed_predictions is not None:
@@ -667,6 +731,7 @@ def _run_and_save(
         postprocess=postprocess,
         precomputed_predictions=normalized_predictions,
         chooser_support=chooser_support,
+        policy_support=policy_support,
     )
     metrics["global_metrics_computed"] = bool(
         postprocess_state and isinstance(postprocess_state, dict) and "global_metrics" in postprocess_state
@@ -922,6 +987,7 @@ def evaluate_trained_model(
     precomputed_predictions: torch.Tensor | None = None,
     write_per_constraint_csv: bool = False,
     chooser_support: ChooserSupport | None = None,
+    policy_support: PolicySupport | None = None,
 ) -> None:
     checkpoint_path = get_checkpoint_path(run_directory)
 
@@ -976,6 +1042,7 @@ def evaluate_trained_model(
         precomputed_predictions=precomputed_predictions,
         write_per_constraint_csv=write_per_constraint_csv,
         chooser_support=chooser_support,
+        policy_support=policy_support,
     )
 
 
@@ -1038,6 +1105,11 @@ def parse_args():
         action="store_true",
         help="Use proposal chooser head to select candidate edits instead of slot-wise argmax.",
     )
+    parser.add_argument(
+        "--use-policy-choice",
+        action="store_true",
+        help="Use policy choice head to filter candidates before selection.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1096,6 +1168,8 @@ def main():
             )
         if args.use_chooser and args.reranker_predictions:
             raise RuntimeError("--use-chooser cannot be combined with --reranker-predictions.")
+        if args.use_policy_choice and args.reranker_predictions:
+            raise RuntimeError("--use-policy-choice cannot be combined with --reranker-predictions.")
 
         logging.info(
             "Evaluating dataset=%s min_occurrence=%s | encoding=%s model=%s",
@@ -1111,6 +1185,7 @@ def main():
         postprocess_fns: list[Callable[[torch.Tensor, torch.Tensor, list[str]], None]] = []
         postprocess_states: list[dict[str, object]] = []
         chooser_support: ChooserSupport | None = None
+        policy_support: PolicySupport | None = None
 
         repair_support = _maybe_prepare_repair_support(
             model_cfg.dataset_variant,
@@ -1153,6 +1228,35 @@ def main():
                 contexts=contexts,
                 heuristics=heuristics,
                 candidate_cfg=candidate_cfg,
+            )
+
+        if args.use_policy_choice:
+            if not model_cfg.enable_policy_choice:
+                raise RuntimeError("Policy choice evaluation requested but policy choice is disabled in model config.")
+            interim_base = Path("data/interim") / f"{model_cfg.dataset_variant}_minocc{model_cfg.min_occurrence}"
+            encoder_path = interim_base / "globalintencoder.txt"
+            if not encoder_path.exists():
+                raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
+            encoder = GlobalIntEncoder()
+            encoder.load(encoder_path)
+            encoder.freeze()
+            placeholder_ids = load_placeholder_ids(encoder_path)
+            heuristics = ConstraintRepairHeuristics(
+                encoder=encoder,
+                placeholder_ids=placeholder_ids,
+                none_class=NONE_CLASS_INDEX,
+            )
+            contexts = load_violation_contexts(interim_base, "test", none_class=NONE_CLASS_INDEX)
+            if len(contexts) != len(test_data):
+                raise RuntimeError("Mismatch between test graphs and violation contexts for policy choice.")
+            for idx, graph in enumerate(test_data):
+                setattr(graph, "context_index", idx)
+            candidate_cfg = CandidateConfig()
+            policy_support = PolicySupport(
+                contexts=contexts,
+                heuristics=heuristics,
+                candidate_cfg=candidate_cfg,
+                filter_strict=training_cfg.policy_filter_strict,
             )
 
         global_support = None
@@ -1213,11 +1317,14 @@ def main():
             precomputed_predictions=precomputed_predictions,
             write_per_constraint_csv=True if strict_global else (args.per_constraint_csv or global_metrics_enabled),
             chooser_support=chooser_support,
+            policy_support=policy_support,
         )
 
     else:  # Evaluate baselines
         if args.use_chooser:
             raise RuntimeError("--use-chooser is only supported for trained model evaluation.")
+        if args.use_policy_choice:
+            raise RuntimeError("--use-policy-choice is only supported for trained model evaluation.")
         logging.info(
             "Evaluating baselines dataset=%s min_occurrence=%s using interim parquet data",
             args.dataset,
