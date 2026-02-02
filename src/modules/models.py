@@ -239,10 +239,11 @@ class BaseGraphModel(nn.Module, ABC):
                 x = conv(x, edge_index_forward, edge_attr=edge_features_forward)
             else:
                 x = conv(x, edge_index)
-        x = global_mean_pool(x, batch)
+        node_emb = x
+        graph_emb = global_mean_pool(x, batch)
 
         ## Classification Head
-        shared = F.relu(self.shared_projection(x))
+        shared = F.relu(self.shared_projection(graph_emb))
         shared = F.dropout(shared, p=self._dropout, training=self.training)
 
         # Role-specificic branches for subject, object, predicate predictions
@@ -270,11 +271,15 @@ class BaseGraphModel(nn.Module, ABC):
 
         prediction = torch.stack([y_add_s, y_add_p, y_add_o, y_del_s, y_del_p, y_del_o], dim=1)
         assert prediction.shape == (
-            x.shape[0],
+            graph_emb.shape[0],
             6,
             self.num_target_ids,
-        ), f"Expected {(x.shape[0], 6, self.num_target_ids)}, got {prediction.shape}"
-        return prediction
+        ), f"Expected {(graph_emb.shape[0], 6, self.num_target_ids)}, got {prediction.shape}"
+        return {
+            "edit_logits": prediction,
+            "node_emb": node_emb,
+            "graph_emb": graph_emb,
+        }
 
     @staticmethod
     def _prepare_class_ids(

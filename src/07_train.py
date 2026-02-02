@@ -262,6 +262,7 @@ def train(
     }
 
     epoch_iter = progress_bar(range(num_epochs), desc="Training Epochs", leave=True)
+    sanity_checked = False
 
     for epoch in epoch_iter:
         logger.info(f"Epoch {epoch + 1}/{num_epochs} started")
@@ -300,7 +301,19 @@ def train(
 
             optimizer.zero_grad(set_to_none=True)
 
-            out = model(data)
+            outputs = model(data)
+            if torch.is_tensor(outputs):
+                outputs = {
+                    "edit_logits": outputs,
+                    "node_emb": None,
+                    "graph_emb": None,
+                }
+            out = outputs.get("edit_logits") if isinstance(outputs, dict) else None
+            assert out is not None, "Model output must include 'edit_logits'."
+            if not sanity_checked:
+                assert isinstance(outputs, dict), "Model output must be a dict."
+                assert "edit_logits" in outputs, "Model output must include 'edit_logits'."
+                sanity_checked = True
             assert out.dim() == 3 and out.size(1) == NUM_SLOTS and out.size(2) == model.num_target_ids, (
                 f"Expected out (batch_size,{NUM_SLOTS},{model.num_target_ids}), got {tuple(out.shape)}"
             )
@@ -450,7 +463,15 @@ def train(
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
 
-                out = model(data)
+                outputs = model(data)
+                if torch.is_tensor(outputs):
+                    outputs = {
+                        "edit_logits": outputs,
+                        "node_emb": None,
+                        "graph_emb": None,
+                    }
+                out = outputs.get("edit_logits") if isinstance(outputs, dict) else None
+                assert out is not None, "Model output must include 'edit_logits'."
                 assert out.dim() == 3 and out.size(1) == NUM_SLOTS and out.size(2) == model.num_target_ids, (
                     f"Expected out (B,{NUM_SLOTS},{model.num_target_ids}), got {tuple(out.shape)}"
                 )
