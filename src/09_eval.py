@@ -34,7 +34,7 @@ from tqdm.autonotebook import tqdm
 from modules.baselines import evaluate_baselines
 from modules.config import ModelConfig
 from modules.data_encoders import GlobalIntEncoder
-from modules.model_store import config_copy_path, evaluations_dir, get_checkpoint_path
+from modules.model_store import baseline_dir, config_copy_path, evaluations_dir, get_checkpoint_path
 from modules.models import BaseGraphModel, build_model
 from modules.repair_eval import (
     ConstraintRepairHeuristics,
@@ -600,6 +600,16 @@ def _run_and_save(
         metrics["global_metrics"] = postprocess_state["global_metrics"]
     if postprocess_state and "global_metrics_per_constraint_type" in postprocess_state:
         metrics["global_metrics_per_constraint_type"] = postprocess_state["global_metrics_per_constraint_type"]
+    if "global_metrics" in metrics and isinstance(metrics["global_metrics"], dict):
+        overall = metrics["global_metrics"].get("overall")
+        if isinstance(overall, dict):
+            metrics["overall_gfr"] = overall.get("gfr", 0.0)
+            metrics["overall_srr"] = overall.get("srr", 0.0)
+            metrics["overall_sir"] = overall.get("sir", 0.0)
+            disruption = overall.get("disruption", {}) if isinstance(overall.get("disruption"), dict) else {}
+            metrics["mean_disruption_add"] = disruption.get("added_triples_mean", 0.0)
+            metrics["mean_disruption_del"] = disruption.get("deleted_triples_mean", 0.0)
+            metrics["mean_disruption_total"] = disruption.get("total_ops_mean", 0.0)
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "model.json"
     with open(results_path, "w", encoding="utf-8") as f:
@@ -652,7 +662,9 @@ def _data_has_factor_fields(test_data: Sequence[Data]) -> bool:
     if not test_data:
         return False
     sample = test_data[0]
-    return hasattr(sample, "factor_satisfied_pre") or hasattr(sample, "factor_checkable_pre")
+    has_ids = hasattr(sample, "factor_constraint_ids")
+    has_labels = hasattr(sample, "factor_satisfied_pre") or hasattr(sample, "factor_checkable_pre")
+    return has_ids and has_labels
 
 
 def _summarize_repair_per_type(repair_metrics: dict[str, object] | None) -> dict[str, dict[str, float | int]]:
@@ -909,7 +921,12 @@ def parse_args():
     parser.add_argument(
         "--global-metrics",
         action="store_true",
-        help="Compute global constraint metrics when possible.",
+        help="Compute global constraint metrics when possible (deprecated; now auto-enabled when available).",
+    )
+    parser.add_argument(
+        "--no-global-metrics",
+        action="store_true",
+        help="Disable global metrics computation (GFR/SRR/SIR/disruption).",
     )
     parser.add_argument(
         "--per-constraint-csv",
@@ -996,7 +1013,9 @@ def main():
             postprocess_states.append(repair_state)
 
         global_support = None
-        global_metrics_enabled = args.global_metrics or _data_has_factor_fields(test_data)
+        global_metrics_enabled = (not args.no_global_metrics) and (
+            args.global_metrics or _data_has_factor_fields(test_data)
+        )
         if global_metrics_enabled:
             global_support = _maybe_prepare_global_support(
                 model_cfg.dataset_variant,
@@ -1063,7 +1082,7 @@ def main():
         )
 
         global_support = None
-        global_metrics_enabled = args.global_metrics
+        global_metrics_enabled = not args.no_global_metrics
         if global_metrics_enabled:
             global_support = _maybe_prepare_global_support(
                 args.dataset,
@@ -1110,6 +1129,23 @@ def main():
                 metrics["global_metrics"] = state["global_metrics"]
             if state and "global_metrics_per_constraint_type" in state:
                 metrics["global_metrics_per_constraint_type"] = state["global_metrics_per_constraint_type"]
+            if "global_metrics" in metrics and isinstance(metrics["global_metrics"], dict):
+                overall = metrics["global_metrics"].get("overall")
+                if isinstance(overall, dict):
+                    metrics["overall_gfr"] = overall.get("gfr", 0.0)
+                    metrics["overall_srr"] = overall.get("srr", 0.0)
+                    metrics["overall_sir"] = overall.get("sir", 0.0)
+                    disruption = overall.get("disruption", {}) if isinstance(overall.get("disruption"), dict) else {}
+                    metrics["mean_disruption_add"] = disruption.get("added_triples_mean", 0.0)
+                    metrics["mean_disruption_del"] = disruption.get("deleted_triples_mean", 0.0)
+                    metrics["mean_disruption_total"] = disruption.get("total_ops_mean", 0.0)
+            output_root = baseline_dir(args.dataset, "parquet", create=True)
+            output_root.mkdir(parents=True, exist_ok=True)
+            output_path = output_root / f"{name}.json"
+            with output_path.open("w", encoding="utf-8") as handle:
+                json.dump(metrics, handle, indent=4)
+            if args.per_constraint_csv or global_metrics_enabled:
+                _write_per_constraint_csv(metrics, output_root / name)
             return metrics
 
         evaluate_baselines(
