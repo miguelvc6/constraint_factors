@@ -179,6 +179,50 @@ class FixProbabilityLossConfig:
 
 
 @dataclass
+class FactorLossConfig:
+    enabled: bool = False
+    weight_pre: float = 0.1
+    pos_weight: float | None = None
+    only_checkable: bool = True
+    per_graph_reduction: str = "mean"
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "FactorLossConfig":
+        instance = cls()
+        return instance.updated(data or {})
+
+    def updated(self, data: Mapping[str, Any] | None = None, **overrides: Any) -> "FactorLossConfig":
+        payload = dict(data or {})
+        payload.update(overrides)
+        filtered = _filter_fields(type(self), payload)
+
+        if "weight_pre" in filtered and filtered["weight_pre"] is not None:
+            filtered["weight_pre"] = float(filtered["weight_pre"])
+        if "pos_weight" in filtered and filtered["pos_weight"] is not None:
+            filtered["pos_weight"] = float(filtered["pos_weight"])
+        if "only_checkable" in filtered and filtered["only_checkable"] is not None:
+            filtered["only_checkable"] = bool(filtered["only_checkable"])
+        if "per_graph_reduction" in filtered and filtered["per_graph_reduction"] is not None:
+            value = str(filtered["per_graph_reduction"]).lower()
+            if value not in {"mean", "sum"}:
+                raise ValueError("FactorLossConfig.per_graph_reduction must be 'mean' or 'sum'")
+            filtered["per_graph_reduction"] = value
+
+        current = {f.name: getattr(self, f.name) for f in fields(type(self))}
+        current.update(filtered)
+        return type(self)(**current)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "weight_pre": self.weight_pre,
+            "pos_weight": self.pos_weight,
+            "only_checkable": self.only_checkable,
+            "per_graph_reduction": self.per_graph_reduction,
+        }
+
+
+@dataclass
 class ModelConfig:
     dataset_variant: str = "full" 
     """Which intermediate dataset variant to consume."""
@@ -267,6 +311,7 @@ class TrainingConfig:
     validate_factor_labels: bool = False  # Enable strict factor label assertions per batch.
     constraint_loss: ConstraintLossConfig = field(default_factory=ConstraintLossConfig)
     fix_probability_loss: FixProbabilityLossConfig = field(default_factory=FixProbabilityLossConfig)
+    factor_loss: FactorLossConfig = field(default_factory=FactorLossConfig)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "TrainingConfig":
@@ -288,6 +333,7 @@ class TrainingConfig:
         current = {f.name: getattr(self, f.name) for f in fields(type(self))}
         constraint_update = filtered.pop("constraint_loss", None)
         fix_loss_update = filtered.pop("fix_probability_loss", None)
+        factor_loss_update = filtered.pop("factor_loss", None)
 
         if dynamic_fallback is not None:
             if constraint_update is None:
@@ -316,12 +362,19 @@ class TrainingConfig:
             else:
                 current["fix_probability_loss"] = self.fix_probability_loss.updated(fix_loss_update)
 
+        if factor_loss_update is not None:
+            if isinstance(factor_loss_update, FactorLossConfig):
+                current["factor_loss"] = factor_loss_update
+            else:
+                current["factor_loss"] = self.factor_loss.updated(factor_loss_update)
+
         return type(self)(**current)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["constraint_loss"] = self.constraint_loss.to_dict()
         payload["fix_probability_loss"] = self.fix_probability_loss.to_dict()
+        payload["factor_loss"] = self.factor_loss.to_dict()
         return payload
 
 
@@ -331,4 +384,5 @@ __all__ = [
     "ConstraintLossConfig",
     "DynamicReweightingConfig",
     "FixProbabilityLossConfig",
+    "FactorLossConfig",
 ]

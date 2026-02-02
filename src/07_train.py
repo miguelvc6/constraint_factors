@@ -239,6 +239,13 @@ def train(
         patience=train_cfg.scheduler_patience,
     )
     criterion = torch.nn.CrossEntropyLoss(reduction="none")
+    factor_cfg = train_cfg.factor_loss
+    factor_criterion: torch.nn.BCEWithLogitsLoss | None = None
+    if factor_cfg.enabled:
+        pos_weight_tensor = None
+        if factor_cfg.pos_weight is not None and factor_cfg.pos_weight > 0:
+            pos_weight_tensor = torch.tensor([float(factor_cfg.pos_weight)], device=device)
+        factor_criterion = torch.nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor)
 
     # Dynamic constraint reweighting / early stopping setup.
     dynamic_weighter = DynamicConstraintWeighter(train_cfg.constraint_loss.dynamic_reweighting)
@@ -281,6 +288,9 @@ def train(
         train_slot_loss_sums = [0.0] * NUM_SLOTS  # per-slot loss sums
         train_slot_counts = [0] * NUM_SLOTS  # per-slot sample counts
         train_slot_correct_slots = [0] * NUM_SLOTS  # per-slot correct predictions
+        train_factor_loss_sum = 0.0
+        train_factor_count = 0
+        train_factor_correct = 0
 
         train_constraint_metrics = ConstraintMetricsAccumulator()
         data_iter = progress_bar(train_loader, desc="Training Batches", leave=False)
@@ -344,6 +354,82 @@ def train(
                             fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
                             fix_penalty = 1.0 - fix_probs
                             graph_loss = graph_loss + fix_weight * fix_penalty
+
+            # Optional - Factor satisfaction loss (pre-state)
+            if factor_cfg.enabled:
+                assert factor_criterion is not None
+                factor_logits = outputs.get("factor_logits_pre")
+                factor_mask = outputs.get("factor_mask_pre")
+                factor_graph_index = outputs.get("factor_graph_index")
+                factor_targets = getattr(data, "factor_satisfied_pre", None)
+                assert factor_targets is not None, "Missing factor_satisfied_pre for factor loss."
+                factor_targets = torch.as_tensor(
+                    factor_targets, dtype=torch.float32, device=graph_loss.device
+                ).view(-1)
+                if factor_mask is None:
+                    factor_mask = torch.ones_like(factor_targets, dtype=torch.bool)
+                else:
+                    factor_mask = torch.as_tensor(
+                        factor_mask, dtype=torch.bool, device=graph_loss.device
+                    ).view(-1)
+                if factor_graph_index is None and hasattr(data, "to_data_list"):
+                    graphs = data.to_data_list()
+                    sizes: list[int] = []
+                    for graph in graphs:
+                        graph_mask = getattr(graph, "factor_checkable_pre", None)
+                        if graph_mask is None:
+                            graph_ids = getattr(graph, "factor_constraint_ids", None)
+                            sizes.append(int(torch.as_tensor(graph_ids).numel()) if graph_ids is not None else 0)
+                        else:
+                            sizes.append(int(torch.as_tensor(graph_mask).numel()))
+                    if sizes and sum(sizes) == int(factor_targets.numel()):
+                        index = torch.arange(len(sizes), device=graph_loss.device, dtype=torch.long)
+                        factor_graph_index = index.repeat_interleave(
+                            torch.tensor(sizes, device=graph_loss.device, dtype=torch.long)
+                        )
+                assert factor_logits is not None, "Model output missing factor_logits_pre."
+                factor_logits = torch.as_tensor(factor_logits, device=graph_loss.device).view(-1)
+                assert factor_logits.numel() == factor_targets.numel(), (
+                    "factor_logits_pre length must match factor_satisfied_pre length."
+                )
+                if factor_cfg.only_checkable:
+                    active_mask = factor_mask
+                else:
+                    active_mask = torch.ones_like(factor_mask, dtype=torch.bool)
+                if active_mask.numel() != factor_targets.numel():
+                    raise AssertionError("factor_mask_pre length must match factor_satisfied_pre length.")
+                active_float = active_mask.to(dtype=graph_loss.dtype)
+                per_factor_loss = factor_criterion(factor_logits, factor_targets)
+                per_factor_loss = per_factor_loss * active_float
+                active_count = int(active_mask.sum().item())
+
+                if factor_graph_index is None:
+                    if graph_loss.numel() == 1:
+                        factor_graph_index = torch.zeros(
+                            factor_targets.numel(), device=graph_loss.device, dtype=torch.long
+                        )
+                    else:
+                        raise AssertionError("factor_graph_index is required for batched factor loss.")
+
+                graph_loss_add = torch.zeros(
+                    graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                )
+                graph_loss_add.scatter_add_(0, factor_graph_index, per_factor_loss)
+                if factor_cfg.per_graph_reduction == "mean":
+                    per_graph_counts = torch.zeros(
+                        graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                    )
+                    per_graph_counts.scatter_add_(0, factor_graph_index, active_float)
+                    graph_loss_add = graph_loss_add / per_graph_counts.clamp(min=1.0)
+
+                graph_loss = graph_loss + factor_cfg.weight_pre * graph_loss_add
+
+                train_factor_loss_sum += per_factor_loss.sum().item()
+                train_factor_count += active_count
+                if active_count > 0:
+                    preds = (factor_logits > 0).to(dtype=torch.long)
+                    targets_long = factor_targets.to(dtype=torch.long)
+                    train_factor_correct += int((preds[active_mask] == targets_long[active_mask]).sum().item())
 
             # Optional - Rebalance weights based on constraint types
             constraint_types = extract_constraint_types(data, loss_matrix.size(0))
@@ -426,6 +512,9 @@ def train(
                     "loss": f"{weighted_loss.item():.4f}",
                     "all6_acc": f"{100 * train_correct / max(train_total, 1):.2f}%",
                     "slot_acc": f"{100 * train_slot_correct / max(train_slot_total, 1):.2f}%",
+                    "factor_loss": f"{train_factor_loss_sum / max(train_factor_count, 1):.4f}"
+                    if factor_cfg.enabled
+                    else "n/a",
                 }
             )
 
@@ -438,6 +527,8 @@ def train(
             100 * train_slot_correct_slots[idx] / max(train_slot_counts[idx], 1) for idx in range(NUM_SLOTS)
         ]
         train_per_constraint = train_constraint_metrics.as_epoch_metrics()
+        train_factor_loss = train_factor_loss_sum / max(train_factor_count, 1)
+        train_factor_acc = 100 * train_factor_correct / max(train_factor_count, 1)
 
         # ------- Validation -------
         model.eval()
@@ -452,6 +543,9 @@ def train(
         val_slot_loss_sums = [0.0] * NUM_SLOTS
         val_slot_counts = [0] * NUM_SLOTS
         val_slot_correct_slots = [0] * NUM_SLOTS
+        val_factor_loss_sum = 0.0
+        val_factor_count = 0
+        val_factor_correct = 0
 
         with torch.no_grad():
             for batch_idx, data in enumerate(
@@ -500,6 +594,82 @@ def train(
                             if fix_weight > 0.0:
                                 fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
                                 graph_loss = graph_loss + fix_weight * (1.0 - fix_probs)
+
+                # Optional - Factor satisfaction loss (pre-state)
+                if factor_cfg.enabled:
+                    assert factor_criterion is not None
+                    factor_logits = outputs.get("factor_logits_pre")
+                    factor_mask = outputs.get("factor_mask_pre")
+                    factor_graph_index = outputs.get("factor_graph_index")
+                    factor_targets = getattr(data, "factor_satisfied_pre", None)
+                    assert factor_targets is not None, "Missing factor_satisfied_pre for factor loss."
+                    factor_targets = torch.as_tensor(
+                        factor_targets, dtype=torch.float32, device=graph_loss.device
+                    ).view(-1)
+                    if factor_mask is None:
+                        factor_mask = torch.ones_like(factor_targets, dtype=torch.bool)
+                    else:
+                        factor_mask = torch.as_tensor(
+                            factor_mask, dtype=torch.bool, device=graph_loss.device
+                        ).view(-1)
+                    if factor_graph_index is None and hasattr(data, "to_data_list"):
+                        graphs = data.to_data_list()
+                        sizes: list[int] = []
+                        for graph in graphs:
+                            graph_mask = getattr(graph, "factor_checkable_pre", None)
+                            if graph_mask is None:
+                                graph_ids = getattr(graph, "factor_constraint_ids", None)
+                                sizes.append(int(torch.as_tensor(graph_ids).numel()) if graph_ids is not None else 0)
+                            else:
+                                sizes.append(int(torch.as_tensor(graph_mask).numel()))
+                        if sizes and sum(sizes) == int(factor_targets.numel()):
+                            index = torch.arange(len(sizes), device=graph_loss.device, dtype=torch.long)
+                            factor_graph_index = index.repeat_interleave(
+                                torch.tensor(sizes, device=graph_loss.device, dtype=torch.long)
+                            )
+                    assert factor_logits is not None, "Model output missing factor_logits_pre."
+                    factor_logits = torch.as_tensor(factor_logits, device=graph_loss.device).view(-1)
+                    assert factor_logits.numel() == factor_targets.numel(), (
+                        "factor_logits_pre length must match factor_satisfied_pre length."
+                    )
+                    if factor_cfg.only_checkable:
+                        active_mask = factor_mask
+                    else:
+                        active_mask = torch.ones_like(factor_mask, dtype=torch.bool)
+                    if active_mask.numel() != factor_targets.numel():
+                        raise AssertionError("factor_mask_pre length must match factor_satisfied_pre length.")
+                    active_float = active_mask.to(dtype=graph_loss.dtype)
+                    per_factor_loss = factor_criterion(factor_logits, factor_targets)
+                    per_factor_loss = per_factor_loss * active_float
+                    active_count = int(active_mask.sum().item())
+
+                    if factor_graph_index is None:
+                        if graph_loss.numel() == 1:
+                            factor_graph_index = torch.zeros(
+                                factor_targets.numel(), device=graph_loss.device, dtype=torch.long
+                            )
+                        else:
+                            raise AssertionError("factor_graph_index is required for batched factor loss.")
+
+                    graph_loss_add = torch.zeros(
+                        graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                    )
+                    graph_loss_add.scatter_add_(0, factor_graph_index, per_factor_loss)
+                    if factor_cfg.per_graph_reduction == "mean":
+                        per_graph_counts = torch.zeros(
+                            graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                        )
+                        per_graph_counts.scatter_add_(0, factor_graph_index, active_float)
+                        graph_loss_add = graph_loss_add / per_graph_counts.clamp(min=1.0)
+
+                    graph_loss = graph_loss + factor_cfg.weight_pre * graph_loss_add
+
+                    val_factor_loss_sum += per_factor_loss.sum().item()
+                    val_factor_count += active_count
+                    if active_count > 0:
+                        preds = (factor_logits > 0).to(dtype=torch.long)
+                        targets_long = factor_targets.to(dtype=torch.long)
+                        val_factor_correct += int((preds[active_mask] == targets_long[active_mask]).sum().item())
 
                 # Accumulate validation metrics
                 val_graph_loss_sum += graph_loss.sum().item()
@@ -562,6 +732,8 @@ def train(
             100 * val_slot_correct_slots[idx] / max(val_slot_counts[idx], 1) for idx in range(NUM_SLOTS)
         ]
         val_per_constraint = val_constraint_metrics.as_epoch_metrics()
+        val_factor_loss = val_factor_loss_sum / max(val_factor_count, 1)
+        val_factor_acc = 100 * val_factor_correct / max(val_factor_count, 1)
 
         logger.info(
             "Epoch %s samples | train=%s validation=%s",
@@ -666,6 +838,15 @@ def train(
             train_acc_slot,
             val_acc_slot,
         )
+        if factor_cfg.enabled:
+            logger.info(
+                "Epoch %s factor metrics | train_loss=%.4f val_loss=%.4f train_acc=%.2f%% val_acc=%.2f%%",
+                epoch + 1,
+                train_factor_loss,
+                val_factor_loss,
+                train_factor_acc,
+                val_factor_acc,
+            )
 
         if device.type == "cuda":
             log_cuda_memory(f"Epoch {epoch + 1} post-epoch", device)
