@@ -452,7 +452,18 @@ def train(
                     "factor_logits_pre length must match factor_satisfied_pre length."
                 )
                 if factor_cfg.only_checkable:
-                    active_mask = factor_mask
+                    checkable = getattr(data, "factor_checkable_pre", None)
+                    if checkable is None:
+                        active_mask = factor_mask
+                    else:
+                        checkable = torch.as_tensor(
+                            checkable, dtype=torch.bool, device=graph_loss.device
+                        ).view(-1)
+                        if checkable.numel() != factor_targets.numel():
+                            raise AssertionError(
+                                "factor_checkable_pre length must match factor_satisfied_pre length."
+                            )
+                        active_mask = factor_mask & checkable
                 else:
                     active_mask = torch.ones_like(factor_mask, dtype=torch.bool)
                 if active_mask.numel() != factor_targets.numel():
@@ -679,7 +690,18 @@ def train(
                         "factor_logits_pre length must match factor_satisfied_pre length."
                     )
                     if factor_cfg.only_checkable:
-                        active_mask = factor_mask
+                        checkable = getattr(data, "factor_checkable_pre", None)
+                        if checkable is None:
+                            active_mask = factor_mask
+                        else:
+                            checkable = torch.as_tensor(
+                                checkable, dtype=torch.bool, device=graph_loss.device
+                            ).view(-1)
+                            if checkable.numel() != factor_targets.numel():
+                                raise AssertionError(
+                                    "factor_checkable_pre length must match factor_satisfied_pre length."
+                                )
+                            active_mask = factor_mask & checkable
                     else:
                         active_mask = torch.ones_like(factor_mask, dtype=torch.bool)
                     if active_mask.numel() != factor_targets.numel():
