@@ -308,18 +308,18 @@ def main() -> None:
             )
         )
         proposal_exps.append(
-        ProposalExperiment(
-            name="a4_pressure_typed",
-            model_name="GIN_PRESSURE",
-            factor_loss_enabled=True,
-            pressure_enabled=True,
-            pressure_type_conditioning="concat",
-            fix_prob_enabled=False,
-            validate_factor_labels=True,
-            factor_weight_pre=0.1,
-            enable_policy_choice=False,
+            ProposalExperiment(
+                name="a4_pressure_typed",
+                model_name="GIN_PRESSURE",
+                factor_loss_enabled=True,
+                pressure_enabled=True,
+                pressure_type_conditioning="concat",
+                fix_prob_enabled=False,
+                validate_factor_labels=True,
+                factor_weight_pre=0.1,
+                enable_policy_choice=False,
+            )
         )
-    )
 
     reranker_exps: list[RerankerExperiment] = [
         # M1 reranker: Fix 1 (imitation + no-regression vs gold)
@@ -380,6 +380,7 @@ def main() -> None:
                     # optional: "factor_type_embedding_dim": 16,
                 },
                 "training_config": {
+                    "num_epochs": 2,
                     "validate_factor_labels": bool(exp.validate_factor_labels),
                     "fix_probability_loss": {
                         "enabled": bool(exp.fix_prob_enabled),
@@ -419,6 +420,7 @@ def main() -> None:
                     # rely on defaults in RerankerConfig unless you want to override
                 },
                 "training_config": {
+                    "num_epochs": 2,
                     "objective": exp.objective,  # "main" or "global_fix"
                     "constraint_scope": exp.constraint_scope,
                     # you can bump these later; start conservative
@@ -440,6 +442,7 @@ def main() -> None:
             created += 1
 
     print(f"[ok] wrote {created} configs under {args.models_root}")
+
 
 if __name__ == "__main__":
     main()
