@@ -18,12 +18,15 @@ from torch_geometric.loader import DataLoader
 from modules.config import ModelConfig
 from modules.data_encoders import (
     GlobalIntEncoder,
+    GraphStreamDataset,
+    base_dataset_name,
     dataset_variant_name,
     infer_node_feature_spec,
 )
 from modules.model_store import (
     config_copy_path,
     config_tag_from_path,
+    available_config_tags,
     ensure_run_dir,
     get_checkpoint_path,
     history_path,
@@ -196,12 +199,35 @@ def _resolve_proposal_checkpoint(
     if "config_tag" in proposal_cfg or "model" in proposal_cfg:
         model_name = proposal_cfg.get("model", model_cfg.model)
         config_tag = proposal_cfg.get("config_tag")
-        run_dir = resolve_run_dir(
-            model_cfg.dataset_variant,
-            model_cfg.encoding,
-            model_name,
-            config_tag,
-        )
+        try:
+            run_dir = resolve_run_dir(
+                model_cfg.dataset_variant,
+                model_cfg.encoding,
+                model_name,
+                config_tag,
+            )
+        except FileNotFoundError as exc:
+            if not config_tag:
+                raise
+            candidates = [
+                tag
+                for tag in available_config_tags(model_cfg.dataset_variant, model_cfg.encoding, model_name)
+                if tag == config_tag or tag.startswith(f"{config_tag}__")
+            ]
+            if len(candidates) == 1:
+                run_dir = resolve_run_dir(
+                    model_cfg.dataset_variant,
+                    model_cfg.encoding,
+                    model_name,
+                    candidates[0],
+                )
+            elif len(candidates) > 1:
+                joined = ", ".join(candidates)
+                raise FileNotFoundError(
+                    f"Multiple proposal runs match config_tag {config_tag}: {joined}"
+                ) from exc
+            else:
+                raise
         return run_dir / "checkpoint.pth"
     raise ValueError("proposal_config requires checkpoint_path, run_dir, or model/config_tag.")
 
@@ -615,6 +641,12 @@ def main() -> None:
 
     train_data = load_graph_dataset(train_path)
     val_data = load_graph_dataset(val_path)
+    if isinstance(train_data, GraphStreamDataset):
+        logger.info("Materializing training stream dataset into memory for reranker training.")
+        train_data = list(train_data)
+    if isinstance(val_data, GraphStreamDataset):
+        logger.info("Materializing validation stream dataset into memory for reranker training.")
+        val_data = list(val_data)
     if not isinstance(train_data, list) or not isinstance(val_data, list):
         raise RuntimeError("Reranker training requires in-memory datasets (list[Data]).")
 
@@ -643,7 +675,15 @@ def main() -> None:
 
     registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
     if not registry_path.exists():
-        raise FileNotFoundError(f"Constraint registry not found at {registry_path}")
+        fallback_name = base_dataset_name(model_cfg.dataset_variant)
+        fallback_path = Path("data") / "interim" / f"constraint_registry_{fallback_name}.parquet"
+        if fallback_path.exists():
+            logger.info("Using constraint registry %s for dataset variant %s", fallback_path, model_cfg.dataset_variant)
+            registry_path = fallback_path
+        else:
+            raise FileNotFoundError(
+                f"Constraint registry not found at {registry_path} or {fallback_path}"
+            )
 
     use_encoded_ids = True
     try:
@@ -661,7 +701,7 @@ def main() -> None:
         use_encoded_ids=use_encoded_ids,
     )
 
-    infer_node_feature_spec(train_data)
+    use_node_embeddings, feature_dim, _, role_spec = infer_node_feature_spec(train_data)
 
     vocab_from_filtered = len(encoder._global_id_to_unfiltered_global_id)
     if vocab_from_filtered > 0:
@@ -677,9 +717,27 @@ def main() -> None:
         fallback_model_cfg=model_cfg,
     )
 
+    if str(model_cfg.encoding).lower() != "node_id" and training_cfg.batch_size > 8:
+        logger.info(
+            "Reducing reranker batch size from %s to 8 for encoding=%s to avoid OOM.",
+            training_cfg.batch_size,
+            model_cfg.encoding,
+        )
+        training_cfg.batch_size = 8
+
+    graph_model_cfg = model_cfg
+    if str(model_cfg.model).upper() == "RERANKER":
+        model_payload = model_cfg.to_dict()
+        model_payload["model"] = proposal_cfg.get("model", "GIN")
+        model_payload["use_node_embeddings"] = bool(use_node_embeddings)
+        if not use_node_embeddings:
+            model_payload["num_embedding_size"] = int(feature_dim)
+        model_payload["use_role_embeddings"] = bool(role_spec.enabled)
+        model_payload["num_role_types"] = int(role_spec.num_types)
+        graph_model_cfg = ModelConfig.from_mapping(model_payload)
     model = build_reranker(
         num_input_graph_nodes=num_input_graph_nodes,
-        model_cfg=model_cfg,
+        model_cfg=graph_model_cfg,
         reranker_cfg=reranker_cfg,
     )
     model.to(device)
@@ -780,9 +838,9 @@ def main() -> None:
                 model_path,
             )
 
-    if epoch - best_epoch >= training_cfg.early_stopping_rounds:
-        logger.info("Early stopping at epoch %s", epoch + 1)
-        break
+        if epoch - best_epoch >= training_cfg.early_stopping_rounds:
+            logger.info("Early stopping at epoch %s", epoch + 1)
+            break
 
     config_destination = config_copy_path(run_dir)
     if config_destination.resolve(strict=False) != args.experiment_config.resolve(strict=False):
