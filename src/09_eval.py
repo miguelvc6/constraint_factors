@@ -34,7 +34,7 @@ from tqdm.autonotebook import tqdm
 from modules.baselines import evaluate_baselines
 from modules.candidates import CandidateConfig, build_candidates
 from modules.config import ModelConfig, TrainingConfig
-from modules.data_encoders import GlobalIntEncoder
+from modules.data_encoders import GlobalIntEncoder, base_dataset_name, dataset_variant_name
 from modules.model_store import baseline_dir, config_copy_path, evaluations_dir, get_checkpoint_path
 from modules.models import BaseGraphModel, build_model
 from modules.repair_eval import (
@@ -342,6 +342,11 @@ def _maybe_prepare_global_support(
     interim_base = Path("data/interim") / variant_dir
     encoder_path = interim_base / "globalintencoder.txt"
     registry_path = Path("data/interim") / f"constraint_registry_{dataset_variant}.parquet"
+    if not registry_path.exists():
+        fallback_name = base_dataset_name(dataset_variant)
+        fallback_path = Path("data/interim") / f"constraint_registry_{fallback_name}.parquet"
+        if fallback_path.exists():
+            registry_path = fallback_path
 
     if not registry_path.exists():
         message = f"Constraint registry not found at {registry_path}."
@@ -1179,7 +1184,8 @@ def main():
             model_cfg.model,
         )
 
-        base_path = Path("data/processed") / f"{model_cfg.dataset_variant}_minocc{model_cfg.min_occurrence}"
+        variant = dataset_variant_name(model_cfg.dataset_variant, model_cfg.min_occurrence)
+        base_path = Path("data/processed") / variant
         test_data = load_split(base_path, model_cfg.encoding, "test")
 
         postprocess_fns: list[Callable[[torch.Tensor, torch.Tensor, list[str]], None]] = []
@@ -1201,7 +1207,9 @@ def main():
         if args.use_chooser:
             if not training_cfg.chooser.enabled:
                 raise RuntimeError("Chooser evaluation requested but chooser is disabled in training config.")
-            interim_base = Path("data/interim") / f"{model_cfg.dataset_variant}_minocc{model_cfg.min_occurrence}"
+            interim_base = Path("data/interim") / dataset_variant_name(
+                model_cfg.dataset_variant, model_cfg.min_occurrence
+            )
             encoder_path = interim_base / "globalintencoder.txt"
             if not encoder_path.exists():
                 raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
@@ -1233,7 +1241,9 @@ def main():
         if args.use_policy_choice:
             if not model_cfg.enable_policy_choice:
                 raise RuntimeError("Policy choice evaluation requested but policy choice is disabled in model config.")
-            interim_base = Path("data/interim") / f"{model_cfg.dataset_variant}_minocc{model_cfg.min_occurrence}"
+            interim_base = Path("data/interim") / dataset_variant_name(
+                model_cfg.dataset_variant, model_cfg.min_occurrence
+            )
             encoder_path = interim_base / "globalintencoder.txt"
             if not encoder_path.exists():
                 raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
@@ -1330,7 +1340,8 @@ def main():
             args.dataset,
             args.min_occurrence,
         )
-        base_path = Path("data/interim") / f"{args.dataset}_minocc{args.min_occurrence}"
+        variant = dataset_variant_name(args.dataset, args.min_occurrence)
+        base_path = Path("data/interim") / variant
 
         train_data, train_max = load_baseline_split_from_parquet(base_path, "train")
         test_data, test_max = load_baseline_split_from_parquet(base_path, "test")
