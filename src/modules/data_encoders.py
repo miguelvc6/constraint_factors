@@ -156,9 +156,21 @@ class GlobalIntEncoder:
 
 def dataset_variant_name(dataset: str, min_occurrence: int) -> str:
     """Return the dataset name variant for the given *min_occurrence*."""
+    if "_minocc" in dataset:
+        return dataset
     if min_occurrence <= 1:
         return dataset
     return f"{dataset}_minocc{min_occurrence}"
+
+
+def base_dataset_name(dataset: str) -> str:
+    """Strip any *_minocc<digits> suffix from dataset."""
+    if "_minocc" not in dataset:
+        return dataset
+    prefix, suffix = dataset.rsplit("_minocc", 1)
+    if suffix.isdigit():
+        return prefix
+    return dataset
 
 
 def discover_min_occurrence(dataset: str) -> int:

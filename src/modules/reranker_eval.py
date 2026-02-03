@@ -5,6 +5,7 @@ import json
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 
 import pandas as pd
+import numpy as np
 
 from modules.constraint_checkers import ConstraintInstance, EvidenceState, evaluate_constraint, normalize_property_id, normalize_token
 from modules.data_encoders import GlobalIntEncoder
@@ -142,15 +143,28 @@ def _lookup_registry_entry(
 
 
 def _coerce_sequence(value: Any, *, cast_int: bool = True) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        seq = list(value)
-    else:
-        seq = [value]
+    def _flatten(item: Any) -> List[Any]:
+        if item is None:
+            return []
+        if isinstance(item, np.ndarray):
+            return _flatten(item.tolist())
+        if isinstance(item, (list, tuple)):
+            flattened: List[Any] = []
+            for sub in item:
+                flattened.extend(_flatten(sub))
+            return flattened
+        return [item]
+
+    seq = _flatten(value)
     if not cast_int:
         return seq
-    return [int(v) for v in seq]
+    coerced: List[Any] = []
+    for v in seq:
+        try:
+            coerced.append(int(v))
+        except (TypeError, ValueError):
+            coerced.append(0)
+    return coerced
 
 
 def _coerce_value(value: Any, *, cast_int: bool = True) -> Any:

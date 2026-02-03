@@ -710,6 +710,10 @@ class RepairGINFactorPressure(BaseGraphModel):
         predicate_features = self.predicate_branch(shared)
         predicate_features = F.dropout(predicate_features, p=self._dropout, training=self.training)
 
+        policy_logits = None
+        if self._policy_enabled and self.policy_head is not None:
+            policy_logits = self.policy_head(shared)
+
         y_add_s = self._expand_entity_logits(self.subject_add_head(subject_features))
         y_del_s = self._expand_entity_logits(self.subject_del_head(subject_features))
 

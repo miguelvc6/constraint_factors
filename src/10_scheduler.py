@@ -228,6 +228,19 @@ def main() -> int:
     logger = logging.getLogger("scheduler")
 
     model_dirs = discover_model_directories(MODELS_ROOT)
+    def _order_key(model_dir: Path) -> tuple[int, str]:
+        config_path = model_dir / CONFIG_FILENAME
+        if not config_path.exists():
+            return (2, model_dir.name)
+        try:
+            cfg = load_config(config_path)
+        except Exception:
+            return (2, model_dir.name)
+        kind = _infer_experiment_kind(cfg)
+        priority = 1 if kind == "reranker" else 0
+        return (priority, model_dir.name)
+
+    model_dirs = sorted(model_dirs, key=_order_key)
     logger.info("Discovered %s model directories", len(model_dirs))
     planned: list[str] = []
     for model_dir in model_dirs:

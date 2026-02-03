@@ -132,11 +132,12 @@ def resolve_run_dir(
 
 def available_config_tags(dataset_variant: str, encoding: str, model_name: str) -> list[str]:
     """Return the discovered config tags for the given model runs."""
+    prefix = run_slug(dataset_variant, encoding, model_name, config_tag="placeholder")
+    prefix = prefix.rsplit("_", 1)[0] + "_"
     tags: list[str] = []
     for directory in list_run_dirs(dataset_variant, encoding, model_name):
-        parts = directory.name.split("_")
-        if len(parts) >= 3:
-            tags.append(parts[-1])
+        if directory.name.startswith(prefix):
+            tags.append(directory.name[len(prefix) :])
     return tags
 
 
