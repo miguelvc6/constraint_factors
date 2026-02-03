@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -18,6 +19,7 @@ from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import (
     GlobalIntEncoder,
     GraphStreamDataset,
+    base_dataset_name,
     dataset_variant_name,
     infer_node_feature_spec,
 )
@@ -1493,6 +1495,12 @@ def main():
     chooser_state: dict[str, object] | None = None
     chooser_cfg = training_cfg.chooser
     if chooser_cfg.enabled:
+        if isinstance(train_data, GraphStreamDataset):
+            logger.info("Materializing training stream dataset into memory for chooser training.")
+            train_data = list(train_data)
+        if isinstance(val_data, GraphStreamDataset):
+            logger.info("Materializing validation stream dataset into memory for chooser training.")
+            val_data = list(val_data)
         if not isinstance(train_data, list) or not isinstance(val_data, list):
             raise RuntimeError("Chooser training requires in-memory datasets (list[Data]).")
         placeholder_ids = placeholder_ids_from_encoder(encoder)
@@ -1515,7 +1523,19 @@ def main():
             raise RuntimeError("Mismatch between parquet rows and graph dataset size for chooser.")
         registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
         if not registry_path.exists():
-            raise FileNotFoundError(f"Constraint registry not found at {registry_path}")
+            fallback_name = base_dataset_name(model_cfg.dataset_variant)
+            fallback_path = Path("data") / "interim" / f"constraint_registry_{fallback_name}.parquet"
+            if fallback_path.exists():
+                logger.info(
+                    "Using constraint registry %s for dataset variant %s",
+                    fallback_path,
+                    model_cfg.dataset_variant,
+                )
+                registry_path = fallback_path
+            else:
+                raise FileNotFoundError(
+                    f"Constraint registry not found at {registry_path} or {fallback_path}"
+                )
         evaluator = CandidateConstraintEvaluator(
             str(registry_path),
             encoder=encoder,
@@ -1546,6 +1566,12 @@ def main():
 
     policy_state: dict[str, object] | None = None
     if model_cfg.enable_policy_choice:
+        if isinstance(train_data, GraphStreamDataset):
+            logger.info("Materializing training stream dataset into memory for policy choice.")
+            train_data = list(train_data)
+        if isinstance(val_data, GraphStreamDataset):
+            logger.info("Materializing validation stream dataset into memory for policy choice.")
+            val_data = list(val_data)
         if not isinstance(train_data, list) or not isinstance(val_data, list):
             raise RuntimeError("Policy choice training requires in-memory datasets (list[Data]).")
         train_contexts = load_violation_contexts(interim_path, "train", none_class=NONE_CLASS_INDEX)
