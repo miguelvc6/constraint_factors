@@ -173,6 +173,34 @@ def run_evaluation(
     }
 
 
+def ensure_reranker_predictions(
+    prepared_config: Path,
+    resolved_run_dir: Path,
+    run_name: str,
+    logger: logging.Logger,
+) -> bool:
+    pred_path = resolved_run_dir / "reranker_predictions.json"
+    if pred_path.exists():
+        return True
+    predict_log_path = RAW_LOG_DIR / f"{run_name}_predict.log"
+    command = [
+        sys.executable,
+        "src/08_train_reranker.py",
+        "--experiment-config",
+        str(prepared_config),
+        "--predict-only",
+    ]
+    logger.info("Generating reranker predictions: %s", " ".join(command))
+    return_code = run_command(command, predict_log_path)
+    if return_code != 0:
+        logger.error("Reranker prediction generation failed with return code %s", return_code)
+        return False
+    if not pred_path.exists():
+        logger.error("Reranker prediction generation finished but %s is missing", pred_path)
+        return False
+    return True
+
+
 def _infer_experiment_kind(config: dict[str, Any]) -> str:
     model_name = str(config.get("model_config", {}).get("model", "")).upper()
     if "reranker_config" in config or "proposal_config" in config or model_name == "RERANKER":
@@ -269,15 +297,60 @@ def main() -> int:
 
         if checkpoint_path.exists():
             logger.info("Checkpoint already exists at %s; skipping", checkpoint_path)
-            write_history(
-                {
-                    "model_dir": str(model_dir),
-                    "config": str(config_path),
-                    "status": "skipped",
-                    "reason": "checkpoint_exists",
-                    "timestamp": datetime.now(UTC).isoformat() + "Z",
-                }
-            )
+            record = {
+                "model_dir": str(model_dir),
+                "config": str(config_path),
+                "status": "skipped",
+                "reason": "checkpoint_exists",
+                "timestamp": datetime.now(UTC).isoformat() + "Z",
+            }
+            if config_path.exists():
+                try:
+                    cfg = load_config(config_path)
+                except Exception as exc:
+                    logger.error("Skipping eval for %s: %s", model_dir, exc)
+                    write_history(record)
+                    continue
+                kind = _infer_experiment_kind(cfg)
+                if kind == "reranker":
+                    try:
+                        dataset_variant = infer_model_field(cfg, "dataset_variant")
+                        encoding = infer_model_field(cfg, "encoding")
+                    except Exception as exc:
+                        logger.error("Skipping eval for %s: %s", model_dir, exc)
+                        write_history(record)
+                        continue
+                    prepared_config = prepare_config_copy(model_dir, config_path)
+                    config_tag = config_tag_from_path(prepared_config)
+                    resolved_run_dir = ensure_run_dir(dataset_variant, encoding, "RERANKER", config_tag)
+                    run_name = sanitize_run_name(model_dir)
+                    run_prefix = f"{sanitize_fragment(dataset_variant)}-{sanitize_fragment(encoding)}_RERANKER"
+                    if model_dir.name.startswith(run_prefix):
+                        write_history(record)
+                        continue
+                    eval_flags: list[str] = []
+                    if args.eval_global_metrics:
+                        eval_flags.append("--global-metrics")
+                    if args.eval_per_constraint_csv or "--per-constraint-csv" not in eval_flags:
+                        eval_flags.append("--per-constraint-csv")
+                    if args.paper_suite and "--strict-global-metrics" not in eval_flags:
+                        eval_flags.append("--strict-global-metrics")
+                    if ensure_reranker_predictions(prepared_config, resolved_run_dir, run_name, logger):
+                        reranker_predictions = resolved_run_dir / "reranker_predictions.json"
+                        evaluation = run_evaluation(
+                            resolved_run_dir,
+                            run_name,
+                            logger,
+                            extra_flags=eval_flags + ["--reranker-predictions", str(reranker_predictions)],
+                        )
+                        record["evaluation"] = evaluation
+                        if evaluation.get("return_code") not in (0, None) and not args.keep_going:
+                            write_history(record)
+                            logger.error(
+                                "Stopping scheduler after eval failure (use --keep-going to continue)."
+                            )
+                            return 1
+            write_history(record)
             continue
 
         try:
@@ -418,8 +491,8 @@ def main() -> int:
                     logger.error("Stopping scheduler after eval failure (use --keep-going to continue).")
                     return 1
             else:
-                reranker_predictions = resolved_run_dir / "reranker_predictions.json"
-                if reranker_predictions.exists():
+                if ensure_reranker_predictions(prepared_config, resolved_run_dir, run_name, logger):
+                    reranker_predictions = resolved_run_dir / "reranker_predictions.json"
                     eval_command = [
                         sys.executable,
                         "src/09_eval.py",
@@ -429,7 +502,12 @@ def main() -> int:
                         str(reranker_predictions),
                     ] + eval_flags
                     logger.info("Eval command: %s", " ".join(eval_command))
-                    evaluation = run_evaluation(resolved_run_dir, run_name, logger, extra_flags=eval_flags + ["--reranker-predictions", str(reranker_predictions)])
+                    evaluation = run_evaluation(
+                        resolved_run_dir,
+                        run_name,
+                        logger,
+                        extra_flags=eval_flags + ["--reranker-predictions", str(reranker_predictions)],
+                    )
                     record["evaluation"] = evaluation
                     if evaluation.get("return_code") not in (0, None) and not args.keep_going:
                         write_history(record)

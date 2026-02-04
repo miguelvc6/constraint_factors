@@ -1163,7 +1163,11 @@ def main():
             experiment_config = json.load(f)
 
         model_cfg = ModelConfig.from_mapping(experiment_config["model_config"])
-        training_cfg = TrainingConfig.from_mapping(experiment_config.get("training_config", {}))
+        training_payload = experiment_config.get("training_config", {})
+        if "reranker_config" in experiment_config or str(model_cfg.model).upper() == "RERANKER":
+            allowed = set(TrainingConfig.__dataclass_fields__.keys())
+            training_payload = {k: v for k, v in dict(training_payload).items() if k in allowed}
+        training_cfg = TrainingConfig.from_mapping(training_payload)
         config_tag = _infer_config_tag_from_run_dir(run_directory)
         strict_global = bool(args.strict_global_metrics or (config_tag in PAPER_SUITE_TAGS))
         if strict_global and args.no_global_metrics:

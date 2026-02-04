@@ -44,6 +44,32 @@ from modules.training_utils import (
     set_seed,
 )
 
+
+def _derive_graph_model_cfg_from_state_dict(
+    state_dict: dict,
+    *,
+    model_cfg: ModelConfig,
+    proposal_cfg: dict,
+) -> ModelConfig:
+    payload = model_cfg.to_dict()
+    payload["model"] = proposal_cfg.get("model", "GIN")
+    payload["use_node_embeddings"] = "graph_encoder.node_embeddings.weight" in state_dict
+    payload["use_role_embeddings"] = "graph_encoder.role_embeddings.weight" in state_dict
+    if payload["use_role_embeddings"]:
+        role_weight = state_dict["graph_encoder.role_embeddings.weight"]
+        payload["role_embedding_dim"] = int(role_weight.shape[1])
+        payload["num_role_types"] = int(role_weight.shape[0])
+    if payload["use_node_embeddings"]:
+        emb_weight = state_dict["graph_encoder.node_embeddings.weight"]
+        payload["num_embedding_size"] = int(emb_weight.shape[1])
+    else:
+        init_weight = state_dict.get("graph_encoder.initialization.0.weight")
+        if init_weight is not None:
+            input_channels = int(init_weight.shape[1])
+            role_dim = int(payload.get("role_embedding_dim", 0)) if payload["use_role_embeddings"] else 0
+            payload["num_embedding_size"] = max(input_channels - role_dim, 1)
+    return ModelConfig.from_mapping(payload)
+
 NUM_SLOTS = 6
 NONE_CLASS_INDEX = 0
 
@@ -625,6 +651,11 @@ def main() -> None:
         default=42,
         help="Random seed.",
     )
+    parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="Skip training and only generate reranker_predictions.json from the latest checkpoint.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -769,6 +800,10 @@ def main() -> None:
     run_dir = ensure_run_dir(
         model_cfg.dataset_variant, model_cfg.encoding, "RERANKER", config_tag_from_path(args.experiment_config)
     )
+    if args.predict_only:
+        checkpoint_path = get_checkpoint_path(run_dir)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path} for --predict-only.")
 
     best_val = float("inf")
     best_epoch = -1
@@ -779,68 +814,69 @@ def main() -> None:
         "val_metrics": [],
     }
 
-    for epoch in range(training_cfg.num_epochs):
-        train_loss, train_metrics = _run_epoch(
-            model=model,
-            proposal_model=proposal_model,
-            loader=train_loader,
-            contexts=train_contexts,
-            rows=train_rows,
-            heuristics=heuristics,
-            evaluator=evaluator,
-            device=device,
-            cfg=training_cfg,
-            optimizer=optimizer,
-        )
-        val_loss, val_metrics = _run_epoch(
-            model=model,
-            proposal_model=proposal_model,
-            loader=val_loader,
-            contexts=val_contexts,
-            rows=val_rows,
-            heuristics=heuristics,
-            evaluator=evaluator,
-            device=device,
-            cfg=training_cfg,
-        )
-
-        scheduler.step(val_loss)
-
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_metrics"].append(train_metrics)
-        history["val_metrics"].append(val_metrics)
-
-        logger.info(
-            "Epoch %s | train_loss=%.4f val_loss=%.4f primary=%.3f/%.3f global=%.3f/%.3f",
-            epoch + 1,
-            train_loss,
-            val_loss,
-            train_metrics.get("primary_chosen", 0.0),
-            train_metrics.get("primary_oracle", 0.0),
-            val_metrics.get("global_chosen", 0.0),
-            val_metrics.get("global_oracle", 0.0),
-        )
-
-        if val_loss < best_val:
-            best_val = val_loss
-            best_epoch = epoch
-            model_path = get_checkpoint_path(run_dir)
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "num_graph_nodes": num_input_graph_nodes,
-                    "model_name": "RERANKER",
-                    "model_cfg": model_cfg.to_dict(),
-                    "training_cfg": training_cfg.to_dict(),
-                    "reranker_cfg": reranker_cfg.to_dict(),
-                },
-                model_path,
+    if not args.predict_only:
+        for epoch in range(training_cfg.num_epochs):
+            train_loss, train_metrics = _run_epoch(
+                model=model,
+                proposal_model=proposal_model,
+                loader=train_loader,
+                contexts=train_contexts,
+                rows=train_rows,
+                heuristics=heuristics,
+                evaluator=evaluator,
+                device=device,
+                cfg=training_cfg,
+                optimizer=optimizer,
+            )
+            val_loss, val_metrics = _run_epoch(
+                model=model,
+                proposal_model=proposal_model,
+                loader=val_loader,
+                contexts=val_contexts,
+                rows=val_rows,
+                heuristics=heuristics,
+                evaluator=evaluator,
+                device=device,
+                cfg=training_cfg,
             )
 
-        if epoch - best_epoch >= training_cfg.early_stopping_rounds:
-            logger.info("Early stopping at epoch %s", epoch + 1)
-            break
+            scheduler.step(val_loss)
+
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["train_metrics"].append(train_metrics)
+            history["val_metrics"].append(val_metrics)
+
+            logger.info(
+                "Epoch %s | train_loss=%.4f val_loss=%.4f primary=%.3f/%.3f global=%.3f/%.3f",
+                epoch + 1,
+                train_loss,
+                val_loss,
+                train_metrics.get("primary_chosen", 0.0),
+                train_metrics.get("primary_oracle", 0.0),
+                val_metrics.get("global_chosen", 0.0),
+                val_metrics.get("global_oracle", 0.0),
+            )
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_epoch = epoch
+                model_path = get_checkpoint_path(run_dir)
+                torch.save(
+                    {
+                        "model_state": model.state_dict(),
+                        "num_graph_nodes": num_input_graph_nodes,
+                        "model_name": "RERANKER",
+                        "model_cfg": model_cfg.to_dict(),
+                        "training_cfg": training_cfg.to_dict(),
+                        "reranker_cfg": reranker_cfg.to_dict(),
+                    },
+                    model_path,
+                )
+
+            if epoch - best_epoch >= training_cfg.early_stopping_rounds:
+                logger.info("Early stopping at epoch %s", epoch + 1)
+                break
 
     config_destination = config_copy_path(run_dir)
     if config_destination.resolve(strict=False) != args.experiment_config.resolve(strict=False):
@@ -854,6 +890,9 @@ def main() -> None:
     test_path = processed_root / f"test_graph-{model_cfg.encoding}.pkl"
     if test_path.exists():
         test_data = load_graph_dataset(test_path)
+        if isinstance(test_data, GraphStreamDataset):
+            logger.info("Materializing test stream dataset into memory for reranker predictions.")
+            test_data = list(test_data)
         if isinstance(test_data, list):
             test_contexts = load_violation_contexts(interim_path, "test", none_class=NONE_CLASS_INDEX)
             if len(test_contexts) == len(test_data):
@@ -864,7 +903,23 @@ def main() -> None:
                     checkpoint = torch.load(get_checkpoint_path(run_dir), map_location=device)
                     state_dict = checkpoint.get("model_state")
                     if state_dict is not None:
-                        model.load_state_dict(state_dict)
+                        try:
+                            model.load_state_dict(state_dict)
+                        except RuntimeError as exc:
+                            if args.predict_only:
+                                graph_model_cfg = _derive_graph_model_cfg_from_state_dict(
+                                    state_dict,
+                                    model_cfg=model_cfg,
+                                    proposal_cfg=proposal_cfg,
+                                )
+                                model = build_reranker(
+                                    num_input_graph_nodes=num_input_graph_nodes,
+                                    model_cfg=graph_model_cfg,
+                                    reranker_cfg=reranker_cfg,
+                                )
+                                model.load_state_dict(state_dict, strict=False)
+                            else:
+                                raise
                         model.to(device)
                     predictions = _predict_reranker_edits(
                         model=model,
@@ -885,8 +940,6 @@ def main() -> None:
                     logger.warning("Skipping reranker predictions: test rows mismatch.")
             else:
                 logger.warning("Skipping reranker predictions: test contexts mismatch.")
-        else:
-            logger.warning("Skipping reranker predictions: test dataset is streamed.")
     else:
         logger.warning("Skipping reranker predictions: test split not found at %s", test_path)
 
