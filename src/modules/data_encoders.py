@@ -1,5 +1,6 @@
 import logging
 import pickle
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable, Iterator, NamedTuple
 
@@ -30,6 +31,17 @@ class RoleFeatureSpec(NamedTuple):
     enabled: bool
     num_types: int
     dtype: torch.dtype
+
+
+class ArtifactWriteResult(NamedTuple):
+    path: Path
+    bytes_written: int
+    checksum: str
+
+
+class GraphArtifactInfo(NamedTuple):
+    path: Path
+    format: str
 
 
 SCALAR_FEATURES: tuple[str, ...] = (
@@ -412,21 +424,23 @@ def dump_in_shards(
     base_path: Path,
     shard_size: int,
     use_torch_save: bool,
-) -> tuple[int, int]:
+    atomic_write: bool = True,
+) -> tuple[int, int, list[ArtifactWriteResult]]:
     base_path = Path(base_path)
     base_path.parent.mkdir(parents=True, exist_ok=True)
     buf: list[Data] = []
     shard = 0
     total = 0
+    artifacts: list[ArtifactWriteResult] = []
     for obj in objs:
         buf.append(obj)
         if len(buf) == shard_size:
-            _write_shard(buf, base_path, shard, use_torch_save)
+            artifacts.append(_write_shard(buf, base_path, shard, use_torch_save, atomic_write=atomic_write))
             total += len(buf)
             buf.clear()
             shard += 1
     if buf:
-        _write_shard(buf, base_path, shard, use_torch_save)
+        artifacts.append(_write_shard(buf, base_path, shard, use_torch_save, atomic_write=atomic_write))
         total += len(buf)
         buf.clear()
         shard += 1
@@ -436,36 +450,72 @@ def dump_in_shards(
         shard,
         base_path,
     )
-    return total, shard
+    return total, shard, artifacts
 
 
-def _write_shard(buf: list[Data], base_path: Path, shard: int, use_torch: bool) -> None:
+def _write_shard(
+    buf: list[Data],
+    base_path: Path,
+    shard: int,
+    use_torch: bool,
+    atomic_write: bool = True,
+) -> ArtifactWriteResult:
     shard_path = base_path.with_name(
         f"{base_path.stem}-shard{shard:03d}{base_path.suffix if not use_torch else '.pt'}"
     )
-    tmp = shard_path.with_suffix(shard_path.suffix + ".tmp")
+    destination = shard_path.with_suffix(shard_path.suffix + ".tmp") if atomic_write else shard_path
     if use_torch:
-        torch.save(buf, tmp)
+        torch.save(buf, destination)
     else:
-        with open(tmp, "wb") as f:
+        with open(destination, "wb") as f:
             pickle.dump(buf, f, protocol=5)
-    tmp.replace(shard_path)
+    if atomic_write:
+        destination.replace(shard_path)
+    digest = _compute_prefix_sha256(shard_path)
+    size_bytes = shard_path.stat().st_size
     logging.debug("Wrote shard %s", shard_path)
+    return ArtifactWriteResult(path=shard_path, bytes_written=size_bytes, checksum=digest)
 
 
-def dump_stream(objs: Iterable[Data], path: str | Path, protocol: int = 5) -> int:
+def dump_stream(
+    objs: Iterable[Data],
+    path: str | Path,
+    protocol: int = 5,
+    atomic_write: bool = True,
+) -> tuple[int, ArtifactWriteResult]:
     """Stream ``objs`` to ``path`` using pickle one object at a time."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    destination = path.with_suffix(path.suffix + ".tmp") if atomic_write else path
     count = 0
-    with open(tmp, "wb") as f:
+    with open(destination, "wb") as f:
         for obj in objs:
             pickle.dump(obj, f, protocol=protocol)
             count += 1
-    tmp.replace(path)
+    if atomic_write:
+        destination.replace(path)
+    digest = _compute_prefix_sha256(path)
+    size_bytes = path.stat().st_size
     logging.info("Wrote %s graph objects to %s", count, path)
-    return count
+    return count, ArtifactWriteResult(path=path, bytes_written=size_bytes, checksum=digest)
+
+
+def _compute_prefix_sha256(
+    path: Path,
+    chunk_size: int = 8 * 1024 * 1024,
+    max_bytes: int = 16 * 1024 * 1024,
+) -> str:
+    hasher = sha256()
+    consumed = 0
+    with path.open("rb") as handle:
+        while consumed < max_bytes:
+            remaining = max_bytes - consumed
+            block = handle.read(min(chunk_size, remaining))
+            if not block:
+                break
+            hasher.update(block)
+            consumed += len(block)
+    return hasher.hexdigest()
 
 
 class GraphStreamDataset(IterableDataset):
@@ -498,6 +548,65 @@ class GraphStreamDataset(IterableDataset):
 
     def __len__(self):
         raise TypeError("GraphStreamDataset does not support len()")
+
+
+class ShardedGraphStreamDataset(GraphStreamDataset):
+    """Lazily iterate graphs stored as a sequence of shard files."""
+
+    def __init__(self, shard_paths: Iterable[Path]):
+        shard_list = [Path(p) for p in shard_paths]
+        if not shard_list:
+            raise ValueError("ShardedGraphStreamDataset requires at least one shard path.")
+        super().__init__(shard_list[0])
+        self.shard_paths = shard_list
+
+    def _iterate_stream(self, worker_id: int, num_workers: int):
+        index = 0
+        for shard_path in self.shard_paths:
+            if shard_path.suffix == ".pt":
+                shard_objects = torch.load(shard_path, map_location="cpu")
+            else:
+                with shard_path.open("rb") as f:
+                    shard_objects = pickle.load(f)
+            if not isinstance(shard_objects, list):
+                raise TypeError(f"Expected list payload in shard {shard_path}, got {type(shard_objects)!r}")
+            for obj in shard_objects:
+                if index % num_workers == worker_id:
+                    yield obj
+                index += 1
+            del shard_objects
+
+
+def discover_graph_artifacts(path: Path) -> list[GraphArtifactInfo]:
+    """
+    Discover graph artifacts for ``path``.
+
+    Returns a list with one entry for a monolithic ``.pkl`` file, or multiple
+    entries for sharded ``-shardNNN.(pkl|pt)`` files.
+    """
+    path = Path(path)
+    artifacts: list[GraphArtifactInfo] = []
+    if path.exists():
+        artifacts.append(GraphArtifactInfo(path=path, format="stream"))
+        return artifacts
+
+    shard_candidates: list[Path] = []
+    shard_candidates.extend(sorted(path.parent.glob(f"{path.stem}-shard*.pkl")))
+    shard_candidates.extend(sorted(path.parent.glob(f"{path.stem}-shard*.pt")))
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in shard_candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(candidate)
+
+    for shard_path in sorted(deduped):
+        fmt = "shard_torch" if shard_path.suffix == ".pt" else "shard_pickle"
+        artifacts.append(GraphArtifactInfo(path=shard_path, format=fmt))
+    return artifacts
 
 
 def _peek_first_graph(dataset: list[Data] | GraphStreamDataset) -> Data | None:

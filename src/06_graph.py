@@ -20,7 +20,8 @@ Encoding Options
 Usage
 -----
 python src/06_graph.py --dataset {sample,full} --encoding {node_id,text_embedding} \
-    [--min-occurrence N] [--shard-size N] [--use-torch-save] [--embedding-dtype {float32,float16}]
+    [--min-occurrence N] [--shard-size N] [--use-torch-save] \
+    [--persistence-profile {research_safe,full}] [--overwrite {atomic,unsafe,skip}]
 """
 
 import os
@@ -35,6 +36,7 @@ import itertools
 import json
 import logging
 import pickle
+from datetime import datetime, timezone
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
@@ -51,6 +53,7 @@ from torch_geometric.loader import DataLoader
 from tqdm.auto import tqdm
 
 from modules.data_encoders import (
+    ArtifactWriteResult,
     ROLE_NONE,
     ROLE_OBJECT,
     ROLE_PREDICATE,
@@ -59,6 +62,7 @@ from modules.data_encoders import (
     GlobalToLocalNodeMap,
     PrecomputedWikidataCache,
     dataset_variant_name,
+    discover_graph_artifacts,
     dump_in_shards,
     dump_stream,
     iter_stream,
@@ -66,6 +70,13 @@ from modules.data_encoders import (
 
 
 LITERAL_ID = 0
+PERSISTENCE_PROFILE_FULL = "full"
+PERSISTENCE_PROFILE_RESEARCH_SAFE = "research_safe"
+PERSISTENCE_PROFILE_CHOICES = (PERSISTENCE_PROFILE_FULL, PERSISTENCE_PROFILE_RESEARCH_SAFE)
+OVERWRITE_MODE_ATOMIC = "atomic"
+OVERWRITE_MODE_UNSAFE = "unsafe"
+OVERWRITE_MODE_SKIP = "skip"
+OVERWRITE_MODE_CHOICES = (OVERWRITE_MODE_ATOMIC, OVERWRITE_MODE_UNSAFE, OVERWRITE_MODE_SKIP)
 
 
 def _normalize_target_id(value: Any, encoder: GlobalIntEncoder, unknown_id: int) -> int:
@@ -116,6 +127,7 @@ def create_graph(
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
     constraint_scope: Literal["local", "focus"] = "local",
     store_node_names: bool = False,
+    include_debug_fields: bool = True,
     embedding_dtype: np.dtype | None = None,
     debug_factor_wiring: bool = False,
 ) -> Data:
@@ -841,9 +853,10 @@ def create_graph(
             ],
             dtype=torch.long,
         ),
-        x_names=global_to_local_id_encoder.local_names,
         role_flags=role_flags,
     )
+    if include_debug_fields:
+        data_graph.x_names = global_to_local_id_encoder.local_names
 
     # Baseline metadata
     # Violating triple in global ID space
@@ -854,14 +867,15 @@ def create_graph(
     data_graph.factor_constraint_ids = torch.tensor(factor_constraint_ids, dtype=torch.long)
     data_graph.factor_node_index = torch.tensor(factor_local_ids, dtype=torch.long)
     data_graph.primary_factor_index = int(primary_factor_index)
-    data_graph.factor_constraint_types = factor_constraint_types
+    if include_debug_fields:
+        data_graph.factor_constraint_types = factor_constraint_types
     if factor_checkable_pre_tensor is not None:
         data_graph.factor_checkable_pre = factor_checkable_pre_tensor
         data_graph.factor_satisfied_pre = factor_satisfied_pre_tensor
         data_graph.factor_checkable_post_gold = factor_checkable_post_gold_tensor
         data_graph.factor_satisfied_post_gold = factor_satisfied_post_gold_tensor
         data_graph.factor_types = factor_types_tensor
-    if debug_factor_wiring:
+    if include_debug_fields and debug_factor_wiring:
         data_graph.factor_wiring_debug = {
             "constraint_id": int(graph["constraint_id"]),
             "primary_constraint_id": int(graph["constraint_id"]),
@@ -935,6 +949,7 @@ def compute_torch_geometric_objects(
     encoding: Literal["node_id", "text_embedding"],
     constraint_scope: Literal["local", "focus"] = "local",
     store_node_names: bool = False,
+    include_debug_fields: bool = True,
     embedding_dtype: np.dtype | None = None,
     on_sample: Optional[Callable[[Data], None]] = None,
     debug_state: dict[str, Any] | None = None,
@@ -958,12 +973,13 @@ def compute_torch_geometric_objects(
             encoding=encoding,
             constraint_scope=constraint_scope,
             store_node_names=store_node_names,
+            include_debug_fields=include_debug_fields,
             embedding_dtype=embedding_dtype,
             debug_factor_wiring=bool(debug_state and debug_state.get("enabled")),
         )
         if on_sample is not None:
             on_sample(graph)
-        if debug_state and debug_state.get("enabled") and not debug_state.get("written"):
+        if include_debug_fields and debug_state and debug_state.get("enabled") and not debug_state.get("written"):
             debug_payload = getattr(graph, "factor_wiring_debug", None)
             if debug_payload and debug_payload.get("local_constraint_count", 0) > 1:
                 debug_payload = dict(debug_payload)
@@ -1039,15 +1055,131 @@ def collect_sample_for_check(
     return sample
 
 
+def _profile_debug_fields_enabled(persistence_profile: str) -> bool:
+    return persistence_profile == PERSISTENCE_PROFILE_FULL
+
+
+def _profile_kept_fields(persistence_profile: str) -> list[str]:
+    core_fields = [
+        "x",
+        "edge_index",
+        "edge_type",
+        "edge_index_non_flattened",
+        "edge_attr_non_flattened",
+        "y",
+        "role_flags",
+        "focus_triple",
+        "shape_id",
+        "constraint_type",
+        "factor_constraint_ids",
+        "factor_node_index",
+        "primary_factor_index",
+        "factor_checkable_pre",
+        "factor_satisfied_pre",
+        "factor_checkable_post_gold",
+        "factor_satisfied_post_gold",
+        "factor_types",
+        "is_factor_node",
+    ]
+    if _profile_debug_fields_enabled(persistence_profile):
+        core_fields.extend(["x_names", "factor_constraint_types", "factor_wiring_debug"])
+    return core_fields
+
+
+def _profile_dropped_fields(persistence_profile: str) -> list[str]:
+    if _profile_debug_fields_enabled(persistence_profile):
+        return []
+    return ["x_names", "factor_constraint_types", "factor_wiring_debug"]
+
+
+def _manifest_path_for_split(output_path: Path) -> Path:
+    return output_path.with_suffix(output_path.suffix + ".manifest.json")
+
+
+def _load_existing_vocab_targets(vocab_path: Path, split: str) -> dict[str, list[int]] | None:
+    if not vocab_path.exists():
+        return None
+    try:
+        with vocab_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        per_split = payload.get("per_split") if isinstance(payload, dict) else None
+        split_payload = per_split.get(split) if isinstance(per_split, dict) else None
+        if not isinstance(split_payload, dict):
+            return None
+        entity_ids = split_payload.get("entity_class_ids")
+        predicate_ids = split_payload.get("predicate_class_ids")
+        if not isinstance(entity_ids, list) or not isinstance(predicate_ids, list):
+            return None
+        return {"entity_class_ids": entity_ids, "predicate_class_ids": predicate_ids}
+    except Exception:
+        logging.exception("Failed to load existing target vocab payload from %s", vocab_path)
+        return None
+
+
+def _clear_existing_shards(output_path: Path) -> None:
+    for shard_path in sorted(output_path.parent.glob(f"{output_path.stem}-shard*.pkl")):
+        shard_path.unlink(missing_ok=True)
+    for shard_path in sorted(output_path.parent.glob(f"{output_path.stem}-shard*.pt")):
+        shard_path.unlink(missing_ok=True)
+
+
+def _write_split_manifest(
+    split: str,
+    output_path: Path,
+    artifact_writes: list[ArtifactWriteResult],
+    graph_count: int,
+    shard_count: int,
+    shard_size: int,
+    use_torch_save: bool,
+    persistence_profile: str,
+    overwrite_mode: str,
+    encoding: str,
+    dataset_variant: str,
+    constraint_scope: str,
+) -> None:
+    manifest = {
+        "split": split,
+        "dataset_variant": dataset_variant,
+        "encoding": encoding,
+        "constraint_scope": constraint_scope,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "graph_count": int(graph_count),
+        "shard_count": int(shard_count),
+        "shard_size": int(shard_size),
+        "sharded": bool(shard_size > 0),
+        "use_torch_save": bool(use_torch_save),
+        "persistence_profile": persistence_profile,
+        "overwrite_mode": overwrite_mode,
+        "kept_fields": _profile_kept_fields(persistence_profile),
+        "dropped_fields": _profile_dropped_fields(persistence_profile),
+        "artifacts": [
+            {
+                "path": str(artifact.path),
+                "bytes": int(artifact.bytes_written),
+                "checksum": artifact.checksum,
+                "checksum_mode": "sha256_prefix_16mb",
+            }
+            for artifact in artifact_writes
+        ],
+    }
+    manifest_path = _manifest_path_for_split(output_path)
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+    logging.info("Wrote split manifest to %s", manifest_path)
+
+
 def main(
     wikidata_cache: PrecomputedWikidataCache | None,
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
+    dataset_variant: str,
     constraint_scope: Literal["local", "focus"] = "local",
     store_node_names: bool = False,
+    persistence_profile: str = PERSISTENCE_PROFILE_RESEARCH_SAFE,
     shard_size: int = 0,
     use_torch_save: bool = False,
+    overwrite_mode: str = OVERWRITE_MODE_ATOMIC,
     embedding_dtype: np.dtype | None = None,
     check_sample_size: int = 32,
     max_instances: int = 0,
@@ -1070,10 +1202,12 @@ def main(
     split_targets: dict[str, dict[str, list[int]]] = {}
 
     debug_state = {
-        "enabled": debug_factor_wiring,
+        "enabled": debug_factor_wiring and _profile_debug_fields_enabled(persistence_profile),
         "written": False,
         "path": PROCESSED_DATA_PATH / "factor_wiring_debug.json",
     }
+    include_debug_fields = _profile_debug_fields_enabled(persistence_profile)
+    vocab_path = PROCESSED_DATA_PATH / "target_vocabs.json"
 
     for split, parquet_name in split_to_parquet.items():
         logging.info("Processing %s split", split)
@@ -1106,6 +1240,32 @@ def main(
                 split_predicate_targets.add(idx)
                 total_predicate_targets.add(idx)
 
+        output_path = PROCESSED_DATA_PATH / f"{split}_graph-{encoding}.pkl"
+        existing_artifacts = discover_graph_artifacts(output_path)
+        if overwrite_mode == OVERWRITE_MODE_SKIP and existing_artifacts:
+            logging.info(
+                "Skipping %s split because artifacts already exist and overwrite mode is 'skip'.",
+                split,
+            )
+            existing_targets = _load_existing_vocab_targets(vocab_path, split)
+            if existing_targets:
+                split_entity_targets.update(existing_targets["entity_class_ids"])
+                split_predicate_targets.update(existing_targets["predicate_class_ids"])
+                total_entity_targets.update(existing_targets["entity_class_ids"])
+                total_predicate_targets.update(existing_targets["predicate_class_ids"])
+            else:
+                logging.warning(
+                    "No reusable target vocab entries found for skipped split %s; "
+                    "vocab output may be incomplete until regenerated.",
+                    split,
+                )
+            outputs[split] = output_path
+            split_targets[split] = {
+                "entity_class_ids": sorted(split_entity_targets),
+                "predicate_class_ids": sorted(split_predicate_targets),
+            }
+            continue
+
         # Build graphs (the heavy lifting happens here)
         row_iter = iter_parquet_rows(
             parquet_path,
@@ -1119,25 +1279,38 @@ def main(
             encoding=encoding,
             constraint_scope=constraint_scope,
             store_node_names=store_node_names,
+            include_debug_fields=include_debug_fields,
             embedding_dtype=embedding_dtype,
             on_sample=collect_targets,
             debug_state=debug_state,
             total_rows=split_total_rows,
         )
-        output_path = PROCESSED_DATA_PATH / f"{split}_graph-{encoding}.pkl"
+        if shard_size > 0:
+            output_path.unlink(missing_ok=True)
+            _clear_existing_shards(output_path)
+        else:
+            _clear_existing_shards(output_path)
 
         # Persist graphs
         total_objects = 0
         shard_count = 0
+        artifact_writes: list[ArtifactWriteResult] = []
+        atomic_write = overwrite_mode == OVERWRITE_MODE_ATOMIC
         if shard_size > 0:
-            total_objects, shard_count = dump_in_shards(
+            total_objects, shard_count, artifact_writes = dump_in_shards(
                 generator,
                 output_path,
                 shard_size=shard_size,
                 use_torch_save=use_torch_save,
+                atomic_write=atomic_write,
             )
         else:
-            total_objects = dump_stream(generator, output_path)
+            total_objects, stream_artifact = dump_stream(
+                generator,
+                output_path,
+                atomic_write=atomic_write,
+            )
+            artifact_writes = [stream_artifact]
             shard_count = 1 if total_objects else 0
 
         logging.info(
@@ -1146,6 +1319,20 @@ def main(
             total_objects,
             shard_count,
             "s" if shard_count != 1 else "",
+        )
+        _write_split_manifest(
+            split=split,
+            output_path=output_path,
+            artifact_writes=artifact_writes,
+            graph_count=total_objects,
+            shard_count=shard_count,
+            shard_size=shard_size,
+            use_torch_save=use_torch_save,
+            persistence_profile=persistence_profile,
+            overwrite_mode=overwrite_mode,
+            encoding=encoding,
+            dataset_variant=dataset_variant,
+            constraint_scope=constraint_scope,
         )
 
         del generator
@@ -1172,7 +1359,6 @@ def main(
             "predicate_class_ids": sorted(split_predicate_targets),
         }
 
-    vocab_path = PROCESSED_DATA_PATH / "target_vocabs.json"
     vocab_payload = {
         "entity_class_ids": sorted(total_entity_targets),
         "predicate_class_ids": sorted(total_predicate_targets),
@@ -1220,13 +1406,13 @@ def display_graph(encoder: GlobalIntEncoder) -> None:
         print("Graph to show:")
         print(graph_to_show)
 
+        x_names = getattr(graph_to_show, "x_names", None)
+        node_attrs = ["x_names"] if x_names is not None else []
         g = utils.to_networkx(
             graph_to_show,
             to_undirected=False,
-            # node_attrs=graph_to_show.x_names)
-            node_attrs=["x_names"],
+            node_attrs=node_attrs,
         )
-        x_names = getattr(graph_to_show, "x_names", None)
         labels = dict(enumerate(x_names)) if x_names is not None else None
         nx.draw(
             g,
@@ -1247,7 +1433,7 @@ def display_graph(encoder: GlobalIntEncoder) -> None:
         g = utils.to_networkx(
             graph_to_show,
             to_undirected=False,
-            node_attrs=["x_names"],
+            node_attrs=node_attrs,
             edge_attrs=["edge_attr_non_flattened"],
         )
         pos = nx.spring_layout(g, k=7 / g.order() ** (1 / 2))
@@ -1349,6 +1535,24 @@ def parse_args():
         action="store_true",
         help="Force using data/interim/<variant> even if a labeled interim dataset exists.",
     )
+    parser.add_argument(
+        "--persistence-profile",
+        choices=PERSISTENCE_PROFILE_CHOICES,
+        default=PERSISTENCE_PROFILE_RESEARCH_SAFE,
+        help=(
+            "Field persistence profile. 'research_safe' drops debug-only fields "
+            "(x_names, factor_constraint_types, factor_wiring_debug) to reduce disk usage."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        choices=OVERWRITE_MODE_CHOICES,
+        default=OVERWRITE_MODE_ATOMIC,
+        help=(
+            "Write mode: 'atomic' writes to *.tmp then renames (crash-safe), "
+            "'unsafe' writes directly to final paths, 'skip' reuses existing split artifacts."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1356,6 +1560,8 @@ def parse_args():
         parser.error("--shard-size must be non-negative")
     if args.max_instances < 0:
         parser.error("--max-instances must be non-negative")
+    if args.debug_factor_wiring and args.persistence_profile != PERSISTENCE_PROFILE_FULL:
+        parser.error("--debug-factor-wiring requires --persistence-profile full")
 
     return args
 
@@ -1399,6 +1605,10 @@ if __name__ == "__main__":
         dataset_variant,
         MIN_OCCURRENCE,
     )
+    if args.overwrite == OVERWRITE_MODE_UNSAFE:
+        logging.warning(
+            "Unsafe overwrite mode enabled: writes go directly to destination files and may leave partial outputs on interruption."
+        )
 
     # Load and freeze int encoder
     encoder = GlobalIntEncoder()
@@ -1432,9 +1642,12 @@ if __name__ == "__main__":
         global_int_encoder=encoder,
         constraint_registry=constraint_registry,
         encoding=args.encoding,
+        dataset_variant=dataset_variant,
         constraint_scope=args.constraint_scope,
+        persistence_profile=args.persistence_profile,
         shard_size=args.shard_size,
         use_torch_save=args.use_torch_save,
+        overwrite_mode=args.overwrite,
         embedding_dtype=text_embedding_dtype,
         max_instances=args.max_instances,
         debug_factor_wiring=args.debug_factor_wiring,

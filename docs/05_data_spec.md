@@ -97,6 +97,7 @@ re-run.
 **Files**
 - `{split}_graph-<encoding>.pkl` (pickle stream of `torch_geometric.data.Data`)
 - Sharded variants: `{split}_graph-<encoding>-shardNNN.pt` or `.pkl`
+- Per-split manifest: `{split}_graph-<encoding>.pkl.manifest.json`
 - `target_vocabs.json` (class-id vocabularies for labels)
 - Optional visuals: `graph_visualization.png`, `graph_visualization-non_flattened.png`
 
@@ -116,6 +117,10 @@ re-run.
 - `factor_constraint_types`: list of constraint family labels (debug)
 - `factor_wiring_debug` (optional): wiring diagnostics when `--debug-factor-wiring` is enabled
 - `context_index` (optional): integer index into violation contexts, attached at training time when fix-probability loss is enabled
+
+**Persistence profiles**
+- `research_safe` (default): drops debug-only fields `x_names`, `factor_constraint_types`, `factor_wiring_debug`.
+- `full`: retains all fields including debug-only attributes.
 
 `target_vocabs.json` contains:
 - `entity_class_ids`

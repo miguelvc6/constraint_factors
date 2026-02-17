@@ -18,7 +18,12 @@ import torch
 from torch_geometric.data import Data
 from tqdm.autonotebook import tqdm
 
-from modules.data_encoders import GlobalIntEncoder, GraphStreamDataset
+from modules.data_encoders import (
+    GlobalIntEncoder,
+    GraphStreamDataset,
+    ShardedGraphStreamDataset,
+    discover_graph_artifacts,
+)
 from modules.repair_eval import ConstraintRepairHeuristics, TriplePattern, ViolationContext
 
 if TYPE_CHECKING:
@@ -64,13 +69,50 @@ def set_seed(seed: int = 42):
 
 def load_graph_dataset(path: Path) -> list[Data] | GraphStreamDataset:
     """Return either an in-memory list or a lazy stream of graphs."""
+    _log_manifest_info(path)
+    artifacts = discover_graph_artifacts(path)
+    if not artifacts:
+        raise FileNotFoundError(
+            f"Could not locate graph dataset at {path} or matching shard files ({path.stem}-shard*)."
+        )
+    if len(artifacts) == 1 and artifacts[0].format == "stream":
+        return _load_single_graph_file(artifacts[0].path)
+
+    shard_paths = [entry.path for entry in artifacts]
+    logger.info("Detected %s shards for dataset %s", len(shard_paths), path)
+    return ShardedGraphStreamDataset(shard_paths)
+
+
+def _log_manifest_info(path: Path) -> None:
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    if not manifest_path.exists():
+        return
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        logger.exception("Failed to read graph manifest %s", manifest_path)
+        return
+    graph_count = payload.get("graph_count")
+    profile = payload.get("persistence_profile")
+    sharded = payload.get("sharded")
+    logger.info(
+        "Graph manifest detected at %s | graph_count=%s profile=%s sharded=%s",
+        manifest_path,
+        graph_count,
+        profile,
+        sharded,
+    )
+
+
+def _load_single_graph_file(path: Path) -> list[Data] | GraphStreamDataset:
     with path.open("rb") as f:
         first_object = pickle.load(f)
 
-    logger.debug(f"First object type in dataset: {type(first_object)!r}")
+    logger.debug("First object type in dataset %s: %r", path, type(first_object))
 
     if isinstance(first_object, list):
-        logger.info(f"Loaded dataset into memory with {len(first_object)} graphs")
+        logger.info("Loaded dataset into memory with %s graphs", len(first_object))
         return first_object
     if isinstance(first_object, Data):
         logger.info("Streaming dataset detected; graphs will be lazily loaded from disk")

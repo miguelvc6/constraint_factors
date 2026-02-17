@@ -34,7 +34,12 @@ from tqdm.autonotebook import tqdm
 from modules.baselines import evaluate_baselines
 from modules.candidates import CandidateConfig, build_candidates
 from modules.config import ModelConfig, TrainingConfig
-from modules.data_encoders import GlobalIntEncoder, base_dataset_name, dataset_variant_name
+from modules.data_encoders import (
+    GlobalIntEncoder,
+    base_dataset_name,
+    dataset_variant_name,
+    discover_graph_artifacts,
+)
 from modules.model_store import baseline_dir, config_copy_path, evaluations_dir, get_checkpoint_path
 from modules.models import BaseGraphModel, build_model
 from modules.repair_eval import (
@@ -786,8 +791,28 @@ def get_device() -> torch.device:
 
 
 def load_split(base_path: Path, encoding: str, split: str) -> list[Data]:
-    """Load a dataset split saved as either a list or a pickled stream of ``Data`` objects."""
+    """Load a dataset split saved as a monolithic file or shard collection."""
     path = base_path / f"{split}_graph-{encoding}.pkl"
+    artifacts = discover_graph_artifacts(path)
+    if not artifacts:
+        raise FileNotFoundError(
+            f"Missing dataset split at {path} and no matching shards ({path.stem}-shard*)."
+        )
+
+    if len(artifacts) > 1 or artifacts[0].format != "stream":
+        graphs: list[Data] = []
+        for artifact in artifacts:
+            if artifact.path.suffix == ".pt":
+                shard_objects = torch.load(artifact.path, map_location="cpu")
+            else:
+                with artifact.path.open("rb") as f:
+                    shard_objects = pickle.load(f)
+            if not isinstance(shard_objects, list):
+                raise TypeError(
+                    f"Unsupported shard payload type {type(shard_objects)!r} in {artifact.path}; expected list[Data]."
+                )
+            graphs.extend(shard_objects)
+        return graphs
 
     with path.open("rb") as f:
         first_object = pickle.load(f)
