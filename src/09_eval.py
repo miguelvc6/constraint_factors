@@ -725,6 +725,8 @@ def _run_and_save(
     write_per_constraint_csv: bool = False,
     chooser_support: ChooserSupport | None = None,
     policy_support: PolicySupport | None = None,
+    selection_weights: dict[str, float] | None = None,
+    selection_disruption_field: str = "mean_disruption_total",
 ) -> dict[str, object]:
     normalized_predictions = None
     if precomputed_predictions is not None:
@@ -760,7 +762,17 @@ def _run_and_save(
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "model.json"
     with open(results_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=4)
+        weights = selection_weights or {}
+        selection_block = compute_model_selection_block(
+            metrics,
+            weights=weights,
+            disruption_field=selection_disruption_field,
+        )
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Model selection block: %s", selection_block)
+        payload = {"model_selection": selection_block}
+        payload.update(metrics)
+        json.dump(payload, f, indent=4)
     if write_per_constraint_csv:
         _write_per_constraint_csv(metrics, output_dir)
     return metrics
@@ -847,6 +859,107 @@ def _summarize_repair_per_type(repair_metrics: dict[str, object] | None) -> dict
             "alternative_rate": float(alternative) / total if total else 0.0,
         }
     return summary
+
+
+def _compute_primary_fix_rate(repair_metrics: dict[str, object] | None) -> float | None:
+    if not repair_metrics:
+        return None
+    per_type = _summarize_repair_per_type(repair_metrics)
+    total = 0
+    exact = 0
+    alternative = 0
+    for metrics in per_type.values():
+        total += int(metrics.get("total", 0))
+        exact += int(metrics.get("exact", 0))
+        alternative += int(metrics.get("alternative", 0))
+    if total == 0:
+        return 0.0
+    return float(exact + alternative) / total
+
+
+def compute_model_selection_block(
+    metrics: dict[str, object],
+    weights: dict[str, float],
+    disruption_field: str,
+) -> dict[str, object]:
+    missing_fields: list[str] = []
+
+    primary_fix_rate = _compute_primary_fix_rate(metrics.get("repair_metrics"))
+    if primary_fix_rate is None:
+        missing_fields.append("primary_fix_rate")
+
+    fidelity_micro_f1 = float(metrics.get("micro_f1", 0.0))
+    if "micro_f1" not in metrics:
+        missing_fields.append("fidelity_micro_f1")
+
+    srr_value = metrics.get("overall_srr")
+    secondary_regression_rate_srr = float(srr_value) if srr_value is not None else None
+    if secondary_regression_rate_srr is None:
+        missing_fields.append("secondary_regression_rate_srr")
+
+    disruption_total_ops_mean = metrics.get("mean_disruption_total")
+    disruption_changed_triples_mean = metrics.get("disruption_changed_triples_mean")
+    overall = metrics.get("global_metrics")
+    if isinstance(overall, dict):
+        overall = overall.get("overall")
+    if isinstance(overall, dict):
+        disruption = overall.get("disruption", {})
+        if isinstance(disruption, dict):
+            if disruption_total_ops_mean is None:
+                disruption_total_ops_mean = disruption.get("total_ops_mean")
+            if disruption_changed_triples_mean is None:
+                disruption_changed_triples_mean = disruption.get("changed_triples_mean")
+
+    disruption_value = None
+    if disruption_field == "mean_disruption_total":
+        disruption_value = disruption_total_ops_mean
+    elif disruption_field == "disruption_changed_triples_mean":
+        disruption_value = disruption_changed_triples_mean
+    if disruption_value is None:
+        missing_fields.append(disruption_field)
+    else:
+        disruption_value = float(disruption_value)
+
+    score_raw = 0.0
+    score_log = 0.0
+    w_primary = float(weights.get("primary", 0.0))
+    w_srr = float(weights.get("srr", 0.0))
+    w_fidelity = float(weights.get("fidelity", 0.0))
+    w_disrupt = float(weights.get("disrupt", 0.0))
+
+    if primary_fix_rate is not None:
+        score_raw += w_primary * primary_fix_rate
+        score_log += w_primary * primary_fix_rate
+    if secondary_regression_rate_srr is not None:
+        score_raw += w_srr * (1.0 - secondary_regression_rate_srr)
+        score_log += w_srr * (1.0 - secondary_regression_rate_srr)
+    score_raw += w_fidelity * fidelity_micro_f1
+    score_log += w_fidelity * fidelity_micro_f1
+    if disruption_value is not None:
+        score_raw -= w_disrupt * disruption_value
+        score_log -= w_disrupt * math.log1p(disruption_value)
+
+    selection_block = {
+        "primary_fix_rate": primary_fix_rate,
+        "secondary_regression_rate_srr": secondary_regression_rate_srr,
+        "fidelity_micro_f1": fidelity_micro_f1,
+        "disruption_total_ops_mean": float(disruption_total_ops_mean) if disruption_total_ops_mean is not None else None,
+        "disruption_changed_triples_mean": float(disruption_changed_triples_mean)
+        if disruption_changed_triples_mean is not None
+        else None,
+        "score_weighted_sum": score_raw,
+        "score_weighted_sum_log_disruption": score_log,
+        "weights": {
+            "primary": w_primary,
+            "srr": w_srr,
+            "fidelity": w_fidelity,
+            "disrupt": w_disrupt,
+            "disruption_field": disruption_field,
+        },
+        "missing_fields": sorted(set(missing_fields)),
+        "notes": "score = w_primary*primary_fix_rate + w_srr*(1 - srr) + w_fidelity*fidelity_micro_f1 - w_disrupt*disruption",
+    }
+    return selection_block
 
 
 def _write_per_constraint_csv(metrics: dict[str, object], output_dir: Path) -> None:
@@ -1048,6 +1161,8 @@ def evaluate_trained_model(
         write_per_constraint_csv=write_per_constraint_csv,
         chooser_support=chooser_support,
         policy_support=policy_support,
+        selection_weights=selection_weights,
+        selection_disruption_field=args.score_disruption_field,
     )
 
 
@@ -1115,6 +1230,36 @@ def parse_args():
         action="store_true",
         help="Use policy choice head to filter candidates before selection.",
     )
+    parser.add_argument(
+        "--score-w-primary",
+        type=float,
+        default=1.0,
+        help="Weight for primary fix rate in model selection score.",
+    )
+    parser.add_argument(
+        "--score-w-srr",
+        type=float,
+        default=1.0,
+        help="Weight for secondary regression rate term (applied to 1 - srr).",
+    )
+    parser.add_argument(
+        "--score-w-fidelity",
+        type=float,
+        default=0.5,
+        help="Weight for fidelity micro F1 in model selection score.",
+    )
+    parser.add_argument(
+        "--score-w-disrupt",
+        type=float,
+        default=0.2,
+        help="Weight for disruption penalty in model selection score.",
+    )
+    parser.add_argument(
+        "--score-disruption-field",
+        choices=["mean_disruption_total", "disruption_changed_triples_mean"],
+        default="mean_disruption_total",
+        help="Disruption field used in model selection score.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1152,6 +1297,12 @@ def parse_args():
 def main():
     args = parse_args()
     device = get_device()
+    selection_weights = {
+        "primary": args.score_w_primary,
+        "srr": args.score_w_srr,
+        "fidelity": args.score_w_fidelity,
+        "disrupt": args.score_w_disrupt,
+    }
 
     if not args.run_baselines:
         run_directory = args.run_directory
@@ -1434,7 +1585,16 @@ def main():
             output_root.mkdir(parents=True, exist_ok=True)
             output_path = output_root / f"{name}.json"
             with output_path.open("w", encoding="utf-8") as handle:
-                json.dump(metrics, handle, indent=4)
+                selection_block = compute_model_selection_block(
+                    metrics,
+                    weights=selection_weights,
+                    disruption_field=args.score_disruption_field,
+                )
+                if logging.getLogger().isEnabledFor(logging.DEBUG):
+                    logging.debug("Model selection block: %s", selection_block)
+                payload = {"model_selection": selection_block}
+                payload.update(metrics)
+                json.dump(payload, handle, indent=4)
             if strict_global or args.per_constraint_csv or global_metrics_enabled:
                 _write_per_constraint_csv(metrics, output_root / name)
             return metrics

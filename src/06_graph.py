@@ -39,11 +39,11 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
 
-import datasets
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch_geometric import utils
 from torch_geometric.data import Data
@@ -881,12 +881,24 @@ def create_graph(
     return data_graph
 
 
-def pandas_to_dataset(dataframe: pd.DataFrame) -> datasets.Dataset:
+def _parquet_num_rows(path: Path) -> int:
+    """Return the total number of rows in a parquet file."""
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def iter_parquet_rows(path: Path, batch_size: int = 4096, max_rows: int = 0) -> Iterator[dict[str, Any]]:
     """
-    Convert a Pandas DataFrame with BASS columns into a *datasets* Dataset.
+    Stream parquet rows as Python dictionaries in bounded batches.
     """
-    dataset = datasets.Dataset.from_pandas(dataframe)
-    return dataset
+    parquet_file = pq.ParquetFile(path)
+    emitted = 0
+    limit = max_rows if max_rows and max_rows > 0 else None
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        for row in batch.to_pylist():
+            yield row
+            emitted += 1
+            if limit is not None and emitted >= limit:
+                return
 
 
 def _maybe_add_target(value: Any, store: set[int]) -> None:
@@ -916,7 +928,7 @@ def _update_target_sets(graph: dict[str, Any], entity_store: set[int], predicate
 
 
 def compute_torch_geometric_objects(
-    data: datasets.Dataset,
+    rows: Iterable[dict[str, Any]],
     wikidata_cache: PrecomputedWikidataCache | None,
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
@@ -926,9 +938,10 @@ def compute_torch_geometric_objects(
     embedding_dtype: np.dtype | None = None,
     on_sample: Optional[Callable[[Data], None]] = None,
     debug_state: dict[str, Any] | None = None,
+    total_rows: int | None = None,
 ) -> Iterator[Data]:
     """
-    Build a stream of torch_geometric.data.Data graphs from a *datasets* object.
+    Build a stream of torch_geometric.data.Data graphs from row dictionaries.
 
     Yields
     -----
@@ -936,8 +949,7 @@ def compute_torch_geometric_objects(
         Individual graphs emitted one-by-one to avoid materialising the full
         dataset in memory.
     """
-    for row_idx in tqdm(range(len(data)), desc="Processing rows"):
-        row = dict(data[row_idx])
+    for row_idx, row in enumerate(tqdm(rows, desc="Processing rows", total=total_rows)):
         graph = create_graph(
             row,
             wikidata_cache=wikidata_cache,
@@ -1066,14 +1078,12 @@ def main(
     for split, parquet_name in split_to_parquet.items():
         logging.info("Processing %s split", split)
 
-        # Load dataframe
-        dataframe = pd.read_parquet(INTERIM_DATA_PATH / parquet_name)
-        dataset = pandas_to_dataset(dataframe)
-        del dataframe
+        parquet_path = INTERIM_DATA_PATH / parquet_name
+        split_total_rows = _parquet_num_rows(parquet_path)
         if max_instances and max_instances > 0:
-            limit = min(max_instances, len(dataset))
-            dataset = dataset.select(range(limit))
+            limit = min(max_instances, split_total_rows)
             logging.info("Limiting %s split to first %s instances", split, limit)
+            split_total_rows = limit
 
         split_entity_targets: set[int] = {0}
         split_predicate_targets: set[int] = {0}
@@ -1097,8 +1107,12 @@ def main(
                 total_predicate_targets.add(idx)
 
         # Build graphs (the heavy lifting happens here)
+        row_iter = iter_parquet_rows(
+            parquet_path,
+            max_rows=max_instances,
+        )
         generator = compute_torch_geometric_objects(
-            dataset,
+            row_iter,
             wikidata_cache,
             global_int_encoder,
             constraint_registry,
@@ -1108,8 +1122,8 @@ def main(
             embedding_dtype=embedding_dtype,
             on_sample=collect_targets,
             debug_state=debug_state,
+            total_rows=split_total_rows,
         )
-        del dataset
         output_path = PROCESSED_DATA_PATH / f"{split}_graph-{encoding}.pkl"
 
         # Persist graphs
