@@ -447,6 +447,17 @@ class BaseGraphModel(nn.Module, ABC):
 
 class RepairGAT(BaseGraphModel):
     def create_conv_layer(self, in_channels: int, out_channels: int):
+        if self.use_edge_attributes:
+            # Edge features are dynamically produced by edge_mlp with size=in_channels.
+            # Disable self-loops in this mode because there is no predicate label for synthetic self-edges.
+            return GATConv(
+                in_channels,
+                out_channels,
+                heads=1,
+                concat=True,
+                edge_dim=in_channels,
+                add_self_loops=False,
+            )
         return GATConv(in_channels, out_channels, heads=1, concat=True)
 
 
