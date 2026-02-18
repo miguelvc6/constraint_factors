@@ -36,6 +36,8 @@ import itertools
 import json
 import logging
 import pickle
+import re
+import shutil
 from datetime import datetime, timezone
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -77,6 +79,16 @@ OVERWRITE_MODE_ATOMIC = "atomic"
 OVERWRITE_MODE_UNSAFE = "unsafe"
 OVERWRITE_MODE_SKIP = "skip"
 OVERWRITE_MODE_CHOICES = (OVERWRITE_MODE_ATOMIC, OVERWRITE_MODE_UNSAFE, OVERWRITE_MODE_SKIP)
+
+
+def _torch_load_trusted(path: Path) -> Any:
+    """
+    Load a trusted local torch artifact with backwards-compatible semantics.
+
+    PyTorch 2.6 changed torch.load default `weights_only` from False to True,
+    which breaks loading generic pickled objects like PyG Data shards.
+    """
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _normalize_target_id(value: Any, encoder: GlobalIntEncoder, unknown_id: int) -> int:
@@ -900,15 +912,29 @@ def _parquet_num_rows(path: Path) -> int:
     return int(pq.ParquetFile(path).metadata.num_rows)
 
 
-def iter_parquet_rows(path: Path, batch_size: int = 4096, max_rows: int = 0) -> Iterator[dict[str, Any]]:
+def iter_parquet_rows(
+    path: Path,
+    batch_size: int = 4096,
+    max_rows: int = 0,
+    skip_rows: int = 0,
+) -> Iterator[dict[str, Any]]:
     """
     Stream parquet rows as Python dictionaries in bounded batches.
     """
     parquet_file = pq.ParquetFile(path)
     emitted = 0
-    limit = max_rows if max_rows and max_rows > 0 else None
+    seen = 0
+    skip_limit = max(0, int(skip_rows))
+    if max_rows and max_rows > 0:
+        remaining = max(0, int(max_rows) - skip_limit)
+        limit = remaining
+    else:
+        limit = None
     for batch in parquet_file.iter_batches(batch_size=batch_size):
         for row in batch.to_pylist():
+            seen += 1
+            if seen <= skip_limit:
+                continue
             yield row
             emitted += 1
             if limit is not None and emitted >= limit:
@@ -1040,7 +1066,7 @@ def collect_sample_for_check(
     sample: list[Data] = []
     for shard_path in sorted(output_path.parent.glob(f"{output_path.stem}-shard*{suffix}")):
         if use_torch_save:
-            shard_objects = torch.load(shard_path, map_location="cpu")
+            shard_objects = _torch_load_trusted(shard_path)
         else:
             with open(shard_path, "rb") as f:
                 shard_objects = pickle.load(f)
@@ -1123,6 +1149,125 @@ def _clear_existing_shards(output_path: Path) -> None:
         shard_path.unlink(missing_ok=True)
 
 
+def _discover_split_shards(output_path: Path, use_torch_save: bool) -> list[Path]:
+    suffix = ".pt" if use_torch_save else output_path.suffix
+    return sorted(output_path.parent.glob(f"{output_path.stem}-shard*{suffix}"))
+
+
+def _extract_shard_index(shard_path: Path) -> int | None:
+    match = re.search(r"-shard(\d+)$", shard_path.stem)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _load_shard_payload(shard_path: Path) -> list[Data]:
+    if shard_path.suffix == ".pt":
+        payload = _torch_load_trusted(shard_path)
+    else:
+        with shard_path.open("rb") as f:
+            payload = pickle.load(f)
+    if not isinstance(payload, list):
+        raise TypeError(f"Expected list payload in {shard_path}, got {type(payload)!r}")
+    return payload
+
+
+def _load_resume_state(
+    shard_paths: list[Path],
+    split_entity_targets: set[int],
+    split_predicate_targets: set[int],
+    total_entity_targets: set[int],
+    total_predicate_targets: set[int],
+) -> tuple[int, int]:
+    if not shard_paths:
+        return 0, 0
+    indexed_paths: list[tuple[int, Path]] = []
+    for shard_path in shard_paths:
+        index = _extract_shard_index(shard_path)
+        if index is None:
+            raise ValueError(f"Unexpected shard naming format: {shard_path.name}")
+        indexed_paths.append((index, shard_path))
+    indexed_paths = sorted(indexed_paths, key=lambda item: item[0])
+    indices = [idx for idx, _ in indexed_paths]
+    expected = list(range(min(indices), max(indices) + 1))
+    if indices != expected or (indices and indices[0] != 0):
+        raise ValueError(
+            "Resume requires contiguous shard indices starting at 000; found "
+            f"indices={indices[:5]}...{indices[-5:] if len(indices) > 5 else indices}"
+        )
+
+    existing_graphs = 0
+    next_shard = indices[-1] + 1
+    for pos, (index, shard_path) in enumerate(indexed_paths):
+        try:
+            shard_objects = _load_shard_payload(shard_path)
+        except Exception as exc:
+            is_last = pos == len(indexed_paths) - 1
+            if not is_last:
+                raise
+            logging.warning(
+                "Ignoring unreadable trailing shard %s (%s); resume will overwrite it.",
+                shard_path,
+                exc,
+            )
+            next_shard = index
+            break
+        existing_graphs += len(shard_objects)
+        for graph in shard_objects:
+            y = getattr(graph, "y", None)
+            if y is None:
+                continue
+            if not isinstance(y, torch.Tensor):
+                y = torch.as_tensor(y)
+            if y.ndim == 1:
+                y = y.unsqueeze(0)
+            if y.numel() < 6:
+                continue
+            add_subject, add_predicate, add_object, del_subject, del_predicate, del_object = y[0].tolist()
+            for idx in (add_subject, add_object, del_subject, del_object):
+                split_entity_targets.add(int(idx))
+                total_entity_targets.add(int(idx))
+            for idx in (add_predicate, del_predicate):
+                split_predicate_targets.add(int(idx))
+                total_predicate_targets.add(int(idx))
+        del shard_objects
+    return existing_graphs, next_shard
+
+
+def _log_free_space_estimate(
+    processed_path: Path,
+    split: str,
+    shard_paths: list[Path],
+    shard_size: int,
+    remaining_rows: int,
+) -> None:
+    if shard_size <= 0 or remaining_rows <= 0:
+        return
+    if not shard_paths:
+        return
+    total_shard_bytes = sum(path.stat().st_size for path in shard_paths)
+    avg_shard_bytes = total_shard_bytes / max(len(shard_paths), 1)
+    estimated_remaining_shards = int(np.ceil(remaining_rows / shard_size))
+    estimated_remaining_bytes = int(avg_shard_bytes * estimated_remaining_shards)
+    free_bytes = shutil.disk_usage(processed_path).free
+    logging.info(
+        "Disk estimate for %s: remaining_rows=%s estimated_remaining_shards=%s "
+        "estimated_bytes=%.2f GB free=%.2f GB",
+        split,
+        remaining_rows,
+        estimated_remaining_shards,
+        estimated_remaining_bytes / (1024**3),
+        free_bytes / (1024**3),
+    )
+    if estimated_remaining_bytes > free_bytes:
+        logging.warning(
+            "Estimated remaining disk required for %s (~%.2f GB) exceeds free disk (~%.2f GB).",
+            split,
+            estimated_remaining_bytes / (1024**3),
+            free_bytes / (1024**3),
+        )
+
+
 def _write_split_manifest(
     split: str,
     output_path: Path,
@@ -1180,6 +1325,7 @@ def main(
     shard_size: int = 0,
     use_torch_save: bool = False,
     overwrite_mode: str = OVERWRITE_MODE_ATOMIC,
+    resume_partial_shards: bool = False,
     embedding_dtype: np.dtype | None = None,
     check_sample_size: int = 32,
     max_instances: int = 0,
@@ -1266,10 +1412,42 @@ def main(
             }
             continue
 
+        resume_skip_rows = 0
+        start_shard = 0
+        existing_shard_count = 0
+        existing_split_shards: list[Path] = []
+        if resume_partial_shards and shard_size > 0:
+            existing_split_shards = _discover_split_shards(output_path, use_torch_save=use_torch_save)
+            if existing_split_shards:
+                resume_skip_rows, start_shard = _load_resume_state(
+                    existing_split_shards,
+                    split_entity_targets=split_entity_targets,
+                    split_predicate_targets=split_predicate_targets,
+                    total_entity_targets=total_entity_targets,
+                    total_predicate_targets=total_predicate_targets,
+                )
+                existing_shard_count = start_shard
+                split_total_rows = max(0, split_total_rows - resume_skip_rows)
+                _log_free_space_estimate(
+                    PROCESSED_DATA_PATH,
+                    split=split,
+                    shard_paths=existing_split_shards[:existing_shard_count],
+                    shard_size=shard_size,
+                    remaining_rows=split_total_rows,
+                )
+                logging.info(
+                    "Resuming %s split from existing shards: shard_count=%s resume_skip_rows=%s next_shard=%s",
+                    split,
+                    existing_shard_count,
+                    resume_skip_rows,
+                    start_shard,
+                )
+
         # Build graphs (the heavy lifting happens here)
         row_iter = iter_parquet_rows(
             parquet_path,
             max_rows=max_instances,
+            skip_rows=resume_skip_rows,
         )
         generator = compute_torch_geometric_objects(
             row_iter,
@@ -1286,8 +1464,9 @@ def main(
             total_rows=split_total_rows,
         )
         if shard_size > 0:
-            output_path.unlink(missing_ok=True)
-            _clear_existing_shards(output_path)
+            if not (resume_partial_shards and existing_split_shards):
+                output_path.unlink(missing_ok=True)
+                _clear_existing_shards(output_path)
         else:
             _clear_existing_shards(output_path)
 
@@ -1303,7 +1482,10 @@ def main(
                 shard_size=shard_size,
                 use_torch_save=use_torch_save,
                 atomic_write=atomic_write,
+                start_shard=start_shard,
             )
+            shard_count += existing_shard_count
+            total_objects += resume_skip_rows
         else:
             total_objects, stream_artifact = dump_stream(
                 generator,
@@ -1386,7 +1568,7 @@ def display_graph(encoder: GlobalIntEncoder) -> None:
         suffix = ".pt" if args.use_torch_save else train_output.suffix
         for shard_path in sorted(train_output.parent.glob(f"{train_output.stem}-shard*{suffix}")):
             if args.use_torch_save:
-                shard_objects = torch.load(shard_path, map_location="cpu")
+                shard_objects = _torch_load_trusted(shard_path)
             else:
                 with open(shard_path, "rb") as f:
                     shard_objects = pickle.load(f)
@@ -1553,6 +1735,14 @@ def parse_args():
             "'unsafe' writes directly to final paths, 'skip' reuses existing split artifacts."
         ),
     )
+    parser.add_argument(
+        "--resume-partial-shards",
+        action="store_true",
+        help=(
+            "Resume shard generation when shard files already exist: counts existing shards, "
+            "skips already-processed rows, and continues from the next shard index."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1562,6 +1752,10 @@ def parse_args():
         parser.error("--max-instances must be non-negative")
     if args.debug_factor_wiring and args.persistence_profile != PERSISTENCE_PROFILE_FULL:
         parser.error("--debug-factor-wiring requires --persistence-profile full")
+    if args.resume_partial_shards and args.shard_size <= 0:
+        parser.error("--resume-partial-shards requires --shard-size > 0")
+    if args.resume_partial_shards and args.overwrite == OVERWRITE_MODE_SKIP:
+        parser.error("--resume-partial-shards is incompatible with --overwrite skip")
 
     return args
 
@@ -1648,6 +1842,7 @@ if __name__ == "__main__":
         shard_size=args.shard_size,
         use_torch_save=args.use_torch_save,
         overwrite_mode=args.overwrite,
+        resume_partial_shards=args.resume_partial_shards,
         embedding_dtype=text_embedding_dtype,
         max_instances=args.max_instances,
         debug_factor_wiring=args.debug_factor_wiring,

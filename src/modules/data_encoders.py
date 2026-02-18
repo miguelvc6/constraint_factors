@@ -425,13 +425,15 @@ def dump_in_shards(
     shard_size: int,
     use_torch_save: bool,
     atomic_write: bool = True,
+    start_shard: int = 0,
 ) -> tuple[int, int, list[ArtifactWriteResult]]:
     base_path = Path(base_path)
     base_path.parent.mkdir(parents=True, exist_ok=True)
     buf: list[Data] = []
-    shard = 0
+    shard = max(0, int(start_shard))
     total = 0
     artifacts: list[ArtifactWriteResult] = []
+    written_shards = 0
     for obj in objs:
         buf.append(obj)
         if len(buf) == shard_size:
@@ -439,18 +441,20 @@ def dump_in_shards(
             total += len(buf)
             buf.clear()
             shard += 1
+            written_shards += 1
     if buf:
         artifacts.append(_write_shard(buf, base_path, shard, use_torch_save, atomic_write=atomic_write))
         total += len(buf)
         buf.clear()
         shard += 1
+        written_shards += 1
     logging.info(
-        "Wrote %s graph objects across %s shard(s) using base %s",
+        "Wrote %s graph objects across %s newly written shard(s) using base %s",
         total,
-        shard,
+        written_shards,
         base_path,
     )
-    return total, shard, artifacts
+    return total, written_shards, artifacts
 
 
 def _write_shard(
