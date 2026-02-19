@@ -348,6 +348,7 @@ def train(
     chooser_val_contexts = None
     chooser_evaluator = None
     chooser_candidate_cfg = None
+    chooser_placeholder_ids: set[int] | None = None
     if chooser_enabled and chooser_state:
         chooser_heuristics = cast(ConstraintRepairHeuristics | None, chooser_state.get("heuristics"))
         chooser_train_rows = cast(list | None, chooser_state.get("train_rows"))
@@ -356,6 +357,7 @@ def train(
         chooser_val_contexts = cast(list[ViolationContext] | None, chooser_state.get("val_contexts"))
         chooser_evaluator = cast(CandidateConstraintEvaluator | None, chooser_state.get("evaluator"))
         chooser_candidate_cfg = cast(CandidateConfig | None, chooser_state.get("candidate_cfg"))
+        chooser_placeholder_ids = cast(set[int] | None, chooser_state.get("placeholder_ids_set"))
 
     policy_enabled = bool(getattr(model, "_policy_enabled", False))
     policy_train_contexts = None
@@ -374,11 +376,18 @@ def train(
     # Device introspection (CUDA memory tracking/debugging).
     logger.info(f"Using device: {device}")
     if device.type == "cuda":
+        # Fast-path defaults for NVIDIA Tensor Cores with stable numerics.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         device_index = device.index if device.index is not None else torch.cuda.current_device()
         logger.info(f"GPU: {torch.cuda.get_device_name(device_index)}")
         log_cuda_memory("Initial GPU state", device)
+    amp_enabled = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if amp_enabled else None
+    if amp_enabled:
+        logger.info("Automatic mixed precision enabled | dtype=%s", str(amp_dtype).replace("torch.", ""))
 
     # Dataset bookkeeping / loader construction.
     train_dataset_info = "streaming" if isinstance(train_data, IterableDataset) else "in-memory"
@@ -398,19 +407,24 @@ def train(
 
     train_is_iterable = isinstance(train_data, IterableDataset)
 
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "pin_memory": pin_memory,
+        "num_workers": train_cfg.num_workers,
+    }
+    if train_cfg.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         cast(Any, train_data),
-        batch_size=batch_size,
         shuffle=(not train_is_iterable),
-        pin_memory=pin_memory,
-        num_workers=train_cfg.num_workers,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         cast(Any, val_data),
-        batch_size=batch_size,
         shuffle=False,
-        pin_memory=pin_memory,
-        num_workers=train_cfg.num_workers,
+        **loader_kwargs,
     )
 
     # Optimiser / scheduler / loss boilerplate.
@@ -522,7 +536,8 @@ def train(
 
             optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(data)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
+                outputs = model(data)
             if torch.is_tensor(outputs):
                 outputs = {
                     "edit_logits": outputs,
@@ -638,6 +653,7 @@ def train(
                     raise AssertionError("factor_mask_pre length must match factor_satisfied_pre length.")
                 active_float = active_mask.to(dtype=graph_loss.dtype)
                 per_factor_loss = factor_criterion(factor_logits, factor_targets)
+                per_factor_loss = per_factor_loss.to(dtype=graph_loss.dtype)
                 per_factor_loss = per_factor_loss * active_float
                 active_count = int(active_mask.sum().item())
 
@@ -700,7 +716,9 @@ def train(
                         heuristics=chooser_heuristics,
                         proposal_logits=out[idx].detach(),
                         cfg=chooser_candidate_cfg,
-                        placeholder_ids=set(chooser_heuristics.placeholder_ids.values()),
+                        placeholder_ids=chooser_placeholder_ids
+                        if chooser_placeholder_ids is not None
+                        else set(chooser_heuristics.placeholder_ids.values()),
                         num_target_ids=model.num_target_ids,
                     )
                     candidate_tensor = torch.tensor(
@@ -917,7 +935,8 @@ def train(
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
 
-                outputs = model(data)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
+                    outputs = model(data)
                 if torch.is_tensor(outputs):
                     outputs = {
                         "edit_logits": outputs,
@@ -1027,6 +1046,7 @@ def train(
                         raise AssertionError("factor_mask_pre length must match factor_satisfied_pre length.")
                     active_float = active_mask.to(dtype=graph_loss.dtype)
                     per_factor_loss = factor_criterion(factor_logits, factor_targets)
+                    per_factor_loss = per_factor_loss.to(dtype=graph_loss.dtype)
                     per_factor_loss = per_factor_loss * active_float
                     active_count = int(active_mask.sum().item())
 
@@ -1089,7 +1109,9 @@ def train(
                             heuristics=chooser_heuristics,
                             proposal_logits=out[idx].detach(),
                             cfg=chooser_candidate_cfg,
-                            placeholder_ids=set(chooser_heuristics.placeholder_ids.values()),
+                            placeholder_ids=chooser_placeholder_ids
+                            if chooser_placeholder_ids is not None
+                            else set(chooser_heuristics.placeholder_ids.values()),
                             num_target_ids=model.num_target_ids,
                         )
                         candidate_tensor = torch.tensor(
@@ -1632,6 +1654,7 @@ def main():
             "val_contexts": val_contexts,
             "evaluator": evaluator,
             "candidate_cfg": candidate_cfg,
+            "placeholder_ids_set": set(chooser_heuristics.placeholder_ids.values()),
         }
         logger.info(
             "Chooser enabled | topk_candidates=%s max_candidates_total=%s loss_mode=%s",
