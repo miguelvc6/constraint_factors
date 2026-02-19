@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -319,6 +320,8 @@ def train(
     fix_loss_state: dict[str, object] | None = None,
     chooser_state: dict[str, object] | None = None,
     policy_state: dict[str, object] | None = None,
+    estimated_train_batches: int | None = None,
+    estimated_val_batches: int | None = None,
 ):
     # Normalise the device argument because config may pass strings.
     if isinstance(device, str):
@@ -436,7 +439,26 @@ def train(
     try:
         train_total_batches = len(train_loader)
     except TypeError:
-        train_total_batches = None
+        train_total_batches = estimated_train_batches
+    try:
+        val_total_batches = len(val_loader)
+    except TypeError:
+        val_total_batches = estimated_val_batches
+
+    def _should_log_batch(batch_idx: int, total_batches: int | None, last_logged_percent: int) -> tuple[bool, int]:
+        """
+        Emit per-batch logs for:
+        - the first 10 iterations
+        - then each new 1% progress point within the epoch (when total is known)
+        """
+        if batch_idx <= 10:
+            return True, last_logged_percent
+        if total_batches is None or total_batches <= 0:
+            return False, last_logged_percent
+        progress_percent = int((batch_idx * 100) / total_batches)
+        if progress_percent > last_logged_percent:
+            return True, progress_percent
+        return False, last_logged_percent
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
@@ -482,8 +504,8 @@ def train(
         train_policy_correct = 0
 
         train_constraint_metrics = ConstraintMetricsAccumulator()
-        data_iter = progress_bar(train_loader, desc="Training Batches", leave=False)
-        for batch_idx, data in enumerate(data_iter, start=1):
+        train_last_logged_percent = 0
+        for batch_idx, data in enumerate(train_loader, start=1):
             data = data.to(device, non_blocking=True)
             if train_cfg.validate_factor_labels:
                 _assert_factor_labels_batch(data)
@@ -825,22 +847,30 @@ def train(
             )
             dynamic_weighter.observe_batch(constraint_types, loss_matrix)
 
-            data_iter.set_postfix(
-                {
-                    "loss": f"{weighted_loss.item():.4f}",
-                    "all6_acc": f"{100 * train_correct / max(train_total, 1):.2f}%",
-                    "slot_acc": f"{100 * train_slot_correct / max(train_slot_total, 1):.2f}%",
-                    "factor_loss": f"{train_factor_loss_sum / max(train_factor_count, 1):.4f}"
-                    if factor_cfg.enabled
-                    else "n/a",
-                    "chooser_loss": f"{train_chooser_loss_sum / max(train_chooser_count, 1):.4f}"
-                    if chooser_enabled
-                    else "n/a",
-                    "policy_loss": f"{train_policy_loss_sum / max(train_policy_count, 1):.4f}"
-                    if policy_enabled
-                    else "n/a",
-                }
+            should_log, train_last_logged_percent = _should_log_batch(
+                batch_idx,
+                train_total_batches,
+                train_last_logged_percent,
             )
+            if should_log:
+                if train_total_batches is not None and train_total_batches > 0:
+                    progress = int((batch_idx * 100) / train_total_batches)
+                    progress_label = (
+                        f"batch {batch_idx}/{train_total_batches} ({min(progress, 100)}%)"
+                    )
+                else:
+                    progress_label = f"batch {batch_idx}"
+                logger.info(
+                    "Epoch %s train %s | loss=%.4f all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
+                    epoch + 1,
+                    progress_label,
+                    weighted_loss.item(),
+                    100 * train_correct / max(train_total, 1),
+                    100 * train_slot_correct / max(train_slot_total, 1),
+                    f"{train_factor_loss_sum / max(train_factor_count, 1):.4f}" if factor_cfg.enabled else "n/a",
+                    f"{train_chooser_loss_sum / max(train_chooser_count, 1):.4f}" if chooser_enabled else "n/a",
+                    f"{train_policy_loss_sum / max(train_policy_count, 1):.4f}" if policy_enabled else "n/a",
+                )
 
         # Epoch training metrics
         avg_train_loss = train_graph_loss_sum / max(train_graph_count, 1)
@@ -880,10 +910,8 @@ def train(
         val_policy_correct = 0
 
         with torch.no_grad():
-            for batch_idx, data in enumerate(
-                progress_bar(val_loader, desc="Validation Batches", leave=False),
-                start=1,
-            ):
+            val_last_logged_percent = 0
+            for batch_idx, data in enumerate(val_loader, start=1):
                 data = data.to(device, non_blocking=True)
                 if train_cfg.validate_factor_labels:
                     _assert_factor_labels_batch(data)
@@ -1183,6 +1211,32 @@ def train(
                             device,
                             level=logging.DEBUG,
                         )
+
+                should_log, val_last_logged_percent = _should_log_batch(
+                    batch_idx,
+                    val_total_batches,
+                    val_last_logged_percent,
+                )
+                if should_log:
+                    if val_total_batches is not None and val_total_batches > 0:
+                        progress = int((batch_idx * 100) / val_total_batches)
+                        progress_label = (
+                            f"batch {batch_idx}/{val_total_batches} ({min(progress, 100)}%)"
+                        )
+                    else:
+                        progress_label = f"batch {batch_idx}"
+                    avg_val_batch_loss = val_graph_loss_sum / max(val_graph_count, 1)
+                    logger.info(
+                        "Epoch %s val %s | loss=%.4f all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
+                        epoch + 1,
+                        progress_label,
+                        avg_val_batch_loss,
+                        100 * val_correct / max(val_total, 1),
+                        100 * val_slot_correct / max(val_slot_total, 1),
+                        f"{val_factor_loss_sum / max(val_factor_count, 1):.4f}" if factor_cfg.enabled else "n/a",
+                        f"{val_chooser_loss_sum / max(val_chooser_count, 1):.4f}" if chooser_enabled else "n/a",
+                        f"{val_policy_loss_sum / max(val_policy_count, 1):.4f}" if policy_enabled else "n/a",
+                    )
 
         # Epoch validation metrics
         avg_val_loss = val_graph_loss_sum / max(val_graph_count, 1)
@@ -1616,6 +1670,23 @@ def main():
             ", ".join(POLICY_NAMES),
         )
 
+    estimated_train_batches: int | None = None
+    estimated_val_batches: int | None = None
+
+    if isinstance(train_data, list):
+        estimated_train_batches = max(1, math.ceil(len(train_data) / max(training_cfg.batch_size, 1)))
+    else:
+        train_graph_count = _manifest_graph_count(train_data_path)
+        if train_graph_count is not None and train_graph_count > 0:
+            estimated_train_batches = max(1, math.ceil(train_graph_count / max(training_cfg.batch_size, 1)))
+
+    if isinstance(val_data, list):
+        estimated_val_batches = max(1, math.ceil(len(val_data) / max(training_cfg.batch_size, 1)))
+    else:
+        val_graph_count = _manifest_graph_count(val_data_path)
+        if val_graph_count is not None and val_graph_count > 0:
+            estimated_val_batches = max(1, math.ceil(val_graph_count / max(training_cfg.batch_size, 1)))
+
     # Select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Selected compute device: %s", device)
@@ -1672,6 +1743,8 @@ def main():
         fix_loss_state=fix_loss_state,
         chooser_state=chooser_state,
         policy_state=policy_state,
+        estimated_train_batches=estimated_train_batches,
+        estimated_val_batches=estimated_val_batches,
     )
 
     if device.type == "cuda":
