@@ -2,8 +2,9 @@
 """
 Generate ~20 hyperparameter-search configs for the MAIN model (Fix-1):
 - Proposal + Chooser(Fix-1) + Typed Pressure + Factor Loss
-- Full dataset: dataset_variant="full", min_occurrence=100
-- Default encoding: "text_embedding"
+- Full dataset defaults: dataset_variant="full", min_occurrence=100
+  (resolved to "full_minocc100")
+- Default encoding: "node_id"
 
 It writes configs under:
   models/hp_m1_<tag>__full__<encoding>/config.json
@@ -12,7 +13,7 @@ Run:
   python scripts/make_hparam_search_configs_m1.py \
     --processed-root data/processed \
     --models-root models \
-    --encoding text_embedding \
+    --encoding node_id \
     --num-configs 20
 """
 
@@ -23,12 +24,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import torch
 
-def _load_first_data_obj(pkl_path: Path) -> Any | None:
-    """Graph files are a pickle stream of PyG Data objects; load the first one."""
+from modules.data_encoders import dataset_variant_name, discover_graph_artifacts
+
+
+def _torch_load_trusted(path: Path) -> Any:
+    """Load trusted local torch payloads (PyTorch 2.6+ compatible)."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _load_first_data_obj(path: Path) -> Any | None:
+    """Load the first graph-like object from a graph artifact path."""
     try:
-        with pkl_path.open("rb") as fh:
-            return pickle.Unpickler(fh).load()
+        if path.suffix == ".pt":
+            payload = _torch_load_trusted(path)
+        else:
+            with path.open("rb") as fh:
+                payload = pickle.Unpickler(fh).load()
+        if isinstance(payload, list):
+            return payload[0] if payload else None
+        return payload
     except Exception:
         return None
 
@@ -84,7 +100,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--processed-root", type=Path, default=Path("data/processed"))
     ap.add_argument("--models-root", type=Path, default=Path("models"))
-    ap.add_argument("--encoding", type=str, default="text_embedding")
+    ap.add_argument("--encoding", type=str, default="node_id")
     ap.add_argument("--num-configs", type=int, default=20)
     ap.add_argument("--min-occurrence", type=int, default=100)
     ap.add_argument("--dataset-variant", type=str, default="full")
@@ -93,17 +109,20 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    variant = args.dataset_variant
+    variant = dataset_variant_name(args.dataset_variant, args.min_occurrence)
     encoding = args.encoding
-    min_occ = args.min_occurrence
+    min_occ = int(args.min_occurrence)
 
     train_graph = args.processed_root / variant / f"train_graph-{encoding}.pkl"
-    if not train_graph.exists():
+    artifacts = discover_graph_artifacts(train_graph)
+    if not artifacts:
         raise FileNotFoundError(
-            f"Missing graph file: {train_graph}\nExpected: data/processed/{variant}/train_graph-{encoding}.pkl"
+            "Missing graph artifacts.\n"
+            f"Checked base path: {train_graph}\n"
+            f"Expected monolithic file or shards matching: {train_graph.parent}/{train_graph.stem}-shard*"
         )
 
-    sample = _load_first_data_obj(train_graph)
+    sample = _load_first_data_obj(artifacts[0].path)
     num_factor_types = _infer_num_factor_types(sample)
 
     # ---- Search design (20 configs) ----
@@ -222,8 +241,9 @@ def main() -> None:
         created += 1
 
     print(f"[ok] wrote {created} configs under {args.models_root}")
-    print(f"Target graph file checked: {train_graph}")
-    print("Next: run scheduler over models/hp_m1_*__full__<encoding>/config.json")
+    print(f"Target graph artifacts checked: {train_graph} (found {len(artifacts)})")
+    print(f"Resolved dataset_variant: {variant}")
+    print(f"Next: run scheduler over models/hp_m1_*__{variant}__{encoding}/config.json")
 
 
 if __name__ == "__main__":

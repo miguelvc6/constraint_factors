@@ -67,6 +67,12 @@ PAPER_SUITE_TAGS: set[str] = {
     "m2_global_fix_reranker",
 }
 
+
+def _torch_load_trusted(path: Path) -> object:
+    """Load trusted local torch artifacts with PyTorch 2.6+ compatibility."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
 # --- EVALUATION METRICS DEFINITIONS --- #
 
 
@@ -255,7 +261,7 @@ def _load_reranker_predictions(path: Path) -> torch.Tensor:
     suffix = path.suffix.lower()
     payload: object
     if suffix in {".pt", ".pth"}:
-        payload = torch.load(path, map_location="cpu")
+        payload = _torch_load_trusted(path)
     elif suffix in {".json", ".jsonl"}:
         if suffix == ".jsonl":
             rows = []
@@ -803,7 +809,7 @@ def load_split(base_path: Path, encoding: str, split: str) -> list[Data]:
         graphs: list[Data] = []
         for artifact in artifacts:
             if artifact.path.suffix == ".pt":
-                shard_objects = torch.load(artifact.path, map_location="cpu")
+                shard_objects = _torch_load_trusted(artifact.path)
             else:
                 with artifact.path.open("rb") as f:
                     shard_objects = pickle.load(f)

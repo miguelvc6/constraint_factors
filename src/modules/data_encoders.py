@@ -44,6 +44,11 @@ class GraphArtifactInfo(NamedTuple):
     format: str
 
 
+def _torch_load_trusted(path: Path) -> Any:
+    """Load trusted local torch artifacts with PyTorch 2.6+ compatibility."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
 SCALAR_FEATURES: tuple[str, ...] = (
     "constraint_id",
     "subject",
@@ -547,6 +552,9 @@ class GraphStreamDataset(IterableDataset):
                     break
 
                 if index % num_workers == worker_id:
+                    # Keep a stable global graph index so downstream losses can align
+                    # streamed graphs with sidecar context/row arrays.
+                    setattr(obj, "context_index", index)
                     yield obj
                 index += 1
 
@@ -568,7 +576,7 @@ class ShardedGraphStreamDataset(GraphStreamDataset):
         index = 0
         for shard_path in self.shard_paths:
             if shard_path.suffix == ".pt":
-                shard_objects = torch.load(shard_path, map_location="cpu")
+                shard_objects = _torch_load_trusted(shard_path)
             else:
                 with shard_path.open("rb") as f:
                     shard_objects = pickle.load(f)
@@ -576,6 +584,8 @@ class ShardedGraphStreamDataset(GraphStreamDataset):
                 raise TypeError(f"Expected list payload in shard {shard_path}, got {type(shard_objects)!r}")
             for obj in shard_objects:
                 if index % num_workers == worker_id:
+                    # Keep a stable global graph index across shards.
+                    setattr(obj, "context_index", index)
                     yield obj
                 index += 1
             del shard_objects

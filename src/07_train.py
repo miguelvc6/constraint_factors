@@ -1398,6 +1398,21 @@ def main():
     train_data = load_graph_dataset(train_data_path)
     val_data = load_graph_dataset(val_data_path)
 
+    def _manifest_graph_count(graph_path: Path) -> int | None:
+        manifest_path = graph_path.with_suffix(graph_path.suffix + ".manifest.json")
+        if not manifest_path.exists():
+            return None
+        try:
+            with manifest_path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            logger.exception("Failed to read graph manifest at %s", manifest_path)
+            return None
+        graph_count = payload.get("graph_count")
+        if isinstance(graph_count, int):
+            return graph_count
+        return None
+
     # Infer node feature spec and target vocabularies
     use_node_embeddings, feature_dim, feature_dtype, role_spec = infer_node_feature_spec(train_data, val_data)
     logger.info(
@@ -1495,14 +1510,6 @@ def main():
     chooser_state: dict[str, object] | None = None
     chooser_cfg = training_cfg.chooser
     if chooser_cfg.enabled:
-        if isinstance(train_data, GraphStreamDataset):
-            logger.info("Materializing training stream dataset into memory for chooser training.")
-            train_data = list(train_data)
-        if isinstance(val_data, GraphStreamDataset):
-            logger.info("Materializing validation stream dataset into memory for chooser training.")
-            val_data = list(val_data)
-        if not isinstance(train_data, list) or not isinstance(val_data, list):
-            raise RuntimeError("Chooser training requires in-memory datasets (list[Data]).")
         placeholder_ids = placeholder_ids_from_encoder(encoder)
         chooser_heuristics = ConstraintRepairHeuristics(
             encoder=encoder,
@@ -1511,16 +1518,31 @@ def main():
         )
         train_contexts = load_violation_contexts(interim_path, "train", none_class=NONE_CLASS_INDEX)
         val_contexts = load_violation_contexts(interim_path, "val", none_class=NONE_CLASS_INDEX)
-        if len(train_contexts) != len(train_data) or len(val_contexts) != len(val_data):
-            raise RuntimeError("Mismatch between graph dataset size and violation contexts for chooser.")
-        for idx, graph in enumerate(train_data):
-            setattr(graph, "context_index", idx)
-        for idx, graph in enumerate(val_data):
-            setattr(graph, "context_index", idx)
         train_rows = _load_parquet_rows(interim_path, "train")
         val_rows = _load_parquet_rows(interim_path, "val")
-        if len(train_rows) != len(train_data) or len(val_rows) != len(val_data):
-            raise RuntimeError("Mismatch between parquet rows and graph dataset size for chooser.")
+        if len(train_rows) != len(train_contexts) or len(val_rows) != len(val_contexts):
+            raise RuntimeError("Mismatch between parquet rows and violation contexts for chooser.")
+        if isinstance(train_data, list) and isinstance(val_data, list):
+            if len(train_contexts) != len(train_data) or len(val_contexts) != len(val_data):
+                raise RuntimeError("Mismatch between graph dataset size and violation contexts for chooser.")
+            for idx, graph in enumerate(train_data):
+                setattr(graph, "context_index", idx)
+            for idx, graph in enumerate(val_data):
+                setattr(graph, "context_index", idx)
+        else:
+            train_graph_count = _manifest_graph_count(train_data_path)
+            val_graph_count = _manifest_graph_count(val_data_path)
+            if train_graph_count is not None and len(train_contexts) != train_graph_count:
+                raise RuntimeError(
+                    f"Mismatch between train manifest graph_count={train_graph_count} and "
+                    f"chooser contexts={len(train_contexts)}."
+                )
+            if val_graph_count is not None and len(val_contexts) != val_graph_count:
+                raise RuntimeError(
+                    f"Mismatch between val manifest graph_count={val_graph_count} and "
+                    f"chooser contexts={len(val_contexts)}."
+                )
+            logger.info("Chooser training will use streamed datasets with on-the-fly context_index assignment.")
         registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
         if not registry_path.exists():
             fallback_name = base_dataset_name(model_cfg.dataset_variant)
