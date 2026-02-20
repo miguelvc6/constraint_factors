@@ -790,6 +790,9 @@ def train(
                 if graph_emb is None:
                     raise RuntimeError("Model output missing graph_emb required for chooser.")
                 graphs = data.to_data_list()
+                loss_mode = chooser_cfg.loss_mode
+                need_regression = loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
+                need_primary = chooser_cfg.gamma_primary > 0
                 chooser_losses = torch.zeros(
                     graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                 )
@@ -818,13 +821,12 @@ def train(
                     scores = model.score_candidates(graph_emb[idx], candidate_tensor)
                     log_probs = F.log_softmax(scores, dim=0)
                     probs = log_probs.exp()
-                    details = chooser_evaluator.evaluate_candidates(
-                        row,
-                        candidates=candidates,
-                        primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
-                    )
-                    loss_mode = chooser_cfg.loss_mode
                     if loss_mode == "global_fix":
+                        details = chooser_evaluator.evaluate_candidates(
+                            row,
+                            candidates=candidates,
+                            primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                        )
                         satisfaction = torch.tensor(
                             [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
                             dtype=graph_loss.dtype,
@@ -833,33 +835,19 @@ def train(
                         chooser_loss = -torch.sum(probs * satisfaction)
                     else:
                         ce_loss = -log_probs[gold_index]
-                        gold_details = details[gold_index]
-                        gold_post = gold_details.get("post_satisfied", [])
-                        gold_post_checkable = gold_details.get("post_checkable", [])
-                        primary_idx = int(getattr(graph, "primary_factor_index", 0))
-                        regression_rates: list[float] = []
-                        primary_flags: list[float] = []
-                        for detail in details:
-                            post = detail.get("post_satisfied", [])
-                            post_checkable = detail.get("post_checkable", [])
-                            regress = 0
-                            denom = 0
-                            for j in range(min(len(post), len(gold_post))):
-                                if j == primary_idx:
-                                    continue
-                                if j >= len(post_checkable) or j >= len(gold_post_checkable):
-                                    continue
-                                if not post_checkable[j] or not gold_post_checkable[j]:
-                                    continue
-                                if gold_post[j]:
-                                    denom += 1
-                                    if not post[j]:
-                                        regress += 1
-                            rate = float(regress) / denom if denom else 0.0
-                            regression_rates.append(rate)
-                            primary_flags.append(float(detail.get("primary_satisfied", 0)))
                         chooser_loss = ce_loss
-                        if loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0:
+                        regression_rates: list[float] | None = None
+                        primary_flags: list[float] | None = None
+                        if need_regression or need_primary:
+                            regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                                row,
+                                candidates=candidates,
+                                gold_index=gold_index,
+                                primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                                need_regression=need_regression,
+                                need_primary=need_primary,
+                            )
+                        if need_regression and regression_rates is not None:
                             regression_tensor = torch.tensor(
                                 regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
                             )
@@ -868,7 +856,7 @@ def train(
                                 probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
                             )
                             chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
-                        if chooser_cfg.gamma_primary > 0:
+                        if need_primary and primary_flags is not None:
                             primary_tensor = torch.tensor(
                                 primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
                             )
@@ -1291,6 +1279,9 @@ def train(
                     if graph_emb is None:
                         raise RuntimeError("Model output missing graph_emb required for chooser.")
                     graphs = data.to_data_list()
+                    loss_mode = chooser_cfg.loss_mode
+                    need_regression = loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
+                    need_primary = chooser_cfg.gamma_primary > 0
                     chooser_losses = torch.zeros(
                         graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                     )
@@ -1319,13 +1310,12 @@ def train(
                         scores = model.score_candidates(graph_emb[idx], candidate_tensor)
                         log_probs = F.log_softmax(scores, dim=0)
                         probs = log_probs.exp()
-                        details = chooser_evaluator.evaluate_candidates(
-                            row,
-                            candidates=candidates,
-                            primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
-                        )
-                        loss_mode = chooser_cfg.loss_mode
                         if loss_mode == "global_fix":
+                            details = chooser_evaluator.evaluate_candidates(
+                                row,
+                                candidates=candidates,
+                                primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                            )
                             satisfaction = torch.tensor(
                                 [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
                                 dtype=graph_loss.dtype,
@@ -1334,33 +1324,19 @@ def train(
                             chooser_loss = -torch.sum(probs * satisfaction)
                         else:
                             ce_loss = -log_probs[gold_index]
-                            gold_details = details[gold_index]
-                            gold_post = gold_details.get("post_satisfied", [])
-                            gold_post_checkable = gold_details.get("post_checkable", [])
-                            primary_idx = int(getattr(graph, "primary_factor_index", 0))
-                            regression_rates: list[float] = []
-                            primary_flags: list[float] = []
-                            for detail in details:
-                                post = detail.get("post_satisfied", [])
-                                post_checkable = detail.get("post_checkable", [])
-                                regress = 0
-                                denom = 0
-                                for j in range(min(len(post), len(gold_post))):
-                                    if j == primary_idx:
-                                        continue
-                                    if j >= len(post_checkable) or j >= len(gold_post_checkable):
-                                        continue
-                                    if not post_checkable[j] or not gold_post_checkable[j]:
-                                        continue
-                                    if gold_post[j]:
-                                        denom += 1
-                                        if not post[j]:
-                                            regress += 1
-                                rate = float(regress) / denom if denom else 0.0
-                                regression_rates.append(rate)
-                                primary_flags.append(float(detail.get("primary_satisfied", 0)))
                             chooser_loss = ce_loss
-                            if loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0:
+                            regression_rates: list[float] | None = None
+                            primary_flags: list[float] | None = None
+                            if need_regression or need_primary:
+                                regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                                    row,
+                                    candidates=candidates,
+                                    gold_index=gold_index,
+                                    primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                                    need_regression=need_regression,
+                                    need_primary=need_primary,
+                                )
+                            if need_regression and regression_rates is not None:
                                 regression_tensor = torch.tensor(
                                     regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
                                 )
@@ -1369,7 +1345,7 @@ def train(
                                     probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
                                 )
                                 chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
-                            if chooser_cfg.gamma_primary > 0:
+                            if need_primary and primary_flags is not None:
                                 primary_tensor = torch.tensor(
                                     primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
                                 )

@@ -338,6 +338,104 @@ def _apply_candidate_edit(
     return missing_edits
 
 
+def _build_post_state_for_candidate(
+    base_facts_by_entity: Dict[Any, Dict[Any, Set[Any]]],
+    base_predicates_present: Dict[Any, Set[Any]],
+    p_local: Set[Any],
+    *,
+    candidate_slots: Sequence[int],
+    placeholder_map: Dict[Any, Any],
+    assume_complete: bool,
+) -> Tuple[Dict[Any, Dict[Any, Set[Any]]], Dict[Any, Set[Any]], Set[Tuple[Any, Any]]]:
+    """
+    Build post-edit facts/predicate maps with copy-on-write semantics.
+
+    This preserves evaluator behavior while avoiding full deep copies per candidate.
+    Only entities/predicate sets touched by the candidate are cloned.
+    """
+    post_facts = base_facts_by_entity
+    post_predicates = base_predicates_present
+    missing_edits: Set[Tuple[Any, Any]] = set()
+
+    copied_entity_maps: Set[Any] = set()
+    copied_value_sets: Set[Tuple[Any, Any]] = set()
+    copied_predicate_sets: Set[Any] = set()
+
+    def _ensure_top_level_facts_copy() -> None:
+        nonlocal post_facts
+        if post_facts is base_facts_by_entity:
+            post_facts = dict(base_facts_by_entity)
+
+    def _ensure_top_level_predicates_copy() -> None:
+        nonlocal post_predicates
+        if post_predicates is base_predicates_present:
+            post_predicates = dict(base_predicates_present)
+
+    def _entity_facts_for_mutation(subject_id: Any) -> Dict[Any, Set[Any]] | None:
+        source = base_facts_by_entity.get(subject_id)
+        if source is None:
+            return None
+        if subject_id not in copied_entity_maps:
+            _ensure_top_level_facts_copy()
+            post_facts[subject_id] = dict(source)
+            copied_entity_maps.add(subject_id)
+        return post_facts[subject_id]
+
+    def _clone_value_set_if_needed(subject_id: Any, predicate_id: Any, entity_facts: Dict[Any, Set[Any]]) -> None:
+        key = (subject_id, predicate_id)
+        if key in copied_value_sets:
+            return
+        current = entity_facts.get(predicate_id)
+        if current is not None:
+            entity_facts[predicate_id] = set(current)
+        copied_value_sets.add(key)
+
+    def _predicate_set_for_mutation(subject_id: Any) -> Set[Any]:
+        if subject_id not in copied_predicate_sets:
+            _ensure_top_level_predicates_copy()
+            post_predicates[subject_id] = set(base_predicates_present.get(subject_id, set()))
+            copied_predicate_sets.add(subject_id)
+        return post_predicates[subject_id]
+
+    def _apply(kind: str, subj: Any, pred: Any, obj: Any) -> None:
+        subj = _resolve_placeholder(subj, placeholder_map)
+        pred = _resolve_placeholder(pred, placeholder_map)
+        obj = _resolve_placeholder(obj, placeholder_map)
+        if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
+            return
+        if not assume_complete and pred not in base_predicates_present.get(subj, set()):
+            missing_edits.add((subj, pred))
+            return
+        if pred not in p_local:
+            missing_edits.add((subj, pred))
+            return
+        entity_facts = _entity_facts_for_mutation(subj)
+        if entity_facts is None:
+            missing_edits.add((subj, pred))
+            return
+        if kind == "del":
+            values = entity_facts.get(pred)
+            if values is not None and obj in values:
+                _clone_value_set_if_needed(subj, pred, entity_facts)
+                entity_facts[pred].discard(obj)
+            return
+
+        if pred in entity_facts:
+            _clone_value_set_if_needed(subj, pred, entity_facts)
+            entity_facts[pred].add(obj)
+        else:
+            entity_facts[pred] = {obj}
+            copied_value_sets.add((subj, pred))
+        _predicate_set_for_mutation(subj).add(pred)
+
+    add = candidate_slots[:3]
+    delete = candidate_slots[3:]
+    _apply("del", int(delete[0]), int(delete[1]), int(delete[2]))
+    _apply("add", int(add[0]), int(add[1]), int(add[2]))
+
+    return post_facts, post_predicates, missing_edits
+
+
 def _resolve_default_relations(encoder: GlobalIntEncoder | None) -> List[int]:
     if encoder is None:
         return []
@@ -482,6 +580,169 @@ class CandidateConstraintEvaluator:
         )
         return _metrics_from_details(details)
 
+    def evaluate_candidates_loss_terms(
+        self,
+        row: Any,
+        *,
+        candidates: Sequence[Sequence[int]],
+        gold_index: int,
+        primary_factor_index: int | None = None,
+        need_regression: bool = True,
+        need_primary: bool = False,
+    ) -> Tuple[List[float], List[float] | None]:
+        """
+        Compute only the chooser loss terms required by training.
+
+        Returns:
+            regression_rates: per-candidate secondary regression rates (zeros when disabled).
+            primary_flags: per-candidate primary satisfaction flags (or None when disabled).
+        """
+        candidate_count = len(candidates)
+        if candidate_count == 0:
+            return [], [] if need_primary else None
+        if not need_regression and not need_primary:
+            return [0.0] * candidate_count, None
+        if gold_index < 0 or gold_index >= candidate_count:
+            raise ValueError(
+                f"gold_index {gold_index} out of range for {candidate_count} candidates."
+            )
+
+        p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
+        p_local_set = set(p_local)
+        facts_by_entity, predicates_present = _build_facts_state(
+            row,
+            p_local=p_local,
+            assume_complete=self._assume_complete,
+            cast_int=self._use_encoded_ids,
+        )
+        subject = _coerce_value(getattr(row, "subject", 0), cast_int=self._use_encoded_ids)
+        predicate = _coerce_value(getattr(row, "predicate", 0), cast_int=self._use_encoded_ids)
+        obj = _coerce_value(getattr(row, "object", 0), cast_int=self._use_encoded_ids)
+        other_subject = _coerce_value(getattr(row, "other_subject", 0), cast_int=self._use_encoded_ids)
+        other_predicate = _coerce_value(getattr(row, "other_predicate", 0), cast_int=self._use_encoded_ids)
+        other_object = _coerce_value(getattr(row, "other_object", 0), cast_int=self._use_encoded_ids)
+
+        if self._constraint_scope == "focus":
+            constraint_ids_raw = getattr(row, "local_constraint_ids_focus", None)
+            if constraint_ids_raw is None:
+                constraint_ids_raw = getattr(row, "local_constraint_ids", None)
+        else:
+            constraint_ids_raw = getattr(row, "local_constraint_ids", None)
+        local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=self._use_encoded_ids)
+        if not local_constraint_ids:
+            zeros = [0.0] * candidate_count
+            return zeros, (list(zeros) if need_primary else None)
+
+        constraint_instances: List[ConstraintInstance | None] = [
+            self._get_constraint_instance(cid) for cid in local_constraint_ids
+        ]
+        resolved_primary_index = -1
+        if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
+            resolved_primary_index = int(primary_factor_index)
+        else:
+            constraint_id = _coerce_value(getattr(row, "constraint_id", None), cast_int=self._use_encoded_ids)
+            try:
+                resolved_primary_index = local_constraint_ids.index(constraint_id)
+            except ValueError:
+                resolved_primary_index = -1
+
+        primary_instance = (
+            constraint_instances[resolved_primary_index]
+            if 0 <= resolved_primary_index < len(constraint_instances)
+            else None
+        )
+
+        placeholder_map = _build_placeholder_map(self._encoder, row)
+
+        tracked_indices: List[int] = []
+        if need_regression:
+            gold_facts, gold_predicates, gold_missing = _build_post_state_for_candidate(
+                facts_by_entity,
+                predicates_present,
+                p_local,
+                candidate_slots=candidates[gold_index],
+                placeholder_map=placeholder_map,
+                assume_complete=self._assume_complete,
+            )
+            gold_state = EvidenceState(
+                facts_by_entity=gold_facts,
+                predicates_present=gold_predicates,
+                assume_complete=self._assume_complete,
+                missing_edits=gold_missing,
+                focus_subject=subject,
+                focus_predicate=predicate,
+                focus_object=obj,
+                other_subject=other_subject,
+                other_predicate=other_predicate,
+                other_object=other_object,
+            )
+            for idx, instance in enumerate(constraint_instances):
+                if idx == resolved_primary_index or instance is None:
+                    continue
+                checkable_post, satisfied_post = evaluate_constraint(gold_state, instance, p_local_set)
+                if checkable_post and satisfied_post:
+                    tracked_indices.append(idx)
+            if not tracked_indices and not need_primary:
+                return [0.0] * candidate_count, None
+
+        if need_primary and primary_instance is None and not need_regression:
+            zeros = [0.0] * candidate_count
+            return zeros, list(zeros)
+
+        regression_rates: List[float] = []
+        primary_flags: List[float] | None = [] if need_primary else None
+
+        for candidate_slots in candidates:
+            post_facts, post_predicates, missing_edits = _build_post_state_for_candidate(
+                facts_by_entity,
+                predicates_present,
+                p_local,
+                candidate_slots=candidate_slots,
+                placeholder_map=placeholder_map,
+                assume_complete=self._assume_complete,
+            )
+            post_state = EvidenceState(
+                facts_by_entity=post_facts,
+                predicates_present=post_predicates,
+                assume_complete=self._assume_complete,
+                missing_edits=missing_edits,
+                focus_subject=subject,
+                focus_predicate=predicate,
+                focus_object=obj,
+                other_subject=other_subject,
+                other_predicate=other_predicate,
+                other_object=other_object,
+            )
+
+            if need_regression:
+                regress = 0
+                denom = 0
+                for idx in tracked_indices:
+                    instance = constraint_instances[idx]
+                    if instance is None:
+                        continue
+                    checkable_post, satisfied_post = evaluate_constraint(post_state, instance, p_local_set)
+                    if not checkable_post:
+                        continue
+                    denom += 1
+                    if not satisfied_post:
+                        regress += 1
+                regression_rates.append(float(regress) / float(denom) if denom else 0.0)
+            else:
+                regression_rates.append(0.0)
+
+            if need_primary and primary_flags is not None:
+                primary_value = 0.0
+                if primary_instance is not None:
+                    checkable_post, satisfied_post = evaluate_constraint(
+                        post_state, primary_instance, p_local_set
+                    )
+                    if checkable_post:
+                        primary_value = float(satisfied_post)
+                primary_flags.append(primary_value)
+
+        return regression_rates, primary_flags
+
     def evaluate_full(
         self,
         row: Any,
@@ -490,6 +751,7 @@ class CandidateConstraintEvaluator:
         primary_factor_index: int | None = None,
     ) -> Dict[str, Any]:
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
+        p_local_set = set(p_local)
         facts_by_entity, predicates_present = _build_facts_state(
             row,
             p_local=p_local,
@@ -516,12 +778,10 @@ class CandidateConstraintEvaluator:
             other_object=other_object,
         )
 
-        post_facts = {ent: {pred: set(values) for pred, values in facts.items()} for ent, facts in facts_by_entity.items()}
-        post_predicates = {ent: set(preds) for ent, preds in predicates_present.items()}
         placeholder_map = _build_placeholder_map(self._encoder, row)
-        missing_edits = _apply_candidate_edit(
-            post_facts,
-            post_predicates,
+        post_facts, post_predicates, missing_edits = _build_post_state_for_candidate(
+            facts_by_entity,
+            predicates_present,
             p_local,
             candidate_slots=candidate_slots,
             placeholder_map=placeholder_map,
@@ -580,8 +840,8 @@ class CandidateConstraintEvaluator:
                 post_checkable.append(False)
                 post_satisfied.append(0)
                 continue
-            checkable_pre, satisfied_pre = evaluate_constraint(pre_state, instance, set(p_local))
-            checkable_post, satisfied_post = evaluate_constraint(post_state, instance, set(p_local))
+            checkable_pre, satisfied_pre = evaluate_constraint(pre_state, instance, p_local_set)
+            checkable_post, satisfied_post = evaluate_constraint(post_state, instance, p_local_set)
             pre_checkable.append(bool(checkable_pre))
             pre_satisfied.append(int(satisfied_pre))
             post_checkable.append(bool(checkable_post))
@@ -667,6 +927,7 @@ class CandidateConstraintEvaluator:
         if not candidates:
             return []
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
+        p_local_set = set(p_local)
         facts_by_entity, predicates_present = _build_facts_state(
             row,
             p_local=p_local,
@@ -733,7 +994,7 @@ class CandidateConstraintEvaluator:
                 pre_checkable.append(False)
                 pre_satisfied.append(0)
             else:
-                checkable_pre, satisfied_pre = evaluate_constraint(pre_state, instance, set(p_local))
+                checkable_pre, satisfied_pre = evaluate_constraint(pre_state, instance, p_local_set)
                 pre_checkable.append(bool(checkable_pre))
                 pre_satisfied.append(int(satisfied_pre))
 
@@ -751,14 +1012,9 @@ class CandidateConstraintEvaluator:
         results: List[Dict[str, Any]] = []
 
         for candidate_slots in candidates:
-            post_facts = {
-                ent: {pred: set(values) for pred, values in facts.items()}
-                for ent, facts in facts_by_entity.items()
-            }
-            post_predicates = {ent: set(preds) for ent, preds in predicates_present.items()}
-            missing_edits = _apply_candidate_edit(
-                post_facts,
-                post_predicates,
+            post_facts, post_predicates, missing_edits = _build_post_state_for_candidate(
+                facts_by_entity,
+                predicates_present,
                 p_local,
                 candidate_slots=candidate_slots,
                 placeholder_map=placeholder_map,
@@ -784,7 +1040,7 @@ class CandidateConstraintEvaluator:
                     post_checkable.append(False)
                     post_satisfied.append(0)
                 else:
-                    checkable_post, satisfied_post = evaluate_constraint(post_state, instance, set(p_local))
+                    checkable_post, satisfied_post = evaluate_constraint(post_state, instance, p_local_set)
                     post_checkable.append(bool(checkable_post))
                     post_satisfied.append(int(satisfied_post))
 
