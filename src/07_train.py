@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Iterator, cast
 
 import torch
 import torch.nn.functional as F
@@ -495,6 +495,49 @@ def train(
             return default
         return max(value, minimum)
 
+    prefetch_enabled = bool(
+        device.type == "cuda" and _env_flag("TRAIN_CUDA_PREFETCH", default=True)
+    )
+
+    def _iter_batches(loader: DataLoader) -> Iterator[tuple[Data, bool]]:
+        """
+        Yield `(batch, on_device)` where `on_device=True` indicates CUDA-prefetched
+        batches already moved to GPU.
+        """
+        if not prefetch_enabled:
+            for batch in loader:
+                yield batch, False
+            return
+
+        assert device.type == "cuda"
+        prefetch_stream = torch.cuda.Stream(device=device)
+        loader_iter = iter(loader)
+        next_batch: Data | None = None
+
+        def _preload_next() -> None:
+            nonlocal next_batch
+            try:
+                candidate = next(loader_iter)
+            except StopIteration:
+                next_batch = None
+                return
+            with torch.cuda.stream(prefetch_stream):
+                candidate = candidate.to(device, non_blocking=True)
+            next_batch = candidate
+
+        _preload_next()
+        while next_batch is not None:
+            torch.cuda.current_stream(device).wait_stream(prefetch_stream)
+            batch = next_batch
+            record_stream = getattr(batch, "record_stream", None)
+            if callable(record_stream):
+                record_stream(torch.cuda.current_stream(device))
+            _preload_next()
+            yield batch, True
+
+    if prefetch_enabled:
+        logger.info("CUDA batch prefetch enabled (env: TRAIN_CUDA_PREFETCH=1)")
+
     timing_enabled = _env_flag("TRAIN_TIMING_PROFILE", default=False)
     timing_warmup_batches = _env_int("TRAIN_TIMING_WARMUP_BATCHES", 10, minimum=0)
     timing_log_every = _env_int("TRAIN_TIMING_LOG_EVERY", 100, minimum=1)
@@ -591,10 +634,11 @@ def train(
         train_timing_epoch = _new_timing_bucket(train_timing_keys)
         train_timing_window_count = 0
         train_timing_epoch_count = 0
-        for batch_idx, data in enumerate(train_loader, start=1):
+        for batch_idx, (data, data_on_device) in enumerate(_iter_batches(train_loader), start=1):
             batch_t0 = time.perf_counter() if timing_enabled else 0.0
             phase_t0 = time.perf_counter() if timing_enabled else 0.0
-            data = data.to(device, non_blocking=True)
+            if not data_on_device:
+                data = data.to(device, non_blocking=True)
             if train_cfg.validate_factor_labels:
                 _assert_factor_labels_batch(data)
             targets = data.y.long()
@@ -1156,10 +1200,11 @@ def train(
 
         with torch.no_grad():
             val_last_logged_percent = 0
-            for batch_idx, data in enumerate(val_loader, start=1):
+            for batch_idx, (data, data_on_device) in enumerate(_iter_batches(val_loader), start=1):
                 batch_t0 = time.perf_counter() if timing_enabled else 0.0
                 phase_t0 = time.perf_counter() if timing_enabled else 0.0
-                data = data.to(device, non_blocking=True)
+                if not data_on_device:
+                    data = data.to(device, non_blocking=True)
                 if train_cfg.validate_factor_labels:
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
