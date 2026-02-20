@@ -798,6 +798,28 @@ def train(
                     if chooser_placeholder_ids is not None
                     else set(chooser_heuristics.placeholder_ids.values())
                 )
+                entity_allowed_ids = (
+                    model.entity_class_ids
+                    if hasattr(model, "entity_class_ids")
+                    and torch.is_tensor(getattr(model, "entity_class_ids"))
+                    and int(getattr(model, "entity_class_ids").numel()) < model.num_target_ids
+                    else None
+                )
+                predicate_allowed_ids = (
+                    model.predicate_class_ids
+                    if hasattr(model, "predicate_class_ids")
+                    and torch.is_tensor(getattr(model, "predicate_class_ids"))
+                    and int(getattr(model, "predicate_class_ids").numel()) < model.num_target_ids
+                    else None
+                )
+                chooser_slot_allowed_ids = (
+                    entity_allowed_ids,
+                    predicate_allowed_ids,
+                    entity_allowed_ids,
+                    entity_allowed_ids,
+                    predicate_allowed_ids,
+                    entity_allowed_ids,
+                )
                 chooser_losses = torch.zeros(
                     graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                 )
@@ -824,6 +846,7 @@ def train(
                         cfg=chooser_candidate_cfg,
                         placeholder_ids=placeholder_ids_for_candidates,
                         num_target_ids=model.num_target_ids,
+                        slot_allowed_ids=chooser_slot_allowed_ids,
                     )
                     candidate_groups.append(candidates)
                     gold_indices.append(gold_index)
@@ -1322,6 +1345,28 @@ def train(
                         if chooser_placeholder_ids is not None
                         else set(chooser_heuristics.placeholder_ids.values())
                     )
+                    entity_allowed_ids = (
+                        model.entity_class_ids
+                        if hasattr(model, "entity_class_ids")
+                        and torch.is_tensor(getattr(model, "entity_class_ids"))
+                        and int(getattr(model, "entity_class_ids").numel()) < model.num_target_ids
+                        else None
+                    )
+                    predicate_allowed_ids = (
+                        model.predicate_class_ids
+                        if hasattr(model, "predicate_class_ids")
+                        and torch.is_tensor(getattr(model, "predicate_class_ids"))
+                        and int(getattr(model, "predicate_class_ids").numel()) < model.num_target_ids
+                        else None
+                    )
+                    chooser_slot_allowed_ids = (
+                        entity_allowed_ids,
+                        predicate_allowed_ids,
+                        entity_allowed_ids,
+                        entity_allowed_ids,
+                        predicate_allowed_ids,
+                        entity_allowed_ids,
+                    )
                     chooser_losses = torch.zeros(
                         graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                     )
@@ -1348,6 +1393,7 @@ def train(
                             cfg=chooser_candidate_cfg,
                             placeholder_ids=placeholder_ids_for_candidates,
                             num_target_ids=model.num_target_ids,
+                            slot_allowed_ids=chooser_slot_allowed_ids,
                         )
                         candidate_groups.append(candidates)
                         gold_indices.append(gold_index)

@@ -89,18 +89,43 @@ def _topk_triples_from_logits(
     slots: tuple[int, int, int],
     topk_triples: int,
     topk_per_slot: int,
+    slot_allowed_ids: tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None] | None = None,
 ) -> list[tuple[int, int, int]]:
-    topk_per_slot = max(1, min(topk_per_slot, logits.size(-1)))
     slot_vals = []
     slot_ids = []
-    for slot in slots:
-        vals, ids = torch.topk(logits[slot], k=topk_per_slot)
+    for local_idx, slot in enumerate(slots):
+        allowed_ids = None if slot_allowed_ids is None else slot_allowed_ids[local_idx]
+        if allowed_ids is None:
+            k = max(1, min(topk_per_slot, logits.size(-1)))
+            vals, ids = torch.topk(logits[slot], k=k)
+        else:
+            allowed = allowed_ids
+            if allowed.device != logits.device:
+                allowed = allowed.to(device=logits.device)
+            if allowed.dtype != torch.long:
+                allowed = allowed.to(dtype=torch.long)
+            if allowed.numel() >= topk_per_slot and allowed.numel() > 0:
+                restricted = logits[slot].index_select(0, allowed)
+                k = max(1, min(topk_per_slot, restricted.size(0)))
+                vals_local, idx_local = torch.topk(restricted, k=k)
+                ids = allowed.index_select(0, idx_local)
+                vals = vals_local
+            else:
+                # Preserve legacy behavior when the allowed-id set is too small:
+                # old logic would still return top-k over full vocabulary.
+                k = max(1, min(topk_per_slot, logits.size(-1)))
+                vals, ids = torch.topk(logits[slot], k=k)
         slot_vals.append(vals.cpu())
         slot_ids.append(ids.cpu())
+    if len(slot_vals) != 3:
+        return []
+    k_combos = min(len(slot_vals[0]), len(slot_vals[1]), len(slot_vals[2]))
+    if k_combos <= 0:
+        return []
     combos: list[tuple[float, int, int, int]] = []
-    for i in range(topk_per_slot):
-        for j in range(topk_per_slot):
-            for k in range(topk_per_slot):
+    for i in range(k_combos):
+        for j in range(k_combos):
+            for k in range(k_combos):
                 score = float(slot_vals[0][i] + slot_vals[1][j] + slot_vals[2][k])
                 combos.append((score, int(slot_ids[0][i]), int(slot_ids[1][j]), int(slot_ids[2][k])))
     combos.sort(key=lambda x: x[0], reverse=True)
@@ -116,6 +141,15 @@ def build_candidates(
     cfg: CandidateConfig,
     placeholder_ids: set[int],
     num_target_ids: int,
+    slot_allowed_ids: tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]
+    | None = None,
 ) -> tuple[list[tuple[int, int, int, int, int, int]], int]:
     candidates: list[tuple[int, int, int, int, int, int]] = []
 
@@ -147,12 +181,18 @@ def build_candidates(
         slots=add_slots,
         topk_triples=cfg.topk_candidates,
         topk_per_slot=cfg.topk_per_slot,
+        slot_allowed_ids=(slot_allowed_ids[0], slot_allowed_ids[1], slot_allowed_ids[2])
+        if slot_allowed_ids is not None
+        else None,
     )
     del_topk = _topk_triples_from_logits(
         proposal_logits,
         slots=del_slots,
         topk_triples=cfg.topk_candidates,
         topk_per_slot=cfg.topk_per_slot,
+        slot_allowed_ids=(slot_allowed_ids[3], slot_allowed_ids[4], slot_allowed_ids[5])
+        if slot_allowed_ids is not None
+        else None,
     )
     candidates.extend(candidate_from_triple(triple, action="add") for triple in add_topk)
     candidates.extend(candidate_from_triple(triple, action="delete") for triple in del_topk)
