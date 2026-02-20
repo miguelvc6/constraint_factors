@@ -677,6 +677,9 @@ def train(
         "fix_s",
         "factor_s",
         "chooser_s",
+        "chooser_candidate_build_s",
+        "chooser_packed_score_s",
+        "chooser_evaluator_terms_s",
         "reweight_s",
         "backward_s",
         "optim_s",
@@ -691,6 +694,9 @@ def train(
         "fix_s",
         "factor_s",
         "chooser_s",
+        "chooser_candidate_build_s",
+        "chooser_packed_score_s",
+        "chooser_evaluator_terms_s",
         "metrics_s",
         "total_s",
     )
@@ -846,6 +852,9 @@ def train(
             fix_s = 0.0
             factor_s = 0.0
             chooser_s = 0.0
+            chooser_candidate_build_s = 0.0
+            chooser_packed_score_s = 0.0
+            chooser_evaluator_terms_s = 0.0
             reweight_s = 0.0
 
             if policy_enabled:
@@ -1029,6 +1038,7 @@ def train(
                 primary_indices: list[int] = []
                 packed_candidates: list[tuple[int, int, int, int, int, int]] = []
                 packed_graph_index: list[int] = []
+                chooser_build_t0 = time.perf_counter() if timing_enabled else 0.0
                 for idx, context_index in enumerate(batch_context_indices):
                     if context_index >= len(chooser_train_contexts) or context_index >= len(chooser_train_rows):
                         raise RuntimeError("Chooser context index out of bounds.")
@@ -1067,10 +1077,12 @@ def train(
                     primary_indices.append(primary_index)
                     packed_candidates.extend(candidates)
                     packed_graph_index.extend([idx] * len(candidates))
+                chooser_candidate_build_s = (time.perf_counter() - chooser_build_t0) if timing_enabled else 0.0
 
                 if not packed_candidates:
                     raise RuntimeError("Chooser produced no candidates for the current batch.")
 
+                chooser_score_t0 = time.perf_counter() if timing_enabled else 0.0
                 packed_candidate_tensor = torch.tensor(
                     packed_candidates, dtype=torch.long, device=graph_loss.device
                 )
@@ -1080,7 +1092,9 @@ def train(
                 packed_scores = model.score_candidates_packed(
                     graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                 )
+                chooser_packed_score_s = (time.perf_counter() - chooser_score_t0) if timing_enabled else 0.0
 
+                chooser_eval_t0 = time.perf_counter() if timing_enabled else 0.0
                 offset = 0
                 for idx, candidates in enumerate(candidate_groups):
                     candidate_count = len(candidates)
@@ -1133,6 +1147,7 @@ def train(
                             primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                             chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
                     chooser_losses[idx] = chooser_loss
+                chooser_evaluator_terms_s = (time.perf_counter() - chooser_eval_t0) if timing_enabled else 0.0
                 assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
 
                 graph_loss = graph_loss + chooser_losses
@@ -1233,6 +1248,9 @@ def train(
                     "fix_s": fix_s,
                     "factor_s": factor_s,
                     "chooser_s": chooser_s,
+                    "chooser_candidate_build_s": chooser_candidate_build_s,
+                    "chooser_packed_score_s": chooser_packed_score_s,
+                    "chooser_evaluator_terms_s": chooser_evaluator_terms_s,
                     "reweight_s": reweight_s,
                     "backward_s": backward_s,
                     "optim_s": optim_s,
@@ -1286,7 +1304,7 @@ def train(
                 )
             if timing_enabled and train_timing_window_count >= timing_log_every:
                 logger.info(
-                    "Epoch %s train timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
+                    "Epoch %s train timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
                     epoch + 1,
                     batch_idx,
                     train_timing_window_count,
@@ -1294,6 +1312,9 @@ def train(
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "forward_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "base_loss_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_candidate_build_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_packed_score_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_evaluator_terms_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "factor_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "policy_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "fix_s"),
@@ -1322,7 +1343,7 @@ def train(
         train_policy_acc = 100 * train_policy_correct / max(train_policy_count, 1)
         if timing_enabled and train_timing_epoch_count > 0:
             logger.info(
-                "Epoch %s train timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
+                "Epoch %s train timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
                 epoch + 1,
                 train_timing_epoch_count,
                 timing_warmup_batches,
@@ -1330,6 +1351,9 @@ def train(
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "forward_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "base_loss_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_candidate_build_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_packed_score_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_evaluator_terms_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "factor_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "policy_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "fix_s"),
@@ -1407,6 +1431,9 @@ def train(
                 fix_s = 0.0
                 factor_s = 0.0
                 chooser_s = 0.0
+                chooser_candidate_build_s = 0.0
+                chooser_packed_score_s = 0.0
+                chooser_evaluator_terms_s = 0.0
 
                 if policy_enabled:
                     phase_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -1588,6 +1615,7 @@ def train(
                     primary_indices: list[int] = []
                     packed_candidates: list[tuple[int, int, int, int, int, int]] = []
                     packed_graph_index: list[int] = []
+                    chooser_build_t0 = time.perf_counter() if timing_enabled else 0.0
                     for idx, context_index in enumerate(batch_context_indices):
                         if context_index >= len(chooser_val_contexts) or context_index >= len(chooser_val_rows):
                             raise RuntimeError("Chooser context index out of bounds.")
@@ -1626,10 +1654,12 @@ def train(
                         primary_indices.append(primary_index)
                         packed_candidates.extend(candidates)
                         packed_graph_index.extend([idx] * len(candidates))
+                    chooser_candidate_build_s = (time.perf_counter() - chooser_build_t0) if timing_enabled else 0.0
 
                     if not packed_candidates:
                         raise RuntimeError("Chooser produced no candidates for the current validation batch.")
 
+                    chooser_score_t0 = time.perf_counter() if timing_enabled else 0.0
                     packed_candidate_tensor = torch.tensor(
                         packed_candidates, dtype=torch.long, device=graph_loss.device
                     )
@@ -1639,7 +1669,9 @@ def train(
                     packed_scores = model.score_candidates_packed(
                         graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                     )
+                    chooser_packed_score_s = (time.perf_counter() - chooser_score_t0) if timing_enabled else 0.0
 
+                    chooser_eval_t0 = time.perf_counter() if timing_enabled else 0.0
                     offset = 0
                     for idx, candidates in enumerate(candidate_groups):
                         candidate_count = len(candidates)
@@ -1692,6 +1724,7 @@ def train(
                                 primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                                 chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
                         chooser_losses[idx] = chooser_loss
+                    chooser_evaluator_terms_s = (time.perf_counter() - chooser_eval_t0) if timing_enabled else 0.0
                     assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
 
                     graph_loss = graph_loss + chooser_losses
@@ -1747,6 +1780,9 @@ def train(
                         "fix_s": fix_s,
                         "factor_s": factor_s,
                         "chooser_s": chooser_s,
+                        "chooser_candidate_build_s": chooser_candidate_build_s,
+                        "chooser_packed_score_s": chooser_packed_score_s,
+                        "chooser_evaluator_terms_s": chooser_evaluator_terms_s,
                         "metrics_s": metrics_s,
                         "total_s": time.perf_counter() - batch_t0,
                     }
@@ -1813,7 +1849,7 @@ def train(
                     )
                 if timing_enabled and val_timing_window_count >= timing_log_every:
                     logger.info(
-                        "Epoch %s val timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
+                        "Epoch %s val timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
                         epoch + 1,
                         batch_idx,
                         val_timing_window_count,
@@ -1821,6 +1857,9 @@ def train(
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "forward_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "base_loss_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_candidate_build_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_packed_score_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_evaluator_terms_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "factor_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "policy_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "fix_s"),
@@ -1846,7 +1885,7 @@ def train(
         val_policy_acc = 100 * val_policy_correct / max(val_policy_count, 1)
         if timing_enabled and val_timing_epoch_count > 0:
             logger.info(
-                "Epoch %s val timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
+                "Epoch %s val timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
                 epoch + 1,
                 val_timing_epoch_count,
                 timing_warmup_batches,
@@ -1854,6 +1893,9 @@ def train(
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "forward_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "base_loss_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_candidate_build_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_packed_score_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_evaluator_terms_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "factor_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "policy_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "fix_s"),
