@@ -32,6 +32,20 @@ def gold_candidate(graph: Data) -> tuple[int, int, int, int, int, int]:
     return tuple(int(v) for v in y.tolist())
 
 
+def _coerce_gold_candidate(
+    *,
+    graph: Data | None,
+    gold_slots: Sequence[int] | None,
+) -> tuple[int, int, int, int, int, int]:
+    if gold_slots is not None:
+        if len(gold_slots) != NUM_SLOTS:
+            raise ValueError(f"Expected gold_slots length {NUM_SLOTS}, got {len(gold_slots)}")
+        return tuple(int(v) for v in gold_slots)
+    if graph is None:
+        raise ValueError("Either graph or gold_slots must be provided to build_candidates().")
+    return gold_candidate(graph)
+
+
 def candidate_from_triple(triple: tuple[int, int, int], *, action: str) -> tuple[int, int, int, int, int, int]:
     if action == "add":
         return (triple[0], triple[1], triple[2], 0, 0, 0)
@@ -134,7 +148,8 @@ def _topk_triples_from_logits(
 
 def build_candidates(
     *,
-    graph: Data,
+    graph: Data | None = None,
+    gold_slots: Sequence[int] | None = None,
     context: ViolationContext,
     heuristics: ConstraintRepairHeuristics,
     proposal_logits: torch.Tensor,
@@ -152,9 +167,10 @@ def build_candidates(
     | None = None,
 ) -> tuple[list[tuple[int, int, int, int, int, int]], int]:
     candidates: list[tuple[int, int, int, int, int, int]] = []
+    gold = _coerce_gold_candidate(graph=graph, gold_slots=gold_slots)
 
     if cfg.include_gold:
-        candidates.append(gold_candidate(graph))
+        candidates.append(gold)
 
     candidate_map = heuristics.candidates_for(context)
     add_triples = _instantiate_patterns(
@@ -209,7 +225,6 @@ def build_candidates(
         if len(deduped) >= cfg.max_candidates_total:
             break
 
-    gold = gold_candidate(graph)
     if any(v < 0 or v >= num_target_ids for v in gold):
         raise ValueError("Gold candidate contains out-of-range ids for target vocabulary.")
     if gold not in seen:

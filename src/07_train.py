@@ -313,6 +313,56 @@ def _log_factor_debug(
         )
 
 
+def _batch_int_attr(
+    data: Data,
+    attr_name: str,
+    batch_size: int,
+    *,
+    default_value: int = 0,
+    default_to_batch_index: bool = False,
+) -> list[int]:
+    """
+    Convert a batched graph attribute into a Python `list[int]` of length `batch_size`.
+    """
+    raw = getattr(data, attr_name, None)
+    if raw is None:
+        if default_to_batch_index:
+            return list(range(batch_size))
+        return [int(default_value)] * batch_size
+
+    if torch.is_tensor(raw):
+        raw_tensor = raw.detach().view(-1)
+        # PyG increments attributes whose key contains "index" during batching.
+        # Recover per-graph scalar values by subtracting node-prefix offsets.
+        if "index" in attr_name and raw_tensor.numel() == batch_size:
+            ptr = getattr(data, "ptr", None)
+            if torch.is_tensor(ptr) and ptr.numel() == batch_size + 1:
+                ptr_offsets = ptr.detach().to(device=raw_tensor.device, dtype=raw_tensor.dtype)[:-1]
+                raw_tensor = raw_tensor - ptr_offsets
+        flat = raw_tensor.cpu().tolist()
+    elif isinstance(raw, (list, tuple)):
+        flat = list(raw)
+    else:
+        flat = [raw]
+
+    if len(flat) != batch_size:
+        if len(flat) == 1 and batch_size == 1:
+            pass
+        else:
+            raise RuntimeError(
+                f"Batched attribute '{attr_name}' length {len(flat)} does not match batch size {batch_size}."
+            )
+
+    values: list[int] = []
+    for idx, item in enumerate(flat):
+        fallback = idx if default_to_batch_index else int(default_value)
+        try:
+            values.append(int(item))
+        except (TypeError, ValueError):
+            values.append(fallback)
+    return values
+
+
 def train(
     model: BaseGraphModel,
     train_data: list[Data] | GraphStreamDataset,
@@ -597,6 +647,37 @@ def train(
         "val_acc_slot": [],
     }
 
+    chooser_loss_mode = chooser_cfg.loss_mode
+    chooser_need_regression = chooser_loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
+    chooser_need_primary = chooser_cfg.gamma_primary > 0
+    chooser_placeholder_ids_for_candidates = (
+        chooser_placeholder_ids
+        if chooser_placeholder_ids is not None
+        else (set(chooser_heuristics.placeholder_ids.values()) if chooser_heuristics is not None else set())
+    )
+    chooser_entity_allowed_ids = (
+        model.entity_class_ids
+        if hasattr(model, "entity_class_ids")
+        and torch.is_tensor(getattr(model, "entity_class_ids"))
+        and int(getattr(model, "entity_class_ids").numel()) < model.num_target_ids
+        else None
+    )
+    chooser_predicate_allowed_ids = (
+        model.predicate_class_ids
+        if hasattr(model, "predicate_class_ids")
+        and torch.is_tensor(getattr(model, "predicate_class_ids"))
+        and int(getattr(model, "predicate_class_ids").numel()) < model.num_target_ids
+        else None
+    )
+    chooser_slot_allowed_ids = (
+        chooser_entity_allowed_ids,
+        chooser_predicate_allowed_ids,
+        chooser_entity_allowed_ids,
+        chooser_entity_allowed_ids,
+        chooser_predicate_allowed_ids,
+        chooser_entity_allowed_ids,
+    )
+
     logger.info("Starting training loop for %d epochs", num_epochs)
     epoch_iter = progress_bar(range(num_epochs), desc="Training Epochs", leave=True)
     sanity_checked = False
@@ -697,17 +778,19 @@ def train(
                     raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
                 if policy_train_contexts is None:
                     raise RuntimeError("Policy choice enabled but training contexts are missing.")
-                graphs = data.to_data_list()
+                batch_context_indices = _batch_int_attr(
+                    data,
+                    "context_index",
+                    graph_loss.size(0),
+                    default_to_batch_index=True,
+                )
+                targets_rows = targets.detach().cpu().tolist()
                 policy_labels = []
-                for idx, graph in enumerate(graphs):
-                    context_index = int(getattr(graph, "context_index", idx))
+                for idx, context_index in enumerate(batch_context_indices):
                     if context_index >= len(policy_train_contexts):
                         raise RuntimeError("Policy context index out of bounds.")
                     context = policy_train_contexts[context_index]
-                    gold = graph.y
-                    if gold.dim() == 2:
-                        gold = gold[0]
-                    decision = derive_policy_label(gold.tolist(), context, none_class=NONE_CLASS_INDEX)
+                    decision = derive_policy_label(targets_rows[idx], context, none_class=NONE_CLASS_INDEX)
                     policy_labels.append(int(decision.policy_id))
                 policy_targets = torch.tensor(policy_labels, dtype=torch.long, device=graph_loss.device)
                 policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets, reduction="none")
@@ -721,21 +804,27 @@ def train(
             fix_weight = 0.0
             if fix_scheduler and fix_scheduler.enabled and fix_heuristics is not None and train_contexts is not None:
                 phase_t0 = time.perf_counter() if timing_enabled else 0.0
-                context_tensor = getattr(data, "context_index", None)
-                if context_tensor is not None:
-                    context_indices = context_tensor.detach().cpu().tolist()
-                    if len(context_indices) == graph_loss.size(0):
-                        batch_contexts = [train_contexts[int(idx)] for idx in context_indices]
-                        if train_total_batches:
-                            batch_progress = (batch_idx - 1) / max(train_total_batches, 1)
-                        else:
-                            batch_progress = 0.0
-                        progress = epoch + max(batch_progress, 0.0)
-                        fix_weight = fix_scheduler.weight_for_progress(progress)
-                        if fix_weight > 0.0:
-                            fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
-                            fix_penalty = 1.0 - fix_probs
-                            graph_loss = graph_loss + fix_weight * fix_penalty
+                context_attr = getattr(data, "context_index", None)
+                if context_attr is not None:
+                    context_indices = _batch_int_attr(
+                        data,
+                        "context_index",
+                        graph_loss.size(0),
+                        default_to_batch_index=True,
+                    )
+                    if any(idx < 0 or idx >= len(train_contexts) for idx in context_indices):
+                        raise RuntimeError("Fix-loss context index out of bounds.")
+                    batch_contexts = [train_contexts[idx] for idx in context_indices]
+                    if train_total_batches:
+                        batch_progress = (batch_idx - 1) / max(train_total_batches, 1)
+                    else:
+                        batch_progress = 0.0
+                    progress = epoch + max(batch_progress, 0.0)
+                    fix_weight = fix_scheduler.weight_for_progress(progress)
+                    if fix_weight > 0.0:
+                        fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
+                        fix_penalty = 1.0 - fix_probs
+                        graph_loss = graph_loss + fix_weight * fix_penalty
                 fix_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             # Optional - Factor satisfaction loss (pre-state)
@@ -833,37 +922,21 @@ def train(
                 graph_emb = outputs.get("graph_emb")
                 if graph_emb is None:
                     raise RuntimeError("Model output missing graph_emb required for chooser.")
-                graphs = data.to_data_list()
-                loss_mode = chooser_cfg.loss_mode
-                need_regression = loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
-                need_primary = chooser_cfg.gamma_primary > 0
-                placeholder_ids_for_candidates = (
-                    chooser_placeholder_ids
-                    if chooser_placeholder_ids is not None
-                    else set(chooser_heuristics.placeholder_ids.values())
+                if chooser_train_contexts is None or chooser_train_rows is None:
+                    raise RuntimeError("Chooser enabled but training contexts/rows are missing.")
+                batch_context_indices = _batch_int_attr(
+                    data,
+                    "context_index",
+                    graph_loss.size(0),
+                    default_to_batch_index=True,
                 )
-                entity_allowed_ids = (
-                    model.entity_class_ids
-                    if hasattr(model, "entity_class_ids")
-                    and torch.is_tensor(getattr(model, "entity_class_ids"))
-                    and int(getattr(model, "entity_class_ids").numel()) < model.num_target_ids
-                    else None
+                batch_primary_indices = _batch_int_attr(
+                    data,
+                    "primary_factor_index",
+                    graph_loss.size(0),
+                    default_value=0,
                 )
-                predicate_allowed_ids = (
-                    model.predicate_class_ids
-                    if hasattr(model, "predicate_class_ids")
-                    and torch.is_tensor(getattr(model, "predicate_class_ids"))
-                    and int(getattr(model, "predicate_class_ids").numel()) < model.num_target_ids
-                    else None
-                )
-                chooser_slot_allowed_ids = (
-                    entity_allowed_ids,
-                    predicate_allowed_ids,
-                    entity_allowed_ids,
-                    entity_allowed_ids,
-                    predicate_allowed_ids,
-                    entity_allowed_ids,
-                )
+                gold_rows = targets.detach().cpu().tolist()
                 chooser_losses = torch.zeros(
                     graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                 )
@@ -873,22 +946,19 @@ def train(
                 primary_indices: list[int] = []
                 packed_candidates: list[tuple[int, int, int, int, int, int]] = []
                 packed_graph_index: list[int] = []
-                for idx, graph in enumerate(graphs):
-                    context_index = int(getattr(graph, "context_index", idx))
-                    if chooser_train_contexts is None or chooser_train_rows is None:
-                        raise RuntimeError("Chooser enabled but training contexts/rows are missing.")
+                for idx, context_index in enumerate(batch_context_indices):
                     if context_index >= len(chooser_train_contexts) or context_index >= len(chooser_train_rows):
                         raise RuntimeError("Chooser context index out of bounds.")
                     context = chooser_train_contexts[context_index]
                     row = chooser_train_rows[context_index]
-                    primary_index = int(getattr(graph, "primary_factor_index", 0))
+                    primary_index = int(batch_primary_indices[idx])
                     candidates, gold_index = build_candidates(
-                        graph=graph,
+                        gold_slots=gold_rows[idx],
                         context=context,
                         heuristics=chooser_heuristics,
                         proposal_logits=out[idx].detach(),
                         cfg=chooser_candidate_cfg,
-                        placeholder_ids=placeholder_ids_for_candidates,
+                        placeholder_ids=chooser_placeholder_ids_for_candidates,
                         num_target_ids=model.num_target_ids,
                         slot_allowed_ids=chooser_slot_allowed_ids,
                     )
@@ -912,24 +982,52 @@ def train(
                     graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                 )
 
+                global_fix_satisfaction: list[list[float] | None] = []
+                regression_cache: list[list[float] | None] = []
+                primary_cache: list[list[float] | None] = []
+                if chooser_loss_mode == "global_fix":
+                    for idx, candidates in enumerate(candidate_groups):
+                        details = chooser_evaluator.evaluate_candidates(
+                            candidate_rows[idx],
+                            candidates=candidates,
+                            primary_factor_index=primary_indices[idx],
+                        )
+                        global_fix_satisfaction.append(
+                            [float(d.get("global_satisfied_fraction", 0.0)) for d in details]
+                        )
+                        regression_cache.append(None)
+                        primary_cache.append(None)
+                else:
+                    for idx, candidates in enumerate(candidate_groups):
+                        if chooser_need_regression or chooser_need_primary:
+                            regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                                candidate_rows[idx],
+                                candidates=candidates,
+                                gold_index=gold_indices[idx],
+                                primary_factor_index=primary_indices[idx],
+                                need_regression=chooser_need_regression,
+                                need_primary=chooser_need_primary,
+                            )
+                        else:
+                            regression_rates, primary_flags = None, None
+                        global_fix_satisfaction.append(None)
+                        regression_cache.append(regression_rates)
+                        primary_cache.append(primary_flags)
+
                 offset = 0
                 for idx, candidates in enumerate(candidate_groups):
                     candidate_count = len(candidates)
                     scores = packed_scores[offset : offset + candidate_count]
                     offset += candidate_count
-                    row = candidate_rows[idx]
                     gold_index = gold_indices[idx]
-                    primary_index = primary_indices[idx]
                     log_probs = F.log_softmax(scores, dim=0)
                     probs = log_probs.exp()
-                    if loss_mode == "global_fix":
-                        details = chooser_evaluator.evaluate_candidates(
-                            row,
-                            candidates=candidates,
-                            primary_factor_index=primary_index,
-                        )
+                    if chooser_loss_mode == "global_fix":
+                        details = global_fix_satisfaction[idx]
+                        if details is None:
+                            raise RuntimeError("Missing chooser global-fix cache entry.")
                         satisfaction = torch.tensor(
-                            [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
+                            details,
                             dtype=graph_loss.dtype,
                             device=graph_loss.device,
                         )
@@ -937,18 +1035,9 @@ def train(
                     else:
                         ce_loss = -log_probs[gold_index]
                         chooser_loss = ce_loss
-                        regression_rates: list[float] | None = None
-                        primary_flags: list[float] | None = None
-                        if need_regression or need_primary:
-                            regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
-                                row,
-                                candidates=candidates,
-                                gold_index=gold_index,
-                                primary_factor_index=primary_index,
-                                need_regression=need_regression,
-                                need_primary=need_primary,
-                            )
-                        if need_regression and regression_rates is not None:
+                        regression_rates = regression_cache[idx]
+                        primary_flags = primary_cache[idx]
+                        if chooser_need_regression and regression_rates is not None:
                             regression_tensor = torch.tensor(
                                 regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
                             )
@@ -957,7 +1046,7 @@ def train(
                                 probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
                             )
                             chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
-                        if need_primary and primary_flags is not None:
+                        if chooser_need_primary and primary_flags is not None:
                             primary_tensor = torch.tensor(
                                 primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
                             )
@@ -1246,17 +1335,19 @@ def train(
                         raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
                     if policy_val_contexts is None:
                         raise RuntimeError("Policy choice enabled but validation contexts are missing.")
-                    graphs = data.to_data_list()
+                    batch_context_indices = _batch_int_attr(
+                        data,
+                        "context_index",
+                        graph_loss.size(0),
+                        default_to_batch_index=True,
+                    )
+                    targets_rows = targets.detach().cpu().tolist()
                     policy_labels = []
-                    for idx, graph in enumerate(graphs):
-                        context_index = int(getattr(graph, "context_index", idx))
+                    for idx, context_index in enumerate(batch_context_indices):
                         if context_index >= len(policy_val_contexts):
                             raise RuntimeError("Policy context index out of bounds.")
                         context = policy_val_contexts[context_index]
-                        gold = graph.y
-                        if gold.dim() == 2:
-                            gold = gold[0]
-                        decision = derive_policy_label(gold.tolist(), context, none_class=NONE_CLASS_INDEX)
+                        decision = derive_policy_label(targets_rows[idx], context, none_class=NONE_CLASS_INDEX)
                         policy_labels.append(int(decision.policy_id))
                     policy_targets = torch.tensor(policy_labels, dtype=torch.long, device=graph_loss.device)
                     policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets, reduction="none")
@@ -1274,16 +1365,22 @@ def train(
                     and val_contexts is not None
                 ):
                     phase_t0 = time.perf_counter() if timing_enabled else 0.0
-                    context_tensor = getattr(data, "context_index", None)
-                    if context_tensor is not None:
-                        context_indices = context_tensor.detach().cpu().tolist()
-                        if len(context_indices) == graph_loss.size(0):
-                            batch_contexts = [val_contexts[int(idx)] for idx in context_indices]
-                            progress = epoch + 1.0
-                            fix_weight = fix_scheduler.weight_for_progress(progress)
-                            if fix_weight > 0.0:
-                                fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
-                                graph_loss = graph_loss + fix_weight * (1.0 - fix_probs)
+                    context_attr = getattr(data, "context_index", None)
+                    if context_attr is not None:
+                        context_indices = _batch_int_attr(
+                            data,
+                            "context_index",
+                            graph_loss.size(0),
+                            default_to_batch_index=True,
+                        )
+                        if any(idx < 0 or idx >= len(val_contexts) for idx in context_indices):
+                            raise RuntimeError("Fix-loss context index out of bounds.")
+                        batch_contexts = [val_contexts[idx] for idx in context_indices]
+                        progress = epoch + 1.0
+                        fix_weight = fix_scheduler.weight_for_progress(progress)
+                        if fix_weight > 0.0:
+                            fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
+                            graph_loss = graph_loss + fix_weight * (1.0 - fix_probs)
                     fix_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
                 # Optional - Factor satisfaction loss (pre-state)
@@ -1381,37 +1478,21 @@ def train(
                     graph_emb = outputs.get("graph_emb")
                     if graph_emb is None:
                         raise RuntimeError("Model output missing graph_emb required for chooser.")
-                    graphs = data.to_data_list()
-                    loss_mode = chooser_cfg.loss_mode
-                    need_regression = loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
-                    need_primary = chooser_cfg.gamma_primary > 0
-                    placeholder_ids_for_candidates = (
-                        chooser_placeholder_ids
-                        if chooser_placeholder_ids is not None
-                        else set(chooser_heuristics.placeholder_ids.values())
+                    if chooser_val_contexts is None or chooser_val_rows is None:
+                        raise RuntimeError("Chooser enabled but validation contexts/rows are missing.")
+                    batch_context_indices = _batch_int_attr(
+                        data,
+                        "context_index",
+                        graph_loss.size(0),
+                        default_to_batch_index=True,
                     )
-                    entity_allowed_ids = (
-                        model.entity_class_ids
-                        if hasattr(model, "entity_class_ids")
-                        and torch.is_tensor(getattr(model, "entity_class_ids"))
-                        and int(getattr(model, "entity_class_ids").numel()) < model.num_target_ids
-                        else None
+                    batch_primary_indices = _batch_int_attr(
+                        data,
+                        "primary_factor_index",
+                        graph_loss.size(0),
+                        default_value=0,
                     )
-                    predicate_allowed_ids = (
-                        model.predicate_class_ids
-                        if hasattr(model, "predicate_class_ids")
-                        and torch.is_tensor(getattr(model, "predicate_class_ids"))
-                        and int(getattr(model, "predicate_class_ids").numel()) < model.num_target_ids
-                        else None
-                    )
-                    chooser_slot_allowed_ids = (
-                        entity_allowed_ids,
-                        predicate_allowed_ids,
-                        entity_allowed_ids,
-                        entity_allowed_ids,
-                        predicate_allowed_ids,
-                        entity_allowed_ids,
-                    )
+                    gold_rows = targets.detach().cpu().tolist()
                     chooser_losses = torch.zeros(
                         graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                     )
@@ -1421,22 +1502,19 @@ def train(
                     primary_indices: list[int] = []
                     packed_candidates: list[tuple[int, int, int, int, int, int]] = []
                     packed_graph_index: list[int] = []
-                    for idx, graph in enumerate(graphs):
-                        context_index = int(getattr(graph, "context_index", idx))
-                        if chooser_val_contexts is None or chooser_val_rows is None:
-                            raise RuntimeError("Chooser enabled but validation contexts/rows are missing.")
+                    for idx, context_index in enumerate(batch_context_indices):
                         if context_index >= len(chooser_val_contexts) or context_index >= len(chooser_val_rows):
                             raise RuntimeError("Chooser context index out of bounds.")
                         context = chooser_val_contexts[context_index]
                         row = chooser_val_rows[context_index]
-                        primary_index = int(getattr(graph, "primary_factor_index", 0))
+                        primary_index = int(batch_primary_indices[idx])
                         candidates, gold_index = build_candidates(
-                            graph=graph,
+                            gold_slots=gold_rows[idx],
                             context=context,
                             heuristics=chooser_heuristics,
                             proposal_logits=out[idx].detach(),
                             cfg=chooser_candidate_cfg,
-                            placeholder_ids=placeholder_ids_for_candidates,
+                            placeholder_ids=chooser_placeholder_ids_for_candidates,
                             num_target_ids=model.num_target_ids,
                             slot_allowed_ids=chooser_slot_allowed_ids,
                         )
@@ -1460,24 +1538,52 @@ def train(
                         graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                     )
 
+                    global_fix_satisfaction: list[list[float] | None] = []
+                    regression_cache: list[list[float] | None] = []
+                    primary_cache: list[list[float] | None] = []
+                    if chooser_loss_mode == "global_fix":
+                        for idx, candidates in enumerate(candidate_groups):
+                            details = chooser_evaluator.evaluate_candidates(
+                                candidate_rows[idx],
+                                candidates=candidates,
+                                primary_factor_index=primary_indices[idx],
+                            )
+                            global_fix_satisfaction.append(
+                                [float(d.get("global_satisfied_fraction", 0.0)) for d in details]
+                            )
+                            regression_cache.append(None)
+                            primary_cache.append(None)
+                    else:
+                        for idx, candidates in enumerate(candidate_groups):
+                            if chooser_need_regression or chooser_need_primary:
+                                regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                                    candidate_rows[idx],
+                                    candidates=candidates,
+                                    gold_index=gold_indices[idx],
+                                    primary_factor_index=primary_indices[idx],
+                                    need_regression=chooser_need_regression,
+                                    need_primary=chooser_need_primary,
+                                )
+                            else:
+                                regression_rates, primary_flags = None, None
+                            global_fix_satisfaction.append(None)
+                            regression_cache.append(regression_rates)
+                            primary_cache.append(primary_flags)
+
                     offset = 0
                     for idx, candidates in enumerate(candidate_groups):
                         candidate_count = len(candidates)
                         scores = packed_scores[offset : offset + candidate_count]
                         offset += candidate_count
-                        row = candidate_rows[idx]
                         gold_index = gold_indices[idx]
-                        primary_index = primary_indices[idx]
                         log_probs = F.log_softmax(scores, dim=0)
                         probs = log_probs.exp()
-                        if loss_mode == "global_fix":
-                            details = chooser_evaluator.evaluate_candidates(
-                                row,
-                                candidates=candidates,
-                                primary_factor_index=primary_index,
-                            )
+                        if chooser_loss_mode == "global_fix":
+                            details = global_fix_satisfaction[idx]
+                            if details is None:
+                                raise RuntimeError("Missing chooser global-fix cache entry.")
                             satisfaction = torch.tensor(
-                                [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
+                                details,
                                 dtype=graph_loss.dtype,
                                 device=graph_loss.device,
                             )
@@ -1485,18 +1591,9 @@ def train(
                         else:
                             ce_loss = -log_probs[gold_index]
                             chooser_loss = ce_loss
-                            regression_rates: list[float] | None = None
-                            primary_flags: list[float] | None = None
-                            if need_regression or need_primary:
-                                regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
-                                    row,
-                                    candidates=candidates,
-                                    gold_index=gold_index,
-                                    primary_factor_index=primary_index,
-                                    need_regression=need_regression,
-                                    need_primary=need_primary,
-                                )
-                            if need_regression and regression_rates is not None:
+                            regression_rates = regression_cache[idx]
+                            primary_flags = primary_cache[idx]
+                            if chooser_need_regression and regression_rates is not None:
                                 regression_tensor = torch.tensor(
                                     regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
                                 )
@@ -1505,7 +1602,7 @@ def train(
                                     probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
                                 )
                                 chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
-                            if need_primary and primary_flags is not None:
+                            if chooser_need_primary and primary_flags is not None:
                                 primary_tensor = torch.tensor(
                                     primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
                                 )
