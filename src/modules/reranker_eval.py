@@ -16,6 +16,15 @@ PARAM_P2308 = "P2308"
 PARAM_P2305 = "P2305"
 PARAM_P1696 = "P1696"
 
+PLACEHOLDER_LABELS: tuple[str, ...] = (
+    "subject",
+    "predicate",
+    "object",
+    "other_subject",
+    "other_predicate",
+    "other_object",
+)
+
 
 @dataclass(frozen=True)
 class RegistryEntry:
@@ -143,6 +152,44 @@ def _lookup_registry_entry(
 
 
 def _coerce_sequence(value: Any, *, cast_int: bool = True) -> List[Any]:
+    # Fast path for common parquet payloads: 1-D primitive ndarrays.
+    if isinstance(value, np.ndarray):
+        if value.ndim == 1 and value.dtype != object:
+            if not cast_int:
+                return value.tolist()
+            if np.issubdtype(value.dtype, np.integer):
+                return value.astype(np.int64, copy=False).tolist()
+            coerced = []
+            for v in value.tolist():
+                try:
+                    coerced.append(int(v))
+                except (TypeError, ValueError):
+                    coerced.append(0)
+            return coerced
+        if value.ndim == 0:
+            scalar = value.item()
+            if not cast_int:
+                return [scalar]
+            try:
+                return [int(scalar)]
+            except (TypeError, ValueError):
+                return [0]
+
+    # Fast path for flat Python sequences.
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return []
+        if all(not isinstance(v, (list, tuple, np.ndarray)) for v in value):
+            if not cast_int:
+                return list(value)
+            coerced = []
+            for v in value:
+                try:
+                    coerced.append(int(v))
+                except (TypeError, ValueError):
+                    coerced.append(0)
+            return coerced
+
     def _flatten(item: Any) -> List[Any]:
         if item is None:
             return []
@@ -170,10 +217,23 @@ def _coerce_sequence(value: Any, *, cast_int: bool = True) -> List[Any]:
 def _coerce_value(value: Any, *, cast_int: bool = True) -> Any:
     if not cast_int:
         return value
+    if isinstance(value, (int, np.integer)):
+        return int(value)
     try:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _resolve_placeholder_token_ids(encoder: GlobalIntEncoder | None) -> Dict[str, int]:
+    if encoder is None:
+        return {}
+    token_ids: Dict[str, int] = {}
+    for label in PLACEHOLDER_LABELS:
+        token_id = encoder.encode(label, add_new=False)
+        if token_id:
+            token_ids[label] = int(token_id)
+    return token_ids
 
 
 def _compute_p_local(row: Any, *, cast_int: bool = True) -> Set[Any]:
@@ -263,7 +323,11 @@ def _build_facts_state(
     return facts_by_entity, predicates_present
 
 
-def _build_placeholder_map(encoder: GlobalIntEncoder | None, row: Any) -> Dict[Any, Any]:
+def _build_placeholder_map(
+    encoder: GlobalIntEncoder | None,
+    row: Any,
+    placeholder_token_ids: Dict[str, int] | None = None,
+) -> Dict[Any, Any]:
     mapping: Dict[Any, Any] = {}
     if encoder is None:
         return {
@@ -275,18 +339,9 @@ def _build_placeholder_map(encoder: GlobalIntEncoder | None, row: Any) -> Dict[A
             "other_object": getattr(row, "other_object", 0),
         }
 
-    placeholders = [
-        "subject",
-        "predicate",
-        "object",
-        "other_subject",
-        "other_predicate",
-        "other_object",
-    ]
-    for label in placeholders:
-        token_id = encoder.encode(label, add_new=False)
-        if token_id:
-            mapping[token_id] = int(getattr(row, label, 0) or 0)
+    token_ids = placeholder_token_ids if placeholder_token_ids is not None else _resolve_placeholder_token_ids(encoder)
+    for label, token_id in token_ids.items():
+        mapping[token_id] = int(getattr(row, label, 0) or 0)
     return mapping
 
 
@@ -541,6 +596,7 @@ class CandidateConstraintEvaluator:
         self._constraint_scope = constraint_scope
         self._use_encoded_ids = use_encoded_ids
         self._default_relations = _resolve_default_relations(encoder)
+        self._placeholder_token_ids = _resolve_placeholder_token_ids(encoder)
         self._constraint_cache: Dict[str, ConstraintInstance] = {}
 
     def _get_constraint_instance(self, constraint_id: Any) -> ConstraintInstance | None:
@@ -608,7 +664,7 @@ class CandidateConstraintEvaluator:
             )
 
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
-        p_local_set = set(p_local)
+        p_local_set = p_local
         facts_by_entity, predicates_present = _build_facts_state(
             row,
             p_local=p_local,
@@ -652,7 +708,7 @@ class CandidateConstraintEvaluator:
             else None
         )
 
-        placeholder_map = _build_placeholder_map(self._encoder, row)
+        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
 
         tracked_indices: List[int] = []
         if need_regression:
@@ -751,7 +807,7 @@ class CandidateConstraintEvaluator:
         primary_factor_index: int | None = None,
     ) -> Dict[str, Any]:
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
-        p_local_set = set(p_local)
+        p_local_set = p_local
         facts_by_entity, predicates_present = _build_facts_state(
             row,
             p_local=p_local,
@@ -778,7 +834,7 @@ class CandidateConstraintEvaluator:
             other_object=other_object,
         )
 
-        placeholder_map = _build_placeholder_map(self._encoder, row)
+        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
         post_facts, post_predicates, missing_edits = _build_post_state_for_candidate(
             facts_by_entity,
             predicates_present,
@@ -927,7 +983,7 @@ class CandidateConstraintEvaluator:
         if not candidates:
             return []
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
-        p_local_set = set(p_local)
+        p_local_set = p_local
         facts_by_entity, predicates_present = _build_facts_state(
             row,
             p_local=p_local,
@@ -1008,7 +1064,7 @@ class CandidateConstraintEvaluator:
             except ValueError:
                 resolved_primary_index = -1
 
-        placeholder_map = _build_placeholder_map(self._encoder, row)
+        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
         results: List[Dict[str, Any]] = []
 
         for candidate_slots in candidates:
