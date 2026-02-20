@@ -243,7 +243,20 @@ def _compute_p_local(row: Any, *, cast_int: bool = True) -> Set[Any]:
         if value not in (None, "", 0):
             p_local.add(value)
     for name in ("subject_predicates", "object_predicates", "other_entity_predicates"):
-        for pred in _coerce_sequence(getattr(row, name, None), cast_int=cast_int):
+        raw = getattr(row, name, None)
+        if isinstance(raw, np.ndarray) and raw.ndim == 1 and raw.dtype != object:
+            if cast_int and np.issubdtype(raw.dtype, np.integer):
+                for pred_id in raw:
+                    value = int(pred_id)
+                    if value != 0:
+                        p_local.add(value)
+            else:
+                for pred in raw.tolist():
+                    value = _coerce_value(pred, cast_int=cast_int)
+                    if value not in (None, "", 0):
+                        p_local.add(value)
+            continue
+        for pred in _coerce_sequence(raw, cast_int=cast_int):
             if pred not in (None, "", 0):
                 p_local.add(pred)
     return p_local
@@ -260,14 +273,47 @@ def _pick_other_entity_id(row: Any, *, cast_int: bool = True) -> Any:
 
 
 def _build_facts_for_entity(
-    predicates: Sequence[Any],
-    objects: Sequence[Any],
+    predicates: Sequence[Any] | np.ndarray | None,
+    objects: Sequence[Any] | np.ndarray | None,
     *,
     p_local: Set[Any],
     cast_int: bool,
 ) -> Tuple[Dict[Any, Set[Any]], Set[Any]]:
     facts: Dict[Any, Set[Any]] = {}
     predicates_present: Set[Any] = set()
+    if predicates is None or objects is None:
+        return facts, predicates_present
+
+    if (
+        isinstance(predicates, np.ndarray)
+        and isinstance(objects, np.ndarray)
+        and predicates.ndim == 1
+        and objects.ndim == 1
+    ):
+        limit = min(int(predicates.shape[0]), int(objects.shape[0]))
+        if cast_int and np.issubdtype(predicates.dtype, np.integer) and np.issubdtype(objects.dtype, np.integer):
+            for idx in range(limit):
+                pred_id = int(predicates[idx])
+                obj_id = int(objects[idx])
+                if pred_id == 0 or obj_id == 0:
+                    continue
+                if pred_id not in p_local:
+                    continue
+                facts.setdefault(pred_id, set()).add(obj_id)
+                predicates_present.add(pred_id)
+            return facts, predicates_present
+
+        for idx in range(limit):
+            pred_id = _coerce_value(predicates[idx], cast_int=cast_int)
+            obj_id = _coerce_value(objects[idx], cast_int=cast_int)
+            if pred_id in (None, "", 0) or obj_id in (None, "", 0):
+                continue
+            if pred_id not in p_local:
+                continue
+            facts.setdefault(pred_id, set()).add(obj_id)
+            predicates_present.add(pred_id)
+        return facts, predicates_present
+
     for pred, obj in zip(predicates, objects):
         pred_id = _coerce_value(pred, cast_int=cast_int)
         obj_id = _coerce_value(obj, cast_int=cast_int)
@@ -294,8 +340,8 @@ def _build_facts_state(
     object_id = _coerce_value(getattr(row, "object", None), cast_int=cast_int)
     other_entity_id = _pick_other_entity_id(row, cast_int=cast_int)
 
-    subject_preds = _coerce_sequence(getattr(row, "subject_predicates", None), cast_int=cast_int)
-    subject_objs = _coerce_sequence(getattr(row, "subject_objects", None), cast_int=cast_int)
+    subject_preds = getattr(row, "subject_predicates", None)
+    subject_objs = getattr(row, "subject_objects", None)
     subject_facts, subject_present = _build_facts_for_entity(
         subject_preds, subject_objs, p_local=p_local, cast_int=cast_int
     )
@@ -303,8 +349,8 @@ def _build_facts_state(
     predicates_present[subject_id] = subject_present
 
     if object_id not in (None, "", 0):
-        object_preds = _coerce_sequence(getattr(row, "object_predicates", None), cast_int=cast_int)
-        object_objs = _coerce_sequence(getattr(row, "object_objects", None), cast_int=cast_int)
+        object_preds = getattr(row, "object_predicates", None)
+        object_objs = getattr(row, "object_objects", None)
         object_facts, object_present = _build_facts_for_entity(
             object_preds, object_objs, p_local=p_local, cast_int=cast_int
         )
@@ -312,8 +358,8 @@ def _build_facts_state(
         predicates_present[object_id] = object_present
 
     if other_entity_id not in (None, "", 0):
-        other_preds = _coerce_sequence(getattr(row, "other_entity_predicates", None), cast_int=cast_int)
-        other_objs = _coerce_sequence(getattr(row, "other_entity_objects", None), cast_int=cast_int)
+        other_preds = getattr(row, "other_entity_predicates", None)
+        other_objs = getattr(row, "other_entity_objects", None)
         other_facts, other_present = _build_facts_for_entity(
             other_preds, other_objs, p_local=p_local, cast_int=cast_int
         )
@@ -402,91 +448,69 @@ def _build_post_state_for_candidate(
     placeholder_map: Dict[Any, Any],
     assume_complete: bool,
 ) -> Tuple[Dict[Any, Dict[Any, Set[Any]]], Dict[Any, Set[Any]], Set[Tuple[Any, Any]]]:
-    """
-    Build post-edit facts/predicate maps with copy-on-write semantics.
-
-    This preserves evaluator behavior while avoiding full deep copies per candidate.
-    Only entities/predicate sets touched by the candidate are cloned.
-    """
     post_facts = base_facts_by_entity
     post_predicates = base_predicates_present
     missing_edits: Set[Tuple[Any, Any]] = set()
 
-    copied_entity_maps: Set[Any] = set()
+    copied_entity_maps: Dict[Any, Dict[Any, Set[Any]]] = {}
     copied_value_sets: Set[Tuple[Any, Any]] = set()
-    copied_predicate_sets: Set[Any] = set()
+    copied_predicate_sets: Dict[Any, Set[Any]] = {}
 
-    def _ensure_top_level_facts_copy() -> None:
-        nonlocal post_facts
-        if post_facts is base_facts_by_entity:
-            post_facts = dict(base_facts_by_entity)
-
-    def _ensure_top_level_predicates_copy() -> None:
-        nonlocal post_predicates
-        if post_predicates is base_predicates_present:
-            post_predicates = dict(base_predicates_present)
-
-    def _entity_facts_for_mutation(subject_id: Any) -> Dict[Any, Set[Any]] | None:
-        source = base_facts_by_entity.get(subject_id)
-        if source is None:
-            return None
-        if subject_id not in copied_entity_maps:
-            _ensure_top_level_facts_copy()
-            post_facts[subject_id] = dict(source)
-            copied_entity_maps.add(subject_id)
-        return post_facts[subject_id]
-
-    def _clone_value_set_if_needed(subject_id: Any, predicate_id: Any, entity_facts: Dict[Any, Set[Any]]) -> None:
-        key = (subject_id, predicate_id)
-        if key in copied_value_sets:
-            return
-        current = entity_facts.get(predicate_id)
-        if current is not None:
-            entity_facts[predicate_id] = set(current)
-        copied_value_sets.add(key)
-
-    def _predicate_set_for_mutation(subject_id: Any) -> Set[Any]:
-        if subject_id not in copied_predicate_sets:
-            _ensure_top_level_predicates_copy()
-            post_predicates[subject_id] = set(base_predicates_present.get(subject_id, set()))
-            copied_predicate_sets.add(subject_id)
-        return post_predicates[subject_id]
-
-    def _apply(kind: str, subj: Any, pred: Any, obj: Any) -> None:
-        subj = _resolve_placeholder(subj, placeholder_map)
-        pred = _resolve_placeholder(pred, placeholder_map)
-        obj = _resolve_placeholder(obj, placeholder_map)
+    for kind, base_idx in (("del", 3), ("add", 0)):
+        subj = _resolve_placeholder(int(candidate_slots[base_idx]), placeholder_map)
+        pred = _resolve_placeholder(int(candidate_slots[base_idx + 1]), placeholder_map)
+        obj = _resolve_placeholder(int(candidate_slots[base_idx + 2]), placeholder_map)
         if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
-            return
+            continue
         if not assume_complete and pred not in base_predicates_present.get(subj, set()):
             missing_edits.add((subj, pred))
-            return
+            continue
         if pred not in p_local:
             missing_edits.add((subj, pred))
-            return
-        entity_facts = _entity_facts_for_mutation(subj)
+            continue
+
+        entity_facts = copied_entity_maps.get(subj)
         if entity_facts is None:
-            missing_edits.add((subj, pred))
-            return
+            source_facts = base_facts_by_entity.get(subj)
+            if source_facts is None:
+                missing_edits.add((subj, pred))
+                continue
+            if post_facts is base_facts_by_entity:
+                post_facts = dict(base_facts_by_entity)
+            entity_facts = dict(source_facts)
+            post_facts[subj] = entity_facts
+            copied_entity_maps[subj] = entity_facts
+
+        key = (subj, pred)
+        values = entity_facts.get(pred)
         if kind == "del":
-            values = entity_facts.get(pred)
-            if values is not None and obj in values:
-                _clone_value_set_if_needed(subj, pred, entity_facts)
-                entity_facts[pred].discard(obj)
-            return
+            if values is None or obj not in values:
+                continue
+            if key not in copied_value_sets:
+                entity_facts[pred] = set(values)
+                copied_value_sets.add(key)
+                values = entity_facts[pred]
+            values.discard(obj)
+            continue
 
-        if pred in entity_facts:
-            _clone_value_set_if_needed(subj, pred, entity_facts)
-            entity_facts[pred].add(obj)
-        else:
+        if values is None:
             entity_facts[pred] = {obj}
-            copied_value_sets.add((subj, pred))
-        _predicate_set_for_mutation(subj).add(pred)
+            copied_value_sets.add(key)
+        else:
+            if key not in copied_value_sets:
+                entity_facts[pred] = set(values)
+                copied_value_sets.add(key)
+                values = entity_facts[pred]
+            values.add(obj)
 
-    add = candidate_slots[:3]
-    delete = candidate_slots[3:]
-    _apply("del", int(delete[0]), int(delete[1]), int(delete[2]))
-    _apply("add", int(add[0]), int(add[1]), int(add[2]))
+        subject_preds = copied_predicate_sets.get(subj)
+        if subject_preds is None:
+            if post_predicates is base_predicates_present:
+                post_predicates = dict(base_predicates_present)
+            subject_preds = set(base_predicates_present.get(subj, set()))
+            post_predicates[subj] = subject_preds
+            copied_predicate_sets[subj] = subject_preds
+        subject_preds.add(pred)
 
     return post_facts, post_predicates, missing_edits
 
