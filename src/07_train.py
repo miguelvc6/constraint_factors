@@ -4,8 +4,11 @@ import argparse
 import json
 import logging
 import math
+import os
 import shutil
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -463,16 +466,79 @@ def train(
         """
         Emit per-batch logs for:
         - the first 10 iterations
-        - then each new 1% progress point within the epoch (when total is known)
+        - then each new 5% progress point within the epoch (when total is known)
         """
         if batch_idx <= 10:
             return True, last_logged_percent
         if total_batches is None or total_batches <= 0:
             return False, last_logged_percent
         progress_percent = int((batch_idx * 100) / total_batches)
-        if progress_percent > last_logged_percent:
-            return True, progress_percent
+        progress_bucket = min((progress_percent // 5) * 5, 100)
+        if progress_bucket > last_logged_percent:
+            return True, progress_bucket
         return False, last_logged_percent
+
+    def _env_flag(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Invalid integer for %s=%r; using default %s", name, raw, default)
+            return default
+        return max(value, minimum)
+
+    timing_enabled = _env_flag("TRAIN_TIMING_PROFILE", default=False)
+    timing_warmup_batches = _env_int("TRAIN_TIMING_WARMUP_BATCHES", 10, minimum=0)
+    timing_log_every = _env_int("TRAIN_TIMING_LOG_EVERY", 100, minimum=1)
+
+    train_timing_keys = (
+        "data_s",
+        "forward_s",
+        "base_loss_s",
+        "policy_s",
+        "fix_s",
+        "factor_s",
+        "chooser_s",
+        "reweight_s",
+        "backward_s",
+        "optim_s",
+        "metrics_s",
+        "total_s",
+    )
+    val_timing_keys = (
+        "data_s",
+        "forward_s",
+        "base_loss_s",
+        "policy_s",
+        "fix_s",
+        "factor_s",
+        "chooser_s",
+        "metrics_s",
+        "total_s",
+    )
+
+    def _new_timing_bucket(keys: tuple[str, ...]) -> dict[str, float]:
+        return {key: 0.0 for key in keys}
+
+    def _timing_bucket_ms(bucket: dict[str, float], count: int, key: str) -> float:
+        if count <= 0:
+            return 0.0
+        return (bucket.get(key, 0.0) / count) * 1000.0
+
+    if timing_enabled:
+        logger.info(
+            "Timing profiler enabled | warmup_batches=%s log_every=%s (env: TRAIN_TIMING_PROFILE=1)",
+            timing_warmup_batches,
+            timing_log_every,
+        )
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
@@ -488,6 +554,7 @@ def train(
         "val_acc_slot": [],
     }
 
+    logger.info("Starting training loop for %d epochs", num_epochs)
     epoch_iter = progress_bar(range(num_epochs), desc="Training Epochs", leave=True)
     sanity_checked = False
 
@@ -495,6 +562,7 @@ def train(
         logger.info(f"Epoch {epoch + 1}/{num_epochs} started")
         if device.type == "cuda" and logger.isEnabledFor(logging.DEBUG):
             log_cuda_memory(f"Epoch {epoch + 1} pre-forward", device, level=logging.DEBUG)
+        train_epoch_start = time.perf_counter()
 
         # ------- Training -------
         model.train()
@@ -519,7 +587,13 @@ def train(
 
         train_constraint_metrics = ConstraintMetricsAccumulator()
         train_last_logged_percent = 0
+        train_timing_window = _new_timing_bucket(train_timing_keys)
+        train_timing_epoch = _new_timing_bucket(train_timing_keys)
+        train_timing_window_count = 0
+        train_timing_epoch_count = 0
         for batch_idx, data in enumerate(train_loader, start=1):
+            batch_t0 = time.perf_counter() if timing_enabled else 0.0
+            phase_t0 = time.perf_counter() if timing_enabled else 0.0
             data = data.to(device, non_blocking=True)
             if train_cfg.validate_factor_labels:
                 _assert_factor_labels_batch(data)
@@ -533,11 +607,14 @@ def train(
             assert 0 <= t_min and t_max < model.num_target_ids, (
                 f"Expected targets in [0,{model.num_target_ids}), got [{t_min},{t_max}]"
             )
+            data_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             optimizer.zero_grad(set_to_none=True)
 
+            phase_t0 = time.perf_counter() if timing_enabled else 0.0
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
                 outputs = model(data)
+            forward_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
             if torch.is_tensor(outputs):
                 outputs = {
                     "edit_logits": outputs,
@@ -558,11 +635,19 @@ def train(
             targets_flat = targets.reshape(-1)
 
             # Constraint type extraction and loss computation
+            phase_t0 = time.perf_counter() if timing_enabled else 0.0
             per_slot_loss = criterion(out_flat, targets_flat)
             loss_matrix = per_slot_loss.view(-1, NUM_SLOTS)
             graph_loss = loss_matrix.mean(dim=1)
+            base_loss_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
+            policy_s = 0.0
+            fix_s = 0.0
+            factor_s = 0.0
+            chooser_s = 0.0
+            reweight_s = 0.0
 
             if policy_enabled:
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 policy_logits = outputs.get("policy_logits")
                 if policy_logits is None:
                     raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
@@ -586,10 +671,12 @@ def train(
                 train_policy_loss_sum += float(policy_loss.sum().item())
                 train_policy_count += policy_loss.numel()
                 train_policy_correct += int((policy_logits.argmax(dim=-1) == policy_targets).sum().item())
+                policy_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             # Optional - Constraint-is-fixed loss term
             fix_weight = 0.0
             if fix_scheduler and fix_scheduler.enabled and fix_heuristics is not None and train_contexts is not None:
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 context_tensor = getattr(data, "context_index", None)
                 if context_tensor is not None:
                     context_indices = context_tensor.detach().cpu().tolist()
@@ -605,9 +692,11 @@ def train(
                             fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
                             fix_penalty = 1.0 - fix_probs
                             graph_loss = graph_loss + fix_weight * fix_penalty
+                fix_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             # Optional - Factor satisfaction loss (pre-state)
             if factor_cfg.enabled:
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 assert factor_criterion is not None
                 factor_logits = outputs.get("factor_logits_pre")
                 factor_mask = outputs.get("factor_mask_pre")
@@ -686,8 +775,10 @@ def train(
                     preds = (factor_logits > 0).to(dtype=torch.long)
                     targets_long = factor_targets.to(dtype=torch.long)
                     train_factor_correct += int((preds[active_mask] == targets_long[active_mask]).sum().item())
+                factor_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             if chooser_enabled:
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 if chooser_evaluator is None or chooser_heuristics is None:
                     raise RuntimeError("Chooser enabled but evaluator/heuristics are not initialized.")
                 if chooser_candidate_cfg is None:
@@ -788,8 +879,10 @@ def train(
                 graph_loss = graph_loss + chooser_losses
                 train_chooser_loss_sum += float(chooser_losses.sum().item())
                 train_chooser_count += chooser_losses.numel()
+                chooser_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             # Optional - Rebalance weights based on constraint types
+            phase_t0 = time.perf_counter() if timing_enabled else 0.0
             constraint_types = extract_constraint_types(data, loss_matrix.size(0))
             sample_weights = dynamic_weighter.weights_for(constraint_types)
 
@@ -802,16 +895,21 @@ def train(
                 weighted_loss = (graph_loss * weight_tensor).mean()
             else:
                 weighted_loss = graph_loss.mean()
+            reweight_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
+            phase_t0 = time.perf_counter() if timing_enabled else 0.0
             weighted_loss.backward()
+            backward_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             train_graph_loss_sum += graph_loss.detach().sum().item()
             train_graph_count += graph_loss.numel()
 
+            phase_t0 = time.perf_counter() if timing_enabled else 0.0
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
             optimizer.step()
+            optim_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             if logger.isEnabledFor(logging.DEBUG):
                 if batch_idx == 1:
@@ -829,6 +927,7 @@ def train(
                     )
 
             # Accuracy (all-6 and per-slot)
+            phase_t0 = time.perf_counter() if timing_enabled else 0.0
             _, predicted = torch.max(out_flat, 1)
             predicted_reshaped = predicted.reshape(-1, NUM_SLOTS)
             targets_reshaped = targets_flat.reshape(-1, NUM_SLOTS)
@@ -864,6 +963,28 @@ def train(
                 NUM_SLOTS,
             )
             dynamic_weighter.observe_batch(constraint_types, loss_matrix)
+            metrics_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
+
+            if timing_enabled and batch_idx > timing_warmup_batches:
+                timing_snapshot = {
+                    "data_s": data_s,
+                    "forward_s": forward_s,
+                    "base_loss_s": base_loss_s,
+                    "policy_s": policy_s,
+                    "fix_s": fix_s,
+                    "factor_s": factor_s,
+                    "chooser_s": chooser_s,
+                    "reweight_s": reweight_s,
+                    "backward_s": backward_s,
+                    "optim_s": optim_s,
+                    "metrics_s": metrics_s,
+                    "total_s": time.perf_counter() - batch_t0,
+                }
+                for key, value in timing_snapshot.items():
+                    train_timing_window[key] += value
+                    train_timing_epoch[key] += value
+                train_timing_window_count += 1
+                train_timing_epoch_count += 1
 
             should_log, train_last_logged_percent = _should_log_batch(
                 batch_idx,
@@ -878,17 +999,53 @@ def train(
                     )
                 else:
                     progress_label = f"batch {batch_idx}"
+                elapsed_s = max(time.perf_counter() - train_epoch_start, 1e-9)
+                it_per_s = batch_idx / elapsed_s
+                if it_per_s >= 1.0:
+                    speed_label = f"{it_per_s:.2f} it/s"
+                else:
+                    speed_label = f"{(1.0 / it_per_s):.2f} s/it"
+                if train_total_batches is not None and train_total_batches > 0:
+                    remaining_batches = max(train_total_batches - batch_idx, 0)
+                    eta_s = remaining_batches / max(it_per_s, 1e-9)
+                    eta_label = time.strftime("%H:%M:%S", time.gmtime(max(int(eta_s), 0)))
+                else:
+                    eta_label = "n/a"
                 logger.info(
-                    "Epoch %s train %s | loss=%.4f all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
+                    "Epoch %s train %s | dt=%s loss=%.4f speed=%s eta_epoch=%s all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
                     epoch + 1,
                     progress_label,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     weighted_loss.item(),
+                    speed_label,
+                    eta_label,
                     100 * train_correct / max(train_total, 1),
                     100 * train_slot_correct / max(train_slot_total, 1),
                     f"{train_factor_loss_sum / max(train_factor_count, 1):.4f}" if factor_cfg.enabled else "n/a",
                     f"{train_chooser_loss_sum / max(train_chooser_count, 1):.4f}" if chooser_enabled else "n/a",
                     f"{train_policy_loss_sum / max(train_policy_count, 1):.4f}" if policy_enabled else "n/a",
                 )
+            if timing_enabled and train_timing_window_count >= timing_log_every:
+                logger.info(
+                    "Epoch %s train timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
+                    epoch + 1,
+                    batch_idx,
+                    train_timing_window_count,
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "data_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "forward_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "base_loss_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "factor_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "policy_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "fix_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "reweight_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "backward_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "optim_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "metrics_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "total_s"),
+                )
+                train_timing_window = _new_timing_bucket(train_timing_keys)
+                train_timing_window_count = 0
 
         # Epoch training metrics
         avg_train_loss = train_graph_loss_sum / max(train_graph_count, 1)
@@ -904,6 +1061,25 @@ def train(
         train_chooser_loss = train_chooser_loss_sum / max(train_chooser_count, 1)
         train_policy_loss = train_policy_loss_sum / max(train_policy_count, 1)
         train_policy_acc = 100 * train_policy_correct / max(train_policy_count, 1)
+        if timing_enabled and train_timing_epoch_count > 0:
+            logger.info(
+                "Epoch %s train timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
+                epoch + 1,
+                train_timing_epoch_count,
+                timing_warmup_batches,
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "data_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "forward_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "base_loss_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "factor_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "policy_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "fix_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "reweight_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "backward_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "optim_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "metrics_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "total_s"),
+            )
 
         # ------- Validation -------
         model.eval()
@@ -926,17 +1102,27 @@ def train(
         val_policy_loss_sum = 0.0
         val_policy_count = 0
         val_policy_correct = 0
+        val_epoch_start = time.perf_counter()
+        val_timing_window = _new_timing_bucket(val_timing_keys)
+        val_timing_epoch = _new_timing_bucket(val_timing_keys)
+        val_timing_window_count = 0
+        val_timing_epoch_count = 0
 
         with torch.no_grad():
             val_last_logged_percent = 0
             for batch_idx, data in enumerate(val_loader, start=1):
+                batch_t0 = time.perf_counter() if timing_enabled else 0.0
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 data = data.to(device, non_blocking=True)
                 if train_cfg.validate_factor_labels:
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
+                data_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
                     outputs = model(data)
+                forward_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
                 if torch.is_tensor(outputs):
                     outputs = {
                         "edit_logits": outputs,
@@ -952,11 +1138,18 @@ def train(
                 out_flat = out.reshape(-1, out.size(-1))
                 targets_flat = targets.reshape(-1)
 
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 per_slot_loss = criterion(out_flat, targets_flat)
                 loss_matrix = per_slot_loss.view(-1, NUM_SLOTS)
                 graph_loss = loss_matrix.mean(dim=1)
+                base_loss_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
+                policy_s = 0.0
+                fix_s = 0.0
+                factor_s = 0.0
+                chooser_s = 0.0
 
                 if policy_enabled:
+                    phase_t0 = time.perf_counter() if timing_enabled else 0.0
                     policy_logits = outputs.get("policy_logits")
                     if policy_logits is None:
                         raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
@@ -980,6 +1173,7 @@ def train(
                     val_policy_loss_sum += float(policy_loss.sum().item())
                     val_policy_count += policy_loss.numel()
                     val_policy_correct += int((policy_logits.argmax(dim=-1) == policy_targets).sum().item())
+                    policy_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
                 # Optional - Constraint-is-fixed loss term
                 if (
@@ -988,6 +1182,7 @@ def train(
                     and fix_heuristics is not None
                     and val_contexts is not None
                 ):
+                    phase_t0 = time.perf_counter() if timing_enabled else 0.0
                     context_tensor = getattr(data, "context_index", None)
                     if context_tensor is not None:
                         context_indices = context_tensor.detach().cpu().tolist()
@@ -998,9 +1193,11 @@ def train(
                             if fix_weight > 0.0:
                                 fix_probs = compute_fix_probabilities(out, batch_contexts, fix_heuristics)
                                 graph_loss = graph_loss + fix_weight * (1.0 - fix_probs)
+                    fix_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
                 # Optional - Factor satisfaction loss (pre-state)
                 if factor_cfg.enabled:
+                    phase_t0 = time.perf_counter() if timing_enabled else 0.0
                     assert factor_criterion is not None
                     factor_logits = outputs.get("factor_logits_pre")
                     factor_mask = outputs.get("factor_mask_pre")
@@ -1079,8 +1276,10 @@ def train(
                         preds = (factor_logits > 0).to(dtype=torch.long)
                         targets_long = factor_targets.to(dtype=torch.long)
                         val_factor_correct += int((preds[active_mask] == targets_long[active_mask]).sum().item())
+                    factor_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
                 if chooser_enabled:
+                    phase_t0 = time.perf_counter() if timing_enabled else 0.0
                     if chooser_evaluator is None or chooser_heuristics is None:
                         raise RuntimeError("Chooser enabled but evaluator/heuristics are not initialized.")
                     if chooser_candidate_cfg is None:
@@ -1181,8 +1380,10 @@ def train(
                     graph_loss = graph_loss + chooser_losses
                     val_chooser_loss_sum += float(chooser_losses.sum().item())
                     val_chooser_count += chooser_losses.numel()
+                    chooser_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
                 # Accumulate validation metrics
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 val_graph_loss_sum += graph_loss.sum().item()
                 val_graph_count += graph_loss.numel()
                 val_slots += targets_flat.numel()
@@ -1218,6 +1419,25 @@ def train(
                     all_correct_per_graph,
                     NUM_SLOTS,
                 )
+                metrics_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
+
+                if timing_enabled and batch_idx > timing_warmup_batches:
+                    timing_snapshot = {
+                        "data_s": data_s,
+                        "forward_s": forward_s,
+                        "base_loss_s": base_loss_s,
+                        "policy_s": policy_s,
+                        "fix_s": fix_s,
+                        "factor_s": factor_s,
+                        "chooser_s": chooser_s,
+                        "metrics_s": metrics_s,
+                        "total_s": time.perf_counter() - batch_t0,
+                    }
+                    for key, value in timing_snapshot.items():
+                        val_timing_window[key] += value
+                        val_timing_epoch[key] += value
+                    val_timing_window_count += 1
+                    val_timing_epoch_count += 1
 
                 if logger.isEnabledFor(logging.DEBUG):
                     if batch_idx == 1:
@@ -1248,17 +1468,50 @@ def train(
                     else:
                         progress_label = f"batch {batch_idx}"
                     avg_val_batch_loss = val_graph_loss_sum / max(val_graph_count, 1)
+                    elapsed_s = max(time.perf_counter() - val_epoch_start, 1e-9)
+                    it_per_s = batch_idx / elapsed_s
+                    if it_per_s >= 1.0:
+                        speed_label = f"{it_per_s:.2f} it/s"
+                    else:
+                        speed_label = f"{(1.0 / it_per_s):.2f} s/it"
+                    if val_total_batches is not None and val_total_batches > 0:
+                        remaining_batches = max(val_total_batches - batch_idx, 0)
+                        eta_s = remaining_batches / max(it_per_s, 1e-9)
+                        eta_label = time.strftime("%H:%M:%S", time.gmtime(max(int(eta_s), 0)))
+                    else:
+                        eta_label = "n/a"
                     logger.info(
-                        "Epoch %s val %s | loss=%.4f all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
+                        "Epoch %s val %s | dt=%s loss=%.4f speed=%s eta_epoch=%s all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
                         epoch + 1,
                         progress_label,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         avg_val_batch_loss,
+                        speed_label,
+                        eta_label,
                         100 * val_correct / max(val_total, 1),
                         100 * val_slot_correct / max(val_slot_total, 1),
                         f"{val_factor_loss_sum / max(val_factor_count, 1):.4f}" if factor_cfg.enabled else "n/a",
                         f"{val_chooser_loss_sum / max(val_chooser_count, 1):.4f}" if chooser_enabled else "n/a",
                         f"{val_policy_loss_sum / max(val_policy_count, 1):.4f}" if policy_enabled else "n/a",
                     )
+                if timing_enabled and val_timing_window_count >= timing_log_every:
+                    logger.info(
+                        "Epoch %s val timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
+                        epoch + 1,
+                        batch_idx,
+                        val_timing_window_count,
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "data_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "forward_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "base_loss_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "factor_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "policy_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "fix_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "metrics_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "total_s"),
+                    )
+                    val_timing_window = _new_timing_bucket(val_timing_keys)
+                    val_timing_window_count = 0
 
         # Epoch validation metrics
         avg_val_loss = val_graph_loss_sum / max(val_graph_count, 1)
@@ -1274,6 +1527,22 @@ def train(
         val_chooser_loss = val_chooser_loss_sum / max(val_chooser_count, 1)
         val_policy_loss = val_policy_loss_sum / max(val_policy_count, 1)
         val_policy_acc = 100 * val_policy_correct / max(val_policy_count, 1)
+        if timing_enabled and val_timing_epoch_count > 0:
+            logger.info(
+                "Epoch %s val timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
+                epoch + 1,
+                val_timing_epoch_count,
+                timing_warmup_batches,
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "data_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "forward_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "base_loss_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "factor_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "policy_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "fix_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "metrics_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "total_s"),
+            )
 
         logger.info(
             "Epoch %s samples | train=%s validation=%s",
@@ -1515,9 +1784,15 @@ def main():
         num_role_types=role_spec.num_types if role_spec.enabled else 0,
         num_embedding_size=feature_dim if not use_node_embeddings else model_cfg.num_embedding_size,
     )
-    num_factor_types = derive_factor_type_count(train_data, val_data)
-    if num_factor_types > 0:
-        model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
+    # Avoid scanning all graphs when num_factor_types is already explicit in config.
+    if model_cfg.num_factor_types > 0:
+        num_factor_types = int(model_cfg.num_factor_types)
+        logger.info("Using preconfigured num_factor_types=%s (skipping dataset scan).", num_factor_types)
+    else:
+        num_factor_types = derive_factor_type_count(train_data, val_data)
+        if num_factor_types > 0:
+            model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
+            logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
 
     # Load and freeze int encoder
     encoder = GlobalIntEncoder()
