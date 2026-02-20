@@ -209,6 +209,6 @@ Disabled / not implemented:
 
 - Candidate generation is shared between proposal and reranker via `src/modules/candidates.py`.
 - Policy filtering is deterministic and documented in `src/modules/policy.py`.
-- If `chooser` or `policy` is enabled, datasets must be in‑memory lists (not streaming), because contexts and parquet rows must align by index.
+- `chooser` supports streamed datasets when graph ordering is stable and context/parquet sidecars align by index.
+- `policy` still requires in-memory datasets; stream datasets are materialized before policy-choice training.
 - Global metrics require registry + encoder + factor fields; strict mode will fail fast if missing.
-

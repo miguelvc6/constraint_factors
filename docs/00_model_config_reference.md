@@ -34,7 +34,7 @@ Experiment config JSON files are JSON objects that can include the keys below.
 | `use_edge_subtraction` | bool | `false` | Uses edge subtraction; requires `use_edge_attributes=true`. |
 | `entity_class_ids` | array[int] or int | `null` | Optional vocabulary subset for entity targets. Can be a single int or any iterable of ints. |
 | `predicate_class_ids` | array[int] or int | `null` | Optional vocabulary subset for predicate targets. Can be a single int or any iterable of ints. |
-| `num_factor_types` | int | `0` | Number of distinct factor type ids. `0` disables type conditioning. |
+| `num_factor_types` | int | `0` | Number of distinct factor type ids. Values `>0` are used directly (startup scan skipped); `0` triggers automatic inference from dataset graphs. |
 | `factor_type_embedding_dim` | int | `8` | Embedding dimension for factor type conditioning. |
 | `pressure_enabled` | bool | `false` | Toggle factor-pressure injection during message passing. |
 | `pressure_type_conditioning` | string | `"none"` | How to condition pressure messages on factor types: `none`, `concat`, `gate`. |

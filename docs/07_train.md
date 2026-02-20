@@ -13,8 +13,9 @@
 2. **Run directory setup** – `ensure_run_dir()` creates or reuses a timestamped folder, while `config_copy_path()` determines where the config snapshot will live beside the checkpoint.
 3. **Data loading** – `dataset_variant_name()` selects the processed root (`data/processed/<variant>/`), `load_graph_dataset()` discovers either monolithic files or shard collections (`*-shardNNN.{pkl,pt}`), returning an in-memory list or a lazy `GraphStreamDataset`/sharded stream as appropriate. `infer_node_feature_spec()` inspects samples to decide whether node features are embeddings or categorical IDs (including optional role flags).
 4. **Target vocabularies** – The model predicts six categorical slots. `load_precomputed_target_vocabs()` reuses cached entity/predicate class IDs when available, otherwise `derive_target_class_ids()` scans the loaded graphs. These IDs are passed into the model so entity and predicate heads can be expanded/masked into a shared `num_target_ids` space.
-5. **Encoder + model build** – The frozen `GlobalIntEncoder` from `data/interim/<variant>/globalintencoder.txt` defines `num_graph_nodes`. `build_model()` instantiates the chosen architecture (e.g., message-passing network with dual branches). Device selection is automatic (CUDA if available) with memory logging hooks for debugging.
-6. **Training loop (`train()`):**
+5. **Factor type setup** – If `model_config.num_factor_types > 0`, training uses that value directly and skips the expensive dataset-wide `derive_factor_type_count()` scan. If it is `0`, the script infers the count from graph data.
+6. **Encoder + model build** – The frozen `GlobalIntEncoder` from `data/interim/<variant>/globalintencoder.txt` defines `num_graph_nodes`. `build_model()` instantiates the chosen architecture (e.g., message-passing network with dual branches). Device selection is automatic (CUDA if available) with memory logging hooks for debugging.
+7. **Training loop (`train()`):**
    - Wrap datasets in `DataLoader`s, shuffling the in-memory split while leaving streaming datasets ordered.
    - Forward pass returns logits of shape `(batch, 6, num_target_ids)` where entity/predicate slots are masked to the per-split vocabularies. Each slot is compared against the gold IDs via `CrossEntropyLoss(reduction="none")`, producing a `(batch, 6)` loss matrix.
    - Per-graph loss is computed as the mean over the six slots (`graph_loss = loss_matrix.mean(dim=1)`), then optionally:
@@ -22,9 +23,13 @@
      - `DynamicConstraintWeighter` rescales each per-graph loss based on constraint types (`extract_constraint_types()` reads `data.constraint_type`).
    - Accuracy is tracked both per-slot (percentage of correctly predicted IDs) and as “all-6 correct” (all slots match simultaneously).
    - `ConstraintMetricsAccumulator` aggregates loss/accuracy per constraint type so reports can highlight which shapes dominate or lag.
+   - If chooser training is enabled, candidate sets are built per graph and scored by the chooser head. Training uses an optimized path:
+     - candidate scoring is done in a packed/batched call (`score_candidates_packed`) rather than one scorer call per graph,
+     - `fix1`-style chooser losses use `evaluate_candidates_loss_terms()` to compute only the required terms (no full diagnostic payload),
+     - top-k candidate extraction can be restricted to valid entity/predicate class IDs per slot.
    - `torch.optim.Adam` drives the updates, `ReduceLROnPlateau` reduces LR when validation loss stalls, gradient clipping is optional, and early stopping is triggered after `training_config.early_stopping_rounds` epochs without improvement.
-7. **Validation** – Mirrors the training pass sans gradient steps, feeding results into the same metric accumulators for apples-to-apples comparisons.
-8. **Artifacts** – Once training finishes (or early stopping fires), the best-performing weights are saved via `torch.save()` alongside the effective `model_cfg`/`training_cfg`. `history_path()` stores the scalar curves, and `plot_training_history()` renders PNG charts for quick inspection.
+8. **Validation** – Mirrors the training pass sans gradient steps, feeding results into the same metric accumulators for apples-to-apples comparisons.
+9. **Artifacts** – Once training finishes (or early stopping fires), the best-performing weights are saved via `torch.save()` alongside the effective `model_cfg`/`training_cfg`. `history_path()` stores the scalar curves, and `plot_training_history()` renders PNG charts for quick inspection.
 
 ## Common Pitfalls / Gotchas
 - The `model_config.dataset_variant` and `model_config.encoding` must match the graphs on disk; mismatches surface as missing-file errors or shape mismatches deep in PyG.
@@ -32,6 +37,22 @@
 - Early stopping patience is enforced even if validation batches fail intermittently; run with a stable validation split and monitor logs before trusting the saved checkpoint.
 - If CUDA is available but `num_workers` is high, pin-memory defaults to `True`; on systems with constrained RAM this can lead to OS-level swapping—tune `pin_memory` in the config if needed.
 - Fix-probability loss requires in-memory datasets (lists) so the script can attach `context_index` and look up contexts; streamed datasets will disable that term automatically.
+- Chooser training supports streamed datasets via per-graph `context_index` assignment; contexts/parquet sidecars must align with graph ordering/counts.
+- CUDA batch prefetch (`TRAIN_CUDA_PREFETCH`) is available and enabled by default; on some hardware/data combinations it may not improve throughput, so treat it as a tunable runtime flag.
+
+## Profiling & Throughput Controls
+
+The trainer exposes runtime environment switches for profiling and data movement overlap:
+
+- `TRAIN_TIMING_PROFILE=1` enables per-phase timing logs in both train and validation loops.
+- `TRAIN_TIMING_WARMUP_BATCHES=<int>` excludes early warmup batches from timing summaries.
+- `TRAIN_TIMING_LOG_EVERY=<int>` controls timing window size/frequency.
+- `TRAIN_CUDA_PREFETCH=0|1` disables/enables asynchronous batch prefetch to GPU using a side CUDA stream.
+
+Timing logs break the batch into phases such as:
+- `data`, `forward`, `chooser`, `factor`, `backward`, `optim`, `metrics`, and `total`.
+
+This makes bottlenecks explicit (for example, chooser-heavy runs where `chooser` dominates `total`).
 
 ## Implementation Details
 - The script intentionally supports streamed graphs (via `GraphStreamDataset`) so very large runs never exceed RAM even when the serialized graphs are sharded.
