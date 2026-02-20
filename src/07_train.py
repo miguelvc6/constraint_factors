@@ -1081,52 +1081,24 @@ def train(
                     graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                 )
 
-                global_fix_satisfaction: list[list[float] | None] = []
-                regression_cache: list[list[float] | None] = []
-                primary_cache: list[list[float] | None] = []
-                if chooser_loss_mode == "global_fix":
-                    for idx, candidates in enumerate(candidate_groups):
-                        details = chooser_evaluator.evaluate_candidates(
-                            candidate_rows[idx],
-                            candidates=candidates,
-                            primary_factor_index=primary_indices[idx],
-                        )
-                        global_fix_satisfaction.append(
-                            [float(d.get("global_satisfied_fraction", 0.0)) for d in details]
-                        )
-                        regression_cache.append(None)
-                        primary_cache.append(None)
-                else:
-                    for idx, candidates in enumerate(candidate_groups):
-                        if chooser_need_regression or chooser_need_primary:
-                            regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
-                                candidate_rows[idx],
-                                candidates=candidates,
-                                gold_index=gold_indices[idx],
-                                primary_factor_index=primary_indices[idx],
-                                need_regression=chooser_need_regression,
-                                need_primary=chooser_need_primary,
-                            )
-                        else:
-                            regression_rates, primary_flags = None, None
-                        global_fix_satisfaction.append(None)
-                        regression_cache.append(regression_rates)
-                        primary_cache.append(primary_flags)
-
                 offset = 0
                 for idx, candidates in enumerate(candidate_groups):
                     candidate_count = len(candidates)
                     scores = packed_scores[offset : offset + candidate_count]
                     offset += candidate_count
+                    row = candidate_rows[idx]
                     gold_index = gold_indices[idx]
+                    primary_index = primary_indices[idx]
                     log_probs = F.log_softmax(scores, dim=0)
                     probs = log_probs.exp()
                     if chooser_loss_mode == "global_fix":
-                        details = global_fix_satisfaction[idx]
-                        if details is None:
-                            raise RuntimeError("Missing chooser global-fix cache entry.")
+                        details = chooser_evaluator.evaluate_candidates(
+                            row,
+                            candidates=candidates,
+                            primary_factor_index=primary_index,
+                        )
                         satisfaction = torch.tensor(
-                            details,
+                            [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
                             dtype=graph_loss.dtype,
                             device=graph_loss.device,
                         )
@@ -1134,8 +1106,17 @@ def train(
                     else:
                         ce_loss = -log_probs[gold_index]
                         chooser_loss = ce_loss
-                        regression_rates = regression_cache[idx]
-                        primary_flags = primary_cache[idx]
+                        regression_rates: list[float] | None = None
+                        primary_flags: list[float] | None = None
+                        if chooser_need_regression or chooser_need_primary:
+                            regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                                row,
+                                candidates=candidates,
+                                gold_index=gold_index,
+                                primary_factor_index=primary_index,
+                                need_regression=chooser_need_regression,
+                                need_primary=chooser_need_primary,
+                            )
                         if chooser_need_regression and regression_rates is not None:
                             regression_tensor = torch.tensor(
                                 regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
@@ -1659,52 +1640,24 @@ def train(
                         graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                     )
 
-                    global_fix_satisfaction: list[list[float] | None] = []
-                    regression_cache: list[list[float] | None] = []
-                    primary_cache: list[list[float] | None] = []
-                    if chooser_loss_mode == "global_fix":
-                        for idx, candidates in enumerate(candidate_groups):
-                            details = chooser_evaluator.evaluate_candidates(
-                                candidate_rows[idx],
-                                candidates=candidates,
-                                primary_factor_index=primary_indices[idx],
-                            )
-                            global_fix_satisfaction.append(
-                                [float(d.get("global_satisfied_fraction", 0.0)) for d in details]
-                            )
-                            regression_cache.append(None)
-                            primary_cache.append(None)
-                    else:
-                        for idx, candidates in enumerate(candidate_groups):
-                            if chooser_need_regression or chooser_need_primary:
-                                regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
-                                    candidate_rows[idx],
-                                    candidates=candidates,
-                                    gold_index=gold_indices[idx],
-                                    primary_factor_index=primary_indices[idx],
-                                    need_regression=chooser_need_regression,
-                                    need_primary=chooser_need_primary,
-                                )
-                            else:
-                                regression_rates, primary_flags = None, None
-                            global_fix_satisfaction.append(None)
-                            regression_cache.append(regression_rates)
-                            primary_cache.append(primary_flags)
-
                     offset = 0
                     for idx, candidates in enumerate(candidate_groups):
                         candidate_count = len(candidates)
                         scores = packed_scores[offset : offset + candidate_count]
                         offset += candidate_count
+                        row = candidate_rows[idx]
                         gold_index = gold_indices[idx]
+                        primary_index = primary_indices[idx]
                         log_probs = F.log_softmax(scores, dim=0)
                         probs = log_probs.exp()
                         if chooser_loss_mode == "global_fix":
-                            details = global_fix_satisfaction[idx]
-                            if details is None:
-                                raise RuntimeError("Missing chooser global-fix cache entry.")
+                            details = chooser_evaluator.evaluate_candidates(
+                                row,
+                                candidates=candidates,
+                                primary_factor_index=primary_index,
+                            )
                             satisfaction = torch.tensor(
-                                details,
+                                [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
                                 dtype=graph_loss.dtype,
                                 device=graph_loss.device,
                             )
@@ -1712,8 +1665,17 @@ def train(
                         else:
                             ce_loss = -log_probs[gold_index]
                             chooser_loss = ce_loss
-                            regression_rates = regression_cache[idx]
-                            primary_flags = primary_cache[idx]
+                            regression_rates: list[float] | None = None
+                            primary_flags: list[float] | None = None
+                            if chooser_need_regression or chooser_need_primary:
+                                regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                                    row,
+                                    candidates=candidates,
+                                    gold_index=gold_index,
+                                    primary_factor_index=primary_index,
+                                    need_regression=chooser_need_regression,
+                                    need_primary=chooser_need_primary,
+                                )
                             if chooser_need_regression and regression_rates is not None:
                                 regression_tensor = torch.tensor(
                                     regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
