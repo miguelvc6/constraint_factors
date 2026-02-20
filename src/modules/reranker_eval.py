@@ -7,7 +7,14 @@ from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 import pandas as pd
 import numpy as np
 
-from modules.constraint_checkers import ConstraintInstance, EvidenceState, evaluate_constraint, normalize_property_id, normalize_token
+from modules.constraint_checkers import (
+    CHECKERS,
+    ConstraintInstance,
+    EvidenceState,
+    evaluate_constraint,
+    normalize_property_id,
+    normalize_token,
+)
 from modules.data_encoders import GlobalIntEncoder
 
 PARAM_P2306 = "P2306"
@@ -601,6 +608,32 @@ def _build_constraint_instance(
     )
 
 
+def _prebind_constraint_checker(
+    instance: ConstraintInstance | None,
+) -> tuple[Any, Any, ConstraintInstance] | None:
+    if instance is None:
+        return None
+    checker = CHECKERS.get(instance.constraint_type)
+    if checker is None:
+        return None
+    is_checkable, is_satisfied = checker
+    return is_checkable, is_satisfied, instance
+
+
+def _evaluate_constraint_prebound(
+    state: EvidenceState,
+    checker_tuple: tuple[Any, Any, ConstraintInstance] | None,
+    p_local: Set[Any],
+) -> tuple[bool, int]:
+    if checker_tuple is None:
+        return False, 0
+    is_checkable, is_satisfied, instance = checker_tuple
+    checkable = bool(is_checkable(state, instance, p_local))
+    if not checkable:
+        return False, 0
+    return True, 1 if bool(is_satisfied(state, instance, p_local)) else 0
+
+
 class CandidateConstraintEvaluator:
     def __init__(
         self,
@@ -716,6 +749,9 @@ class CandidateConstraintEvaluator:
         constraint_instances: List[ConstraintInstance | None] = [
             self._get_constraint_instance(cid) for cid in local_constraint_ids
         ]
+        constraint_checkers: List[tuple[Any, Any, ConstraintInstance] | None] = [
+            _prebind_constraint_checker(instance) for instance in constraint_instances
+        ]
         resolved_primary_index = -1
         if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
             resolved_primary_index = int(primary_factor_index)
@@ -726,15 +762,15 @@ class CandidateConstraintEvaluator:
             except ValueError:
                 resolved_primary_index = -1
 
-        primary_instance = (
-            constraint_instances[resolved_primary_index]
-            if 0 <= resolved_primary_index < len(constraint_instances)
+        primary_checker = (
+            constraint_checkers[resolved_primary_index]
+            if 0 <= resolved_primary_index < len(constraint_checkers)
             else None
         )
 
         placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
 
-        tracked_indices: List[int] = []
+        tracked_checkers: List[tuple[Any, Any, ConstraintInstance]] = []
         if need_regression:
             gold_facts, gold_predicates, gold_missing = _build_post_state_for_candidate(
                 facts_by_entity,
@@ -756,16 +792,18 @@ class CandidateConstraintEvaluator:
                 other_predicate=other_predicate,
                 other_object=other_object,
             )
-            for idx, instance in enumerate(constraint_instances):
-                if idx == resolved_primary_index or instance is None:
+            for idx, checker_tuple in enumerate(constraint_checkers):
+                if idx == resolved_primary_index or checker_tuple is None:
                     continue
-                checkable_post, satisfied_post = evaluate_constraint(gold_state, instance, p_local_set)
+                checkable_post, satisfied_post = _evaluate_constraint_prebound(
+                    gold_state, checker_tuple, p_local_set
+                )
                 if checkable_post and satisfied_post:
-                    tracked_indices.append(idx)
-            if not tracked_indices and not need_primary:
+                    tracked_checkers.append(checker_tuple)
+            if not tracked_checkers and not need_primary:
                 return [0.0] * candidate_count, None
 
-        if need_primary and primary_instance is None and not need_regression:
+        if need_primary and primary_checker is None and not need_regression:
             zeros = [0.0] * candidate_count
             return zeros, list(zeros)
 
@@ -797,11 +835,10 @@ class CandidateConstraintEvaluator:
             if need_regression:
                 regress = 0
                 denom = 0
-                for idx in tracked_indices:
-                    instance = constraint_instances[idx]
-                    if instance is None:
-                        continue
-                    checkable_post, satisfied_post = evaluate_constraint(post_state, instance, p_local_set)
+                for checker_tuple in tracked_checkers:
+                    checkable_post, satisfied_post = _evaluate_constraint_prebound(
+                        post_state, checker_tuple, p_local_set
+                    )
                     if not checkable_post:
                         continue
                     denom += 1
@@ -813,9 +850,9 @@ class CandidateConstraintEvaluator:
 
             if need_primary and primary_flags is not None:
                 primary_value = 0.0
-                if primary_instance is not None:
-                    checkable_post, satisfied_post = evaluate_constraint(
-                        post_state, primary_instance, p_local_set
+                if primary_checker is not None:
+                    checkable_post, satisfied_post = _evaluate_constraint_prebound(
+                        post_state, primary_checker, p_local_set
                     )
                     if checkable_post:
                         primary_value = float(satisfied_post)
