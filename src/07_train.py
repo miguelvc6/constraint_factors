@@ -363,6 +363,83 @@ def _batch_int_attr(
     return values
 
 
+def _compute_batch_slot_topk(
+    proposal_logits: torch.Tensor,
+    *,
+    topk_per_slot: int,
+    slot_allowed_ids: tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]
+    | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """
+    Compute per-slot top-k ids/scores for all graphs in one batched pass.
+    """
+    if proposal_logits.dim() != 3 or proposal_logits.size(1) != NUM_SLOTS:
+        raise ValueError(
+            f"Expected proposal_logits shape (B,{NUM_SLOTS},V), got {tuple(proposal_logits.shape)}"
+        )
+    vocab_size = int(proposal_logits.size(-1))
+    k_default = max(1, min(int(topk_per_slot), vocab_size))
+
+    slot_vals_cpu: list[torch.Tensor] = []
+    slot_ids_cpu: list[torch.Tensor] = []
+    for slot in range(NUM_SLOTS):
+        allowed = None if slot_allowed_ids is None else slot_allowed_ids[slot]
+        if allowed is not None:
+            allowed_ids = allowed
+            if allowed_ids.device != proposal_logits.device:
+                allowed_ids = allowed_ids.to(device=proposal_logits.device)
+            if allowed_ids.dtype != torch.long:
+                allowed_ids = allowed_ids.to(dtype=torch.long)
+            if allowed_ids.numel() >= topk_per_slot and allowed_ids.numel() > 0:
+                restricted = proposal_logits[:, slot, :].index_select(1, allowed_ids)
+                k = max(1, min(int(topk_per_slot), int(restricted.size(1))))
+                vals_local, idx_local = torch.topk(restricted, k=k, dim=1)
+                ids = allowed_ids.index_select(0, idx_local.reshape(-1)).view_as(idx_local)
+                vals = vals_local
+            else:
+                vals, ids = torch.topk(proposal_logits[:, slot, :], k=k_default, dim=1)
+        else:
+            vals, ids = torch.topk(proposal_logits[:, slot, :], k=k_default, dim=1)
+        slot_vals_cpu.append(vals.detach().cpu())
+        slot_ids_cpu.append(ids.detach().cpu())
+    return slot_vals_cpu, slot_ids_cpu
+
+
+def _topk_triples_from_slot_topk_row(
+    slot_vals: list[torch.Tensor],
+    slot_ids: list[torch.Tensor],
+    *,
+    row_index: int,
+    slots: tuple[int, int, int],
+    topk_triples: int,
+) -> list[tuple[int, int, int]]:
+    vals0 = slot_vals[slots[0]][row_index]
+    vals1 = slot_vals[slots[1]][row_index]
+    vals2 = slot_vals[slots[2]][row_index]
+    ids0 = slot_ids[slots[0]][row_index]
+    ids1 = slot_ids[slots[1]][row_index]
+    ids2 = slot_ids[slots[2]][row_index]
+
+    k_combos = min(int(vals0.numel()), int(vals1.numel()), int(vals2.numel()))
+    if k_combos <= 0:
+        return []
+    combos: list[tuple[float, int, int, int]] = []
+    for i in range(k_combos):
+        for j in range(k_combos):
+            for k in range(k_combos):
+                score = float(vals0[i] + vals1[j] + vals2[k])
+                combos.append((score, int(ids0[i]), int(ids1[j]), int(ids2[k])))
+    combos.sort(key=lambda x: x[0], reverse=True)
+    return [(s, p, o) for _, s, p, o in combos[:topk_triples]]
+
+
 def train(
     model: BaseGraphModel,
     train_data: list[Data] | GraphStreamDataset,
@@ -937,6 +1014,12 @@ def train(
                     default_value=0,
                 )
                 gold_rows = targets.detach().cpu().tolist()
+                out_detached = out.detach()
+                batch_slot_vals, batch_slot_ids = _compute_batch_slot_topk(
+                    out_detached,
+                    topk_per_slot=chooser_candidate_cfg.topk_per_slot,
+                    slot_allowed_ids=chooser_slot_allowed_ids,
+                )
                 chooser_losses = torch.zeros(
                     graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                 )
@@ -952,15 +1035,31 @@ def train(
                     context = chooser_train_contexts[context_index]
                     row = chooser_train_rows[context_index]
                     primary_index = int(batch_primary_indices[idx])
+                    add_topk = _topk_triples_from_slot_topk_row(
+                        batch_slot_vals,
+                        batch_slot_ids,
+                        row_index=idx,
+                        slots=(0, 1, 2),
+                        topk_triples=chooser_candidate_cfg.topk_candidates,
+                    )
+                    del_topk = _topk_triples_from_slot_topk_row(
+                        batch_slot_vals,
+                        batch_slot_ids,
+                        row_index=idx,
+                        slots=(3, 4, 5),
+                        topk_triples=chooser_candidate_cfg.topk_candidates,
+                    )
                     candidates, gold_index = build_candidates(
                         gold_slots=gold_rows[idx],
                         context=context,
                         heuristics=chooser_heuristics,
-                        proposal_logits=out[idx].detach(),
+                        proposal_logits=out_detached[idx],
                         cfg=chooser_candidate_cfg,
                         placeholder_ids=chooser_placeholder_ids_for_candidates,
                         num_target_ids=model.num_target_ids,
                         slot_allowed_ids=chooser_slot_allowed_ids,
+                        precomputed_add_topk=add_topk,
+                        precomputed_del_topk=del_topk,
                     )
                     candidate_groups.append(candidates)
                     gold_indices.append(gold_index)
@@ -1493,6 +1592,12 @@ def train(
                         default_value=0,
                     )
                     gold_rows = targets.detach().cpu().tolist()
+                    out_detached = out.detach()
+                    batch_slot_vals, batch_slot_ids = _compute_batch_slot_topk(
+                        out_detached,
+                        topk_per_slot=chooser_candidate_cfg.topk_per_slot,
+                        slot_allowed_ids=chooser_slot_allowed_ids,
+                    )
                     chooser_losses = torch.zeros(
                         graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                     )
@@ -1508,15 +1613,31 @@ def train(
                         context = chooser_val_contexts[context_index]
                         row = chooser_val_rows[context_index]
                         primary_index = int(batch_primary_indices[idx])
+                        add_topk = _topk_triples_from_slot_topk_row(
+                            batch_slot_vals,
+                            batch_slot_ids,
+                            row_index=idx,
+                            slots=(0, 1, 2),
+                            topk_triples=chooser_candidate_cfg.topk_candidates,
+                        )
+                        del_topk = _topk_triples_from_slot_topk_row(
+                            batch_slot_vals,
+                            batch_slot_ids,
+                            row_index=idx,
+                            slots=(3, 4, 5),
+                            topk_triples=chooser_candidate_cfg.topk_candidates,
+                        )
                         candidates, gold_index = build_candidates(
                             gold_slots=gold_rows[idx],
                             context=context,
                             heuristics=chooser_heuristics,
-                            proposal_logits=out[idx].detach(),
+                            proposal_logits=out_detached[idx],
                             cfg=chooser_candidate_cfg,
                             placeholder_ids=chooser_placeholder_ids_for_candidates,
                             num_target_ids=model.num_target_ids,
                             slot_allowed_ids=chooser_slot_allowed_ids,
+                            precomputed_add_topk=add_topk,
+                            precomputed_del_topk=del_topk,
                         )
                         candidate_groups.append(candidates)
                         gold_indices.append(gold_index)

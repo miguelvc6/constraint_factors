@@ -165,6 +165,8 @@ def build_candidates(
         torch.Tensor | None,
     ]
     | None = None,
+    precomputed_add_topk: Sequence[tuple[int, int, int]] | None = None,
+    precomputed_del_topk: Sequence[tuple[int, int, int]] | None = None,
 ) -> tuple[list[tuple[int, int, int, int, int, int]], int]:
     candidates: list[tuple[int, int, int, int, int, int]] = []
     gold = _coerce_gold_candidate(graph=graph, gold_slots=gold_slots)
@@ -190,26 +192,34 @@ def build_candidates(
     candidates.extend(candidate_from_triple(triple, action="add") for triple in add_triples)
     candidates.extend(candidate_from_triple(triple, action="delete") for triple in del_triples)
 
-    add_slots = (0, 1, 2)
-    del_slots = (3, 4, 5)
-    add_topk = _topk_triples_from_logits(
-        proposal_logits,
-        slots=add_slots,
-        topk_triples=cfg.topk_candidates,
-        topk_per_slot=cfg.topk_per_slot,
-        slot_allowed_ids=(slot_allowed_ids[0], slot_allowed_ids[1], slot_allowed_ids[2])
-        if slot_allowed_ids is not None
-        else None,
-    )
-    del_topk = _topk_triples_from_logits(
-        proposal_logits,
-        slots=del_slots,
-        topk_triples=cfg.topk_candidates,
-        topk_per_slot=cfg.topk_per_slot,
-        slot_allowed_ids=(slot_allowed_ids[3], slot_allowed_ids[4], slot_allowed_ids[5])
-        if slot_allowed_ids is not None
-        else None,
-    )
+    if precomputed_add_topk is None:
+        add_slots = (0, 1, 2)
+        add_topk = _topk_triples_from_logits(
+            proposal_logits,
+            slots=add_slots,
+            topk_triples=cfg.topk_candidates,
+            topk_per_slot=cfg.topk_per_slot,
+            slot_allowed_ids=(slot_allowed_ids[0], slot_allowed_ids[1], slot_allowed_ids[2])
+            if slot_allowed_ids is not None
+            else None,
+        )
+    else:
+        add_topk = [(int(s), int(p), int(o)) for s, p, o in precomputed_add_topk]
+
+    if precomputed_del_topk is None:
+        del_slots = (3, 4, 5)
+        del_topk = _topk_triples_from_logits(
+            proposal_logits,
+            slots=del_slots,
+            topk_triples=cfg.topk_candidates,
+            topk_per_slot=cfg.topk_per_slot,
+            slot_allowed_ids=(slot_allowed_ids[3], slot_allowed_ids[4], slot_allowed_ids[5])
+            if slot_allowed_ids is not None
+            else None,
+        )
+    else:
+        del_topk = [(int(s), int(p), int(o)) for s, p, o in precomputed_del_topk]
+
     candidates.extend(candidate_from_triple(triple, action="add") for triple in add_topk)
     candidates.extend(candidate_from_triple(triple, action="delete") for triple in del_topk)
 
