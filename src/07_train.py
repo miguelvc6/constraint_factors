@@ -430,14 +430,35 @@ def _topk_triples_from_slot_topk_row(
     k_combos = min(int(vals0.numel()), int(vals1.numel()), int(vals2.numel()))
     if k_combos <= 0:
         return []
-    combos: list[tuple[float, int, int, int]] = []
-    for i in range(k_combos):
-        for j in range(k_combos):
-            for k in range(k_combos):
-                score = float(vals0[i] + vals1[j] + vals2[k])
-                combos.append((score, int(ids0[i]), int(ids1[j]), int(ids2[k])))
-    combos.sort(key=lambda x: x[0], reverse=True)
-    return [(s, p, o) for _, s, p, o in combos[:topk_triples]]
+    limit = min(max(int(topk_triples), 0), k_combos * k_combos * k_combos)
+    if limit <= 0:
+        return []
+
+    vals0 = vals0[:k_combos]
+    vals1 = vals1[:k_combos]
+    vals2 = vals2[:k_combos]
+    ids0 = ids0[:k_combos]
+    ids1 = ids1[:k_combos]
+    ids2 = ids2[:k_combos]
+
+    combo_scores = (
+        vals0.view(k_combos, 1, 1)
+        + vals1.view(1, k_combos, 1)
+        + vals2.view(1, 1, k_combos)
+    ).reshape(-1)
+
+    # Keep legacy tie behavior by using a stable descending sort over row-major (i,j,k) order.
+    order = torch.argsort(combo_scores, descending=True, stable=True)[:limit]
+    k_sq = k_combos * k_combos
+    i_idx = torch.div(order, k_sq, rounding_mode="floor")
+    rem = torch.remainder(order, k_sq)
+    j_idx = torch.div(rem, k_combos, rounding_mode="floor")
+    k_idx = torch.remainder(rem, k_combos)
+
+    top_ids0 = ids0.index_select(0, i_idx).tolist()
+    top_ids1 = ids1.index_select(0, j_idx).tolist()
+    top_ids2 = ids2.index_select(0, k_idx).tolist()
+    return [(int(s), int(p), int(o)) for s, p, o in zip(top_ids0, top_ids1, top_ids2)]
 
 
 def train(
