@@ -245,6 +245,47 @@ class BaseGraphModel(nn.Module, ABC):
         scores = self._chooser_head(joint).squeeze(-1)
         return scores
 
+    def score_candidates_packed(
+        self,
+        graph_emb: torch.Tensor,
+        candidates: torch.Tensor,
+        candidate_graph_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Score a packed candidate tensor where each row belongs to one graph index.
+        """
+        if not self._chooser_enabled or self._candidate_id_embeddings is None or self._chooser_head is None:
+            raise RuntimeError("Chooser head not enabled; call enable_chooser() before scoring candidates.")
+        if graph_emb.dim() == 1:
+            graph_emb = graph_emb.view(1, -1)
+        if graph_emb.dim() != 2:
+            raise ValueError(f"Expected graph_emb shape (B,H), got {tuple(graph_emb.shape)}")
+        if candidates.dim() == 1:
+            candidates = candidates.view(1, -1)
+        if candidates.dim() != 2 or candidates.size(-1) != 6:
+            raise ValueError(f"Expected candidate slots shape (N,6), got {tuple(candidates.shape)}")
+        if candidate_graph_index.dim() != 1:
+            candidate_graph_index = candidate_graph_index.view(-1)
+        if candidate_graph_index.numel() != candidates.size(0):
+            raise ValueError(
+                "candidate_graph_index length must match number of packed candidates "
+                f"({candidate_graph_index.numel()} vs {candidates.size(0)})"
+            )
+
+        candidates = candidates.to(device=graph_emb.device, dtype=torch.long)
+        candidate_graph_index = candidate_graph_index.to(device=graph_emb.device, dtype=torch.long)
+        if candidate_graph_index.numel() > 0:
+            if int(candidate_graph_index.min().item()) < 0 or int(candidate_graph_index.max().item()) >= graph_emb.size(0):
+                raise ValueError("candidate_graph_index contains out-of-range graph ids.")
+
+        candidate_emb = self._candidate_id_embeddings(
+            candidates.clamp(min=0, max=self.num_target_ids - 1)
+        )
+        candidate_repr = candidate_emb.mean(dim=1)
+        graph_expand = graph_emb.index_select(0, candidate_graph_index)
+        joint = torch.cat([graph_expand, candidate_repr], dim=-1)
+        return self._chooser_head(joint).squeeze(-1)
+
     @abstractmethod
     def create_conv_layer(self, in_channels: int, out_channels: int) -> nn.Module:
         """Return a torch_geometric convolution layer."""

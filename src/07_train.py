@@ -793,9 +793,20 @@ def train(
                 loss_mode = chooser_cfg.loss_mode
                 need_regression = loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
                 need_primary = chooser_cfg.gamma_primary > 0
+                placeholder_ids_for_candidates = (
+                    chooser_placeholder_ids
+                    if chooser_placeholder_ids is not None
+                    else set(chooser_heuristics.placeholder_ids.values())
+                )
                 chooser_losses = torch.zeros(
                     graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                 )
+                candidate_groups: list[list[tuple[int, int, int, int, int, int]]] = []
+                gold_indices: list[int] = []
+                candidate_rows: list[Any] = []
+                primary_indices: list[int] = []
+                packed_candidates: list[tuple[int, int, int, int, int, int]] = []
+                packed_graph_index: list[int] = []
                 for idx, graph in enumerate(graphs):
                     context_index = int(getattr(graph, "context_index", idx))
                     if chooser_train_contexts is None or chooser_train_rows is None:
@@ -804,28 +815,51 @@ def train(
                         raise RuntimeError("Chooser context index out of bounds.")
                     context = chooser_train_contexts[context_index]
                     row = chooser_train_rows[context_index]
+                    primary_index = int(getattr(graph, "primary_factor_index", 0))
                     candidates, gold_index = build_candidates(
                         graph=graph,
                         context=context,
                         heuristics=chooser_heuristics,
                         proposal_logits=out[idx].detach(),
                         cfg=chooser_candidate_cfg,
-                        placeholder_ids=chooser_placeholder_ids
-                        if chooser_placeholder_ids is not None
-                        else set(chooser_heuristics.placeholder_ids.values()),
+                        placeholder_ids=placeholder_ids_for_candidates,
                         num_target_ids=model.num_target_ids,
                     )
-                    candidate_tensor = torch.tensor(
-                        candidates, dtype=torch.long, device=graph_loss.device
-                    )
-                    scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+                    candidate_groups.append(candidates)
+                    gold_indices.append(gold_index)
+                    candidate_rows.append(row)
+                    primary_indices.append(primary_index)
+                    packed_candidates.extend(candidates)
+                    packed_graph_index.extend([idx] * len(candidates))
+
+                if not packed_candidates:
+                    raise RuntimeError("Chooser produced no candidates for the current batch.")
+
+                packed_candidate_tensor = torch.tensor(
+                    packed_candidates, dtype=torch.long, device=graph_loss.device
+                )
+                packed_graph_index_tensor = torch.tensor(
+                    packed_graph_index, dtype=torch.long, device=graph_loss.device
+                )
+                packed_scores = model.score_candidates_packed(
+                    graph_emb, packed_candidate_tensor, packed_graph_index_tensor
+                )
+
+                offset = 0
+                for idx, candidates in enumerate(candidate_groups):
+                    candidate_count = len(candidates)
+                    scores = packed_scores[offset : offset + candidate_count]
+                    offset += candidate_count
+                    row = candidate_rows[idx]
+                    gold_index = gold_indices[idx]
+                    primary_index = primary_indices[idx]
                     log_probs = F.log_softmax(scores, dim=0)
                     probs = log_probs.exp()
                     if loss_mode == "global_fix":
                         details = chooser_evaluator.evaluate_candidates(
                             row,
                             candidates=candidates,
-                            primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                            primary_factor_index=primary_index,
                         )
                         satisfaction = torch.tensor(
                             [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
@@ -843,7 +877,7 @@ def train(
                                 row,
                                 candidates=candidates,
                                 gold_index=gold_index,
-                                primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                                primary_factor_index=primary_index,
                                 need_regression=need_regression,
                                 need_primary=need_primary,
                             )
@@ -863,6 +897,7 @@ def train(
                             primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                             chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
                     chooser_losses[idx] = chooser_loss
+                assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
 
                 graph_loss = graph_loss + chooser_losses
                 train_chooser_loss_sum += float(chooser_losses.sum().item())
@@ -1282,9 +1317,20 @@ def train(
                     loss_mode = chooser_cfg.loss_mode
                     need_regression = loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
                     need_primary = chooser_cfg.gamma_primary > 0
+                    placeholder_ids_for_candidates = (
+                        chooser_placeholder_ids
+                        if chooser_placeholder_ids is not None
+                        else set(chooser_heuristics.placeholder_ids.values())
+                    )
                     chooser_losses = torch.zeros(
                         graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
                     )
+                    candidate_groups: list[list[tuple[int, int, int, int, int, int]]] = []
+                    gold_indices: list[int] = []
+                    candidate_rows: list[Any] = []
+                    primary_indices: list[int] = []
+                    packed_candidates: list[tuple[int, int, int, int, int, int]] = []
+                    packed_graph_index: list[int] = []
                     for idx, graph in enumerate(graphs):
                         context_index = int(getattr(graph, "context_index", idx))
                         if chooser_val_contexts is None or chooser_val_rows is None:
@@ -1293,28 +1339,51 @@ def train(
                             raise RuntimeError("Chooser context index out of bounds.")
                         context = chooser_val_contexts[context_index]
                         row = chooser_val_rows[context_index]
+                        primary_index = int(getattr(graph, "primary_factor_index", 0))
                         candidates, gold_index = build_candidates(
                             graph=graph,
                             context=context,
                             heuristics=chooser_heuristics,
                             proposal_logits=out[idx].detach(),
                             cfg=chooser_candidate_cfg,
-                            placeholder_ids=chooser_placeholder_ids
-                            if chooser_placeholder_ids is not None
-                            else set(chooser_heuristics.placeholder_ids.values()),
+                            placeholder_ids=placeholder_ids_for_candidates,
                             num_target_ids=model.num_target_ids,
                         )
-                        candidate_tensor = torch.tensor(
-                            candidates, dtype=torch.long, device=graph_loss.device
-                        )
-                        scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+                        candidate_groups.append(candidates)
+                        gold_indices.append(gold_index)
+                        candidate_rows.append(row)
+                        primary_indices.append(primary_index)
+                        packed_candidates.extend(candidates)
+                        packed_graph_index.extend([idx] * len(candidates))
+
+                    if not packed_candidates:
+                        raise RuntimeError("Chooser produced no candidates for the current validation batch.")
+
+                    packed_candidate_tensor = torch.tensor(
+                        packed_candidates, dtype=torch.long, device=graph_loss.device
+                    )
+                    packed_graph_index_tensor = torch.tensor(
+                        packed_graph_index, dtype=torch.long, device=graph_loss.device
+                    )
+                    packed_scores = model.score_candidates_packed(
+                        graph_emb, packed_candidate_tensor, packed_graph_index_tensor
+                    )
+
+                    offset = 0
+                    for idx, candidates in enumerate(candidate_groups):
+                        candidate_count = len(candidates)
+                        scores = packed_scores[offset : offset + candidate_count]
+                        offset += candidate_count
+                        row = candidate_rows[idx]
+                        gold_index = gold_indices[idx]
+                        primary_index = primary_indices[idx]
                         log_probs = F.log_softmax(scores, dim=0)
                         probs = log_probs.exp()
                         if loss_mode == "global_fix":
                             details = chooser_evaluator.evaluate_candidates(
                                 row,
                                 candidates=candidates,
-                                primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                                primary_factor_index=primary_index,
                             )
                             satisfaction = torch.tensor(
                                 [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
@@ -1332,7 +1401,7 @@ def train(
                                     row,
                                     candidates=candidates,
                                     gold_index=gold_index,
-                                    primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
+                                    primary_factor_index=primary_index,
                                     need_regression=need_regression,
                                     need_primary=need_primary,
                                 )
@@ -1352,6 +1421,7 @@ def train(
                                 primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                                 chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
                         chooser_losses[idx] = chooser_loss
+                    assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
 
                     graph_loss = graph_loss + chooser_losses
                     val_chooser_loss_sum += float(chooser_losses.sum().item())
