@@ -701,6 +701,8 @@ def train(
         "chooser_candidate_build_s",
         "chooser_packed_score_s",
         "chooser_evaluator_terms_s",
+        "chooser_eval_constraint_s",
+        "chooser_eval_math_s",
         "reweight_s",
         "backward_s",
         "optim_s",
@@ -718,6 +720,8 @@ def train(
         "chooser_candidate_build_s",
         "chooser_packed_score_s",
         "chooser_evaluator_terms_s",
+        "chooser_eval_constraint_s",
+        "chooser_eval_math_s",
         "metrics_s",
         "total_s",
     )
@@ -876,6 +880,8 @@ def train(
             chooser_candidate_build_s = 0.0
             chooser_packed_score_s = 0.0
             chooser_evaluator_terms_s = 0.0
+            chooser_eval_constraint_s = 0.0
+            chooser_eval_math_s = 0.0
             reweight_s = 0.0
 
             if policy_enabled:
@@ -1124,26 +1130,35 @@ def train(
                     row = candidate_rows[idx]
                     gold_index = gold_indices[idx]
                     primary_index = primary_indices[idx]
+                    math_t0 = time.perf_counter() if timing_enabled else 0.0
                     log_probs = F.log_softmax(scores, dim=0)
                     probs = log_probs.exp()
+                    chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                     if chooser_loss_mode == "global_fix":
+                        constraint_t0 = time.perf_counter() if timing_enabled else 0.0
                         details = chooser_evaluator.evaluate_candidates(
                             row,
                             candidates=candidates,
                             primary_factor_index=primary_index,
                         )
+                        chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
+                        math_t0 = time.perf_counter() if timing_enabled else 0.0
                         satisfaction = torch.tensor(
                             [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
                             dtype=graph_loss.dtype,
                             device=graph_loss.device,
                         )
                         chooser_loss = -torch.sum(probs * satisfaction)
+                        chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                     else:
+                        math_t0 = time.perf_counter() if timing_enabled else 0.0
                         ce_loss = -log_probs[gold_index]
                         chooser_loss = ce_loss
+                        chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                         regression_rates: list[float] | None = None
                         primary_flags: list[float] | None = None
                         if chooser_need_regression or chooser_need_primary:
+                            constraint_t0 = time.perf_counter() if timing_enabled else 0.0
                             regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
                                 row,
                                 candidates=candidates,
@@ -1152,7 +1167,9 @@ def train(
                                 need_regression=chooser_need_regression,
                                 need_primary=chooser_need_primary,
                             )
+                            chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
                         if chooser_need_regression and regression_rates is not None:
+                            math_t0 = time.perf_counter() if timing_enabled else 0.0
                             regression_tensor = torch.tensor(
                                 regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
                             )
@@ -1161,12 +1178,15 @@ def train(
                                 probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
                             )
                             chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
+                            chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                         if chooser_need_primary and primary_flags is not None:
+                            math_t0 = time.perf_counter() if timing_enabled else 0.0
                             primary_tensor = torch.tensor(
                                 primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
                             )
                             primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                             chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
+                            chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                     chooser_losses[idx] = chooser_loss
                 chooser_evaluator_terms_s = (time.perf_counter() - chooser_eval_t0) if timing_enabled else 0.0
                 assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
@@ -1272,6 +1292,8 @@ def train(
                     "chooser_candidate_build_s": chooser_candidate_build_s,
                     "chooser_packed_score_s": chooser_packed_score_s,
                     "chooser_evaluator_terms_s": chooser_evaluator_terms_s,
+                    "chooser_eval_constraint_s": chooser_eval_constraint_s,
+                    "chooser_eval_math_s": chooser_eval_math_s,
                     "reweight_s": reweight_s,
                     "backward_s": backward_s,
                     "optim_s": optim_s,
@@ -1325,7 +1347,7 @@ def train(
                 )
             if timing_enabled and train_timing_window_count >= timing_log_every:
                 logger.info(
-                    "Epoch %s train timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
+                    "Epoch %s train timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms chooser_eval_constraints=%.1fms chooser_eval_math=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
                     epoch + 1,
                     batch_idx,
                     train_timing_window_count,
@@ -1336,6 +1358,8 @@ def train(
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_candidate_build_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_packed_score_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_evaluator_terms_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_eval_constraint_s"),
+                    _timing_bucket_ms(train_timing_window, train_timing_window_count, "chooser_eval_math_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "factor_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "policy_s"),
                     _timing_bucket_ms(train_timing_window, train_timing_window_count, "fix_s"),
@@ -1364,7 +1388,7 @@ def train(
         train_policy_acc = 100 * train_policy_correct / max(train_policy_count, 1)
         if timing_enabled and train_timing_epoch_count > 0:
             logger.info(
-                "Epoch %s train timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
+                "Epoch %s train timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms chooser_eval_constraints=%.1fms chooser_eval_math=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
                 epoch + 1,
                 train_timing_epoch_count,
                 timing_warmup_batches,
@@ -1375,6 +1399,8 @@ def train(
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_candidate_build_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_packed_score_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_evaluator_terms_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_eval_constraint_s"),
+                _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "chooser_eval_math_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "factor_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "policy_s"),
                 _timing_bucket_ms(train_timing_epoch, train_timing_epoch_count, "fix_s"),
@@ -1455,6 +1481,8 @@ def train(
                 chooser_candidate_build_s = 0.0
                 chooser_packed_score_s = 0.0
                 chooser_evaluator_terms_s = 0.0
+                chooser_eval_constraint_s = 0.0
+                chooser_eval_math_s = 0.0
 
                 if policy_enabled:
                     phase_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -1701,26 +1729,35 @@ def train(
                         row = candidate_rows[idx]
                         gold_index = gold_indices[idx]
                         primary_index = primary_indices[idx]
+                        math_t0 = time.perf_counter() if timing_enabled else 0.0
                         log_probs = F.log_softmax(scores, dim=0)
                         probs = log_probs.exp()
+                        chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                         if chooser_loss_mode == "global_fix":
+                            constraint_t0 = time.perf_counter() if timing_enabled else 0.0
                             details = chooser_evaluator.evaluate_candidates(
                                 row,
                                 candidates=candidates,
                                 primary_factor_index=primary_index,
                             )
+                            chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
+                            math_t0 = time.perf_counter() if timing_enabled else 0.0
                             satisfaction = torch.tensor(
                                 [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
                                 dtype=graph_loss.dtype,
                                 device=graph_loss.device,
                             )
                             chooser_loss = -torch.sum(probs * satisfaction)
+                            chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                         else:
+                            math_t0 = time.perf_counter() if timing_enabled else 0.0
                             ce_loss = -log_probs[gold_index]
                             chooser_loss = ce_loss
+                            chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                             regression_rates: list[float] | None = None
                             primary_flags: list[float] | None = None
                             if chooser_need_regression or chooser_need_primary:
+                                constraint_t0 = time.perf_counter() if timing_enabled else 0.0
                                 regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
                                     row,
                                     candidates=candidates,
@@ -1729,7 +1766,9 @@ def train(
                                     need_regression=chooser_need_regression,
                                     need_primary=chooser_need_primary,
                                 )
+                                chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
                             if chooser_need_regression and regression_rates is not None:
+                                math_t0 = time.perf_counter() if timing_enabled else 0.0
                                 regression_tensor = torch.tensor(
                                     regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
                                 )
@@ -1738,12 +1777,15 @@ def train(
                                     probs * torch.clamp(regression_tensor - gold_regression, min=0.0)
                                 )
                                 chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
+                                chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                             if chooser_need_primary and primary_flags is not None:
+                                math_t0 = time.perf_counter() if timing_enabled else 0.0
                                 primary_tensor = torch.tensor(
                                     primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
                                 )
                                 primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                                 chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
+                                chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                         chooser_losses[idx] = chooser_loss
                     chooser_evaluator_terms_s = (time.perf_counter() - chooser_eval_t0) if timing_enabled else 0.0
                     assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
@@ -1804,6 +1846,8 @@ def train(
                         "chooser_candidate_build_s": chooser_candidate_build_s,
                         "chooser_packed_score_s": chooser_packed_score_s,
                         "chooser_evaluator_terms_s": chooser_evaluator_terms_s,
+                        "chooser_eval_constraint_s": chooser_eval_constraint_s,
+                        "chooser_eval_math_s": chooser_eval_math_s,
                         "metrics_s": metrics_s,
                         "total_s": time.perf_counter() - batch_t0,
                     }
@@ -1870,7 +1914,7 @@ def train(
                     )
                 if timing_enabled and val_timing_window_count >= timing_log_every:
                     logger.info(
-                        "Epoch %s val timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
+                        "Epoch %s val timing (batch=%s, window=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms chooser_eval_constraints=%.1fms chooser_eval_math=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
                         epoch + 1,
                         batch_idx,
                         val_timing_window_count,
@@ -1881,6 +1925,8 @@ def train(
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_candidate_build_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_packed_score_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_evaluator_terms_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_eval_constraint_s"),
+                        _timing_bucket_ms(val_timing_window, val_timing_window_count, "chooser_eval_math_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "factor_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "policy_s"),
                         _timing_bucket_ms(val_timing_window, val_timing_window_count, "fix_s"),
@@ -1906,7 +1952,7 @@ def train(
         val_policy_acc = 100 * val_policy_correct / max(val_policy_count, 1)
         if timing_enabled and val_timing_epoch_count > 0:
             logger.info(
-                "Epoch %s val timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
+                "Epoch %s val timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms chooser_eval_constraints=%.1fms chooser_eval_math=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms metrics=%.1fms total=%.1fms",
                 epoch + 1,
                 val_timing_epoch_count,
                 timing_warmup_batches,
@@ -1917,6 +1963,8 @@ def train(
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_candidate_build_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_packed_score_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_evaluator_terms_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_eval_constraint_s"),
+                _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "chooser_eval_math_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "factor_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "policy_s"),
                 _timing_bucket_ms(val_timing_epoch, val_timing_epoch_count, "fix_s"),

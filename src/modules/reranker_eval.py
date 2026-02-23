@@ -59,6 +59,69 @@ class CandidateMetrics:
     del_count: int
 
 
+class _ReusableEvidenceState:
+    __slots__ = (
+        "facts_by_entity",
+        "predicates_present",
+        "assume_complete",
+        "missing_edits",
+        "focus_subject",
+        "focus_predicate",
+        "focus_object",
+        "other_subject",
+        "other_predicate",
+        "other_object",
+    )
+
+    def __init__(
+        self,
+        *,
+        facts_by_entity: Dict[int, Dict[int, Set[int]]],
+        predicates_present: Dict[int, Set[int]],
+        assume_complete: bool,
+        missing_edits: Set[Tuple[int, int]],
+        focus_subject: int,
+        focus_predicate: int,
+        focus_object: int,
+        other_subject: int,
+        other_predicate: int,
+        other_object: int,
+    ) -> None:
+        self.facts_by_entity = facts_by_entity
+        self.predicates_present = predicates_present
+        self.assume_complete = assume_complete
+        self.missing_edits = missing_edits
+        self.focus_subject = focus_subject
+        self.focus_predicate = focus_predicate
+        self.focus_object = focus_object
+        self.other_subject = other_subject
+        self.other_predicate = other_predicate
+        self.other_object = other_object
+
+    def entity_in_scope(self, entity_id: int) -> bool:
+        return entity_id in self.facts_by_entity
+
+    def property_complete(self, entity_id: int, predicate_id: int) -> bool:
+        if self.assume_complete:
+            return self.entity_in_scope(entity_id)
+        return predicate_id in self.predicates_present.get(entity_id, set())
+
+    def has_property(self, entity_id: int, predicate_id: int) -> bool:
+        return len(self.facts_by_entity.get(entity_id, {}).get(predicate_id, set())) > 0
+
+    def values_for(self, entity_id: int, predicate_id: int) -> Set[int]:
+        return self.facts_by_entity.get(entity_id, {}).get(predicate_id, set())
+
+    def has_statement(self, entity_id: int, predicate_id: int, object_id: int) -> bool:
+        return object_id in self.facts_by_entity.get(entity_id, {}).get(predicate_id, set())
+
+    def edit_unknown(self, entity_id: int, predicate_id: int) -> bool:
+        return (entity_id, predicate_id) in self.missing_edits
+
+    def focus_statement_present(self) -> bool:
+        return self.has_statement(self.focus_subject, self.focus_predicate, self.focus_object)
+
+
 def _load_registry(path: str | None) -> Dict[str, RegistryEntry]:
     if path is None:
         return {}
@@ -770,6 +833,19 @@ class CandidateConstraintEvaluator:
 
         placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
 
+        state = _ReusableEvidenceState(
+            facts_by_entity=facts_by_entity,
+            predicates_present=predicates_present,
+            assume_complete=self._assume_complete,
+            missing_edits=set(),
+            focus_subject=subject,
+            focus_predicate=predicate,
+            focus_object=obj,
+            other_subject=other_subject,
+            other_predicate=other_predicate,
+            other_object=other_object,
+        )
+
         tracked_checkers: List[tuple[Any, Any, ConstraintInstance]] = []
         if need_regression:
             gold_facts, gold_predicates, gold_missing = _build_post_state_for_candidate(
@@ -780,26 +856,17 @@ class CandidateConstraintEvaluator:
                 placeholder_map=placeholder_map,
                 assume_complete=self._assume_complete,
             )
-            gold_state = EvidenceState(
-                facts_by_entity=gold_facts,
-                predicates_present=gold_predicates,
-                assume_complete=self._assume_complete,
-                missing_edits=gold_missing,
-                focus_subject=subject,
-                focus_predicate=predicate,
-                focus_object=obj,
-                other_subject=other_subject,
-                other_predicate=other_predicate,
-                other_object=other_object,
-            )
+            state.facts_by_entity = gold_facts
+            state.predicates_present = gold_predicates
+            state.missing_edits = gold_missing
             for idx, checker_tuple in enumerate(constraint_checkers):
                 if idx == resolved_primary_index or checker_tuple is None:
                     continue
                 is_checkable, is_satisfied, instance = checker_tuple
-                checkable_post = bool(is_checkable(gold_state, instance, p_local_set))
+                checkable_post = bool(is_checkable(state, instance, p_local_set))
                 if not checkable_post:
                     continue
-                if bool(is_satisfied(gold_state, instance, p_local_set)):
+                if bool(is_satisfied(state, instance, p_local_set)):
                     tracked_checkers.append(checker_tuple)
             if not tracked_checkers and not need_primary:
                 return [0.0] * candidate_count, None
@@ -825,28 +892,19 @@ class CandidateConstraintEvaluator:
                 placeholder_map=placeholder_map,
                 assume_complete=self._assume_complete,
             )
-            post_state = EvidenceState(
-                facts_by_entity=post_facts,
-                predicates_present=post_predicates,
-                assume_complete=self._assume_complete,
-                missing_edits=missing_edits,
-                focus_subject=subject,
-                focus_predicate=predicate,
-                focus_object=obj,
-                other_subject=other_subject,
-                other_predicate=other_predicate,
-                other_object=other_object,
-            )
+            state.facts_by_entity = post_facts
+            state.predicates_present = post_predicates
+            state.missing_edits = missing_edits
 
             if need_regression:
                 regress = 0
                 denom = 0
                 for is_checkable, is_satisfied, instance in tracked_checkers:
-                    checkable_post = bool(is_checkable(post_state, instance, p_local_set))
+                    checkable_post = bool(is_checkable(state, instance, p_local_set))
                     if not checkable_post:
                         continue
                     denom += 1
-                    if not bool(is_satisfied(post_state, instance, p_local_set)):
+                    if not bool(is_satisfied(state, instance, p_local_set)):
                         regress += 1
                 regression_rates.append(float(regress) / float(denom) if denom else 0.0)
             else:
@@ -859,9 +917,9 @@ class CandidateConstraintEvaluator:
                     and primary_is_satisfied is not None
                     and primary_instance is not None
                 ):
-                    checkable_post = bool(primary_is_checkable(post_state, primary_instance, p_local_set))
+                    checkable_post = bool(primary_is_checkable(state, primary_instance, p_local_set))
                     if checkable_post:
-                        primary_value = float(bool(primary_is_satisfied(post_state, primary_instance, p_local_set)))
+                        primary_value = float(bool(primary_is_satisfied(state, primary_instance, p_local_set)))
                 primary_flags.append(primary_value)
 
         return regression_rates, primary_flags
