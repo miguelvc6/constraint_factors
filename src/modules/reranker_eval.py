@@ -567,17 +567,24 @@ def _build_post_state_for_candidate(
             entity_facts[pred] = {obj}
             copied_value_sets.add(key)
         else:
-            if key not in copied_value_sets:
-                entity_facts[pred] = set(values)
-                copied_value_sets.add(key)
-                values = entity_facts[pred]
-            values.add(obj)
+            if obj in values:
+                pass
+            else:
+                if key not in copied_value_sets:
+                    entity_facts[pred] = set(values)
+                    copied_value_sets.add(key)
+                    values = entity_facts[pred]
+                values.add(obj)
+
+        base_subject_preds = base_predicates_present.get(subj, set())
+        if pred in base_subject_preds:
+            continue
 
         subject_preds = copied_predicate_sets.get(subj)
         if subject_preds is None:
             if post_predicates is base_predicates_present:
                 post_predicates = dict(base_predicates_present)
-            subject_preds = set(base_predicates_present.get(subj, set()))
+            subject_preds = set(base_subject_preds)
             post_predicates[subj] = subject_preds
             copied_predicate_sets[subj] = subject_preds
         subject_preds.add(pred)
