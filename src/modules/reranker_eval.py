@@ -751,6 +751,9 @@ class CandidateConstraintEvaluator:
         self._default_relations = _resolve_default_relations(encoder)
         self._placeholder_token_ids = _resolve_placeholder_token_ids(encoder)
         self._constraint_cache: Dict[str, ConstraintInstance] = {}
+        self._checker_sequence_cache: Dict[
+            Tuple[Any, ...], Tuple[tuple[Any, Any, ConstraintInstance] | None, ...]
+        ] = {}
 
     def _get_constraint_instance(self, constraint_id: Any) -> ConstraintInstance | None:
         entry = _lookup_registry_entry(
@@ -774,6 +777,24 @@ class CandidateConstraintEvaluator:
         )
         self._constraint_cache[cache_key] = instance
         return instance
+
+    def _get_checker_sequence(
+        self,
+        local_constraint_ids: Sequence[Any],
+    ) -> Tuple[tuple[Any, Any, ConstraintInstance] | None, ...]:
+        key = tuple(local_constraint_ids)
+        cached = self._checker_sequence_cache.get(key)
+        if cached is not None:
+            return cached
+        checkers = tuple(
+            _prebind_constraint_checker(self._get_constraint_instance(cid))
+            for cid in local_constraint_ids
+        )
+        # Guard against unbounded cache growth on pathological datasets.
+        if len(self._checker_sequence_cache) >= 100_000:
+            self._checker_sequence_cache.clear()
+        self._checker_sequence_cache[key] = checkers
+        return checkers
 
     def evaluate(
         self,
@@ -842,12 +863,7 @@ class CandidateConstraintEvaluator:
             zeros = [0.0] * candidate_count
             return zeros, (list(zeros) if need_primary else None)
 
-        constraint_instances: List[ConstraintInstance | None] = [
-            self._get_constraint_instance(cid) for cid in local_constraint_ids
-        ]
-        constraint_checkers: List[tuple[Any, Any, ConstraintInstance] | None] = [
-            _prebind_constraint_checker(instance) for instance in constraint_instances
-        ]
+        constraint_checkers = self._get_checker_sequence(local_constraint_ids)
         resolved_primary_index = -1
         if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
             resolved_primary_index = int(primary_factor_index)
