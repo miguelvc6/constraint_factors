@@ -528,22 +528,10 @@ def _build_post_state_for_candidate(
     copied_value_sets: Set[Tuple[Any, Any]] = set()
     copied_predicate_sets: Dict[Any, Set[Any]] = {}
 
-    def _ensure_entity_facts_copy(subj: Any, source_facts: Dict[Any, Set[Any]]) -> Dict[Any, Set[Any]]:
-        entity_facts = copied_entity_maps.get(subj)
-        if entity_facts is not None:
-            return entity_facts
-        nonlocal post_facts
-        if post_facts is base_facts_by_entity:
-            post_facts = dict(base_facts_by_entity)
-        entity_facts = dict(source_facts)
-        post_facts[subj] = entity_facts
-        copied_entity_maps[subj] = entity_facts
-        return entity_facts
-
     for kind, base_idx in (("del", 3), ("add", 0)):
-        subj = _resolve_placeholder(candidate_slots[base_idx], placeholder_map)
-        pred = _resolve_placeholder(candidate_slots[base_idx + 1], placeholder_map)
-        obj = _resolve_placeholder(candidate_slots[base_idx + 2], placeholder_map)
+        subj = _resolve_placeholder(int(candidate_slots[base_idx]), placeholder_map)
+        pred = _resolve_placeholder(int(candidate_slots[base_idx + 1]), placeholder_map)
+        obj = _resolve_placeholder(int(candidate_slots[base_idx + 2]), placeholder_map)
         if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
             continue
         if not assume_complete and pred not in base_predicates_present.get(subj, set()):
@@ -557,24 +545,25 @@ def _build_post_state_for_candidate(
             missing_edits.add((subj, pred))
             continue
 
-        source_facts = base_facts_by_entity.get(subj)
-        if source_facts is None:
-            if missing_edits is None:
-                missing_edits = set()
-            missing_edits.add((subj, pred))
-            continue
         entity_facts = copied_entity_maps.get(subj)
-        read_facts = entity_facts if entity_facts is not None else source_facts
+        if entity_facts is None:
+            source_facts = base_facts_by_entity.get(subj)
+            if source_facts is None:
+                if missing_edits is None:
+                    missing_edits = set()
+                missing_edits.add((subj, pred))
+                continue
+            if post_facts is base_facts_by_entity:
+                post_facts = dict(base_facts_by_entity)
+            entity_facts = dict(source_facts)
+            post_facts[subj] = entity_facts
+            copied_entity_maps[subj] = entity_facts
+
         key = (subj, pred)
-        values = read_facts.get(pred)
+        values = entity_facts.get(pred)
         if kind == "del":
             if values is None or obj not in values:
                 continue
-            if entity_facts is None:
-                entity_facts = _ensure_entity_facts_copy(subj, source_facts)
-                values = entity_facts.get(pred)
-                if values is None or obj not in values:
-                    continue
             if key not in copied_value_sets:
                 entity_facts[pred] = set(values)
                 copied_value_sets.add(key)
@@ -582,28 +571,21 @@ def _build_post_state_for_candidate(
             values.discard(obj)
             continue
 
-        base_subject_preds = base_predicates_present.get(subj, set())
-        need_add_object = values is None or obj not in values
-        need_add_predicate = pred not in base_subject_preds
-        if not need_add_object and not need_add_predicate:
-            continue
-        if entity_facts is None:
-            entity_facts = _ensure_entity_facts_copy(subj, source_facts)
-            values = entity_facts.get(pred)
-
         if values is None:
-            if need_add_object:
-                entity_facts[pred] = {obj}
-                copied_value_sets.add(key)
+            entity_facts[pred] = {obj}
+            copied_value_sets.add(key)
         else:
-            if need_add_object:
+            if obj in values:
+                pass
+            else:
                 if key not in copied_value_sets:
                     entity_facts[pred] = set(values)
                     copied_value_sets.add(key)
                     values = entity_facts[pred]
                 values.add(obj)
 
-        if not need_add_predicate:
+        base_subject_preds = base_predicates_present.get(subj, set())
+        if pred in base_subject_preds:
             continue
 
         subject_preds = copied_predicate_sets.get(subj)
@@ -751,9 +733,6 @@ class CandidateConstraintEvaluator:
         self._default_relations = _resolve_default_relations(encoder)
         self._placeholder_token_ids = _resolve_placeholder_token_ids(encoder)
         self._constraint_cache: Dict[str, ConstraintInstance] = {}
-        self._checker_sequence_cache: Dict[
-            Tuple[Any, ...], Tuple[tuple[Any, Any, ConstraintInstance] | None, ...]
-        ] = {}
 
     def _get_constraint_instance(self, constraint_id: Any) -> ConstraintInstance | None:
         entry = _lookup_registry_entry(
@@ -777,24 +756,6 @@ class CandidateConstraintEvaluator:
         )
         self._constraint_cache[cache_key] = instance
         return instance
-
-    def _get_checker_sequence(
-        self,
-        local_constraint_ids: Sequence[Any],
-    ) -> Tuple[tuple[Any, Any, ConstraintInstance] | None, ...]:
-        key = tuple(local_constraint_ids)
-        cached = self._checker_sequence_cache.get(key)
-        if cached is not None:
-            return cached
-        checkers = tuple(
-            _prebind_constraint_checker(self._get_constraint_instance(cid))
-            for cid in local_constraint_ids
-        )
-        # Guard against unbounded cache growth on pathological datasets.
-        if len(self._checker_sequence_cache) >= 100_000:
-            self._checker_sequence_cache.clear()
-        self._checker_sequence_cache[key] = checkers
-        return checkers
 
     def evaluate(
         self,
@@ -863,7 +824,12 @@ class CandidateConstraintEvaluator:
             zeros = [0.0] * candidate_count
             return zeros, (list(zeros) if need_primary else None)
 
-        constraint_checkers = self._get_checker_sequence(local_constraint_ids)
+        constraint_instances: List[ConstraintInstance | None] = [
+            self._get_constraint_instance(cid) for cid in local_constraint_ids
+        ]
+        constraint_checkers: List[tuple[Any, Any, ConstraintInstance] | None] = [
+            _prebind_constraint_checker(instance) for instance in constraint_instances
+        ]
         resolved_primary_index = -1
         if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
             resolved_primary_index = int(primary_factor_index)
