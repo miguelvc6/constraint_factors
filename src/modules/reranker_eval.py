@@ -32,6 +32,8 @@ PLACEHOLDER_LABELS: tuple[str, ...] = (
     "other_object",
 )
 
+_EMPTY_MISSING_EDITS = frozenset()
+
 
 @dataclass(frozen=True)
 class RegistryEntry:
@@ -520,7 +522,7 @@ def _build_post_state_for_candidate(
 ) -> Tuple[Dict[Any, Dict[Any, Set[Any]]], Dict[Any, Set[Any]], Set[Tuple[Any, Any]]]:
     post_facts = base_facts_by_entity
     post_predicates = base_predicates_present
-    missing_edits: Set[Tuple[Any, Any]] = set()
+    missing_edits: Set[Tuple[Any, Any]] | None = None
 
     copied_entity_maps: Dict[Any, Dict[Any, Set[Any]]] = {}
     copied_value_sets: Set[Tuple[Any, Any]] = set()
@@ -533,9 +535,13 @@ def _build_post_state_for_candidate(
         if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
             continue
         if not assume_complete and pred not in base_predicates_present.get(subj, set()):
+            if missing_edits is None:
+                missing_edits = set()
             missing_edits.add((subj, pred))
             continue
         if pred not in p_local:
+            if missing_edits is None:
+                missing_edits = set()
             missing_edits.add((subj, pred))
             continue
 
@@ -543,6 +549,8 @@ def _build_post_state_for_candidate(
         if entity_facts is None:
             source_facts = base_facts_by_entity.get(subj)
             if source_facts is None:
+                if missing_edits is None:
+                    missing_edits = set()
                 missing_edits.add((subj, pred))
                 continue
             if post_facts is base_facts_by_entity:
@@ -589,7 +597,7 @@ def _build_post_state_for_candidate(
             copied_predicate_sets[subj] = subject_preds
         subject_preds.add(pred)
 
-    return post_facts, post_predicates, missing_edits
+    return post_facts, post_predicates, missing_edits if missing_edits is not None else _EMPTY_MISSING_EDITS
 
 
 def _resolve_default_relations(encoder: GlobalIntEncoder | None) -> List[int]:
