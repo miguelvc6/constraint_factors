@@ -541,9 +541,9 @@ def _build_post_state_for_candidate(
         return entity_facts
 
     for kind, base_idx in (("del", 3), ("add", 0)):
-        subj = _resolve_placeholder(int(candidate_slots[base_idx]), placeholder_map)
-        pred = _resolve_placeholder(int(candidate_slots[base_idx + 1]), placeholder_map)
-        obj = _resolve_placeholder(int(candidate_slots[base_idx + 2]), placeholder_map)
+        subj = _resolve_placeholder(candidate_slots[base_idx], placeholder_map)
+        pred = _resolve_placeholder(candidate_slots[base_idx + 1], placeholder_map)
+        obj = _resolve_placeholder(candidate_slots[base_idx + 2], placeholder_map)
         if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
             continue
         if not assume_complete and pred not in base_predicates_present.get(subj, set()):
