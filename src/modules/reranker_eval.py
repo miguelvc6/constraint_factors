@@ -528,6 +528,18 @@ def _build_post_state_for_candidate(
     copied_value_sets: Set[Tuple[Any, Any]] = set()
     copied_predicate_sets: Dict[Any, Set[Any]] = {}
 
+    def _ensure_entity_facts_copy(subj: Any, source_facts: Dict[Any, Set[Any]]) -> Dict[Any, Set[Any]]:
+        entity_facts = copied_entity_maps.get(subj)
+        if entity_facts is not None:
+            return entity_facts
+        nonlocal post_facts
+        if post_facts is base_facts_by_entity:
+            post_facts = dict(base_facts_by_entity)
+        entity_facts = dict(source_facts)
+        post_facts[subj] = entity_facts
+        copied_entity_maps[subj] = entity_facts
+        return entity_facts
+
     for kind, base_idx in (("del", 3), ("add", 0)):
         subj = _resolve_placeholder(int(candidate_slots[base_idx]), placeholder_map)
         pred = _resolve_placeholder(int(candidate_slots[base_idx + 1]), placeholder_map)
@@ -545,25 +557,24 @@ def _build_post_state_for_candidate(
             missing_edits.add((subj, pred))
             continue
 
+        source_facts = base_facts_by_entity.get(subj)
+        if source_facts is None:
+            if missing_edits is None:
+                missing_edits = set()
+            missing_edits.add((subj, pred))
+            continue
         entity_facts = copied_entity_maps.get(subj)
-        if entity_facts is None:
-            source_facts = base_facts_by_entity.get(subj)
-            if source_facts is None:
-                if missing_edits is None:
-                    missing_edits = set()
-                missing_edits.add((subj, pred))
-                continue
-            if post_facts is base_facts_by_entity:
-                post_facts = dict(base_facts_by_entity)
-            entity_facts = dict(source_facts)
-            post_facts[subj] = entity_facts
-            copied_entity_maps[subj] = entity_facts
-
+        read_facts = entity_facts if entity_facts is not None else source_facts
         key = (subj, pred)
-        values = entity_facts.get(pred)
+        values = read_facts.get(pred)
         if kind == "del":
             if values is None or obj not in values:
                 continue
+            if entity_facts is None:
+                entity_facts = _ensure_entity_facts_copy(subj, source_facts)
+                values = entity_facts.get(pred)
+                if values is None or obj not in values:
+                    continue
             if key not in copied_value_sets:
                 entity_facts[pred] = set(values)
                 copied_value_sets.add(key)
@@ -571,21 +582,28 @@ def _build_post_state_for_candidate(
             values.discard(obj)
             continue
 
+        base_subject_preds = base_predicates_present.get(subj, set())
+        need_add_object = values is None or obj not in values
+        need_add_predicate = pred not in base_subject_preds
+        if not need_add_object and not need_add_predicate:
+            continue
+        if entity_facts is None:
+            entity_facts = _ensure_entity_facts_copy(subj, source_facts)
+            values = entity_facts.get(pred)
+
         if values is None:
-            entity_facts[pred] = {obj}
-            copied_value_sets.add(key)
+            if need_add_object:
+                entity_facts[pred] = {obj}
+                copied_value_sets.add(key)
         else:
-            if obj in values:
-                pass
-            else:
+            if need_add_object:
                 if key not in copied_value_sets:
                     entity_facts[pred] = set(values)
                     copied_value_sets.add(key)
                     values = entity_facts[pred]
                 values.add(obj)
 
-        base_subject_preds = base_predicates_present.get(subj, set())
-        if pred in base_subject_preds:
+        if not need_add_predicate:
             continue
 
         subject_preds = copied_predicate_sets.get(subj)
