@@ -795,10 +795,11 @@ class CandidateConstraintEvaluator:
             for idx, checker_tuple in enumerate(constraint_checkers):
                 if idx == resolved_primary_index or checker_tuple is None:
                     continue
-                checkable_post, satisfied_post = _evaluate_constraint_prebound(
-                    gold_state, checker_tuple, p_local_set
-                )
-                if checkable_post and satisfied_post:
+                is_checkable, is_satisfied, instance = checker_tuple
+                checkable_post = bool(is_checkable(gold_state, instance, p_local_set))
+                if not checkable_post:
+                    continue
+                if bool(is_satisfied(gold_state, instance, p_local_set)):
                     tracked_checkers.append(checker_tuple)
             if not tracked_checkers and not need_primary:
                 return [0.0] * candidate_count, None
@@ -806,6 +807,11 @@ class CandidateConstraintEvaluator:
         if need_primary and primary_checker is None and not need_regression:
             zeros = [0.0] * candidate_count
             return zeros, list(zeros)
+        primary_is_checkable = None
+        primary_is_satisfied = None
+        primary_instance: ConstraintInstance | None = None
+        if primary_checker is not None:
+            primary_is_checkable, primary_is_satisfied, primary_instance = primary_checker
 
         regression_rates: List[float] = []
         primary_flags: List[float] | None = [] if need_primary else None
@@ -835,14 +841,12 @@ class CandidateConstraintEvaluator:
             if need_regression:
                 regress = 0
                 denom = 0
-                for checker_tuple in tracked_checkers:
-                    checkable_post, satisfied_post = _evaluate_constraint_prebound(
-                        post_state, checker_tuple, p_local_set
-                    )
+                for is_checkable, is_satisfied, instance in tracked_checkers:
+                    checkable_post = bool(is_checkable(post_state, instance, p_local_set))
                     if not checkable_post:
                         continue
                     denom += 1
-                    if not satisfied_post:
+                    if not bool(is_satisfied(post_state, instance, p_local_set)):
                         regress += 1
                 regression_rates.append(float(regress) / float(denom) if denom else 0.0)
             else:
@@ -850,12 +854,14 @@ class CandidateConstraintEvaluator:
 
             if need_primary and primary_flags is not None:
                 primary_value = 0.0
-                if primary_checker is not None:
-                    checkable_post, satisfied_post = _evaluate_constraint_prebound(
-                        post_state, primary_checker, p_local_set
-                    )
+                if (
+                    primary_is_checkable is not None
+                    and primary_is_satisfied is not None
+                    and primary_instance is not None
+                ):
+                    checkable_post = bool(primary_is_checkable(post_state, primary_instance, p_local_set))
                     if checkable_post:
-                        primary_value = float(satisfied_post)
+                        primary_value = float(bool(primary_is_satisfied(post_state, primary_instance, p_local_set)))
                 primary_flags.append(primary_value)
 
         return regression_rates, primary_flags
