@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate ~20 hyperparameter-search configs for the MAIN model (Fix-1):
+Generate a focused 5-config hyperparameter sweep for the MAIN model (Fix-1):
 - Proposal + Chooser(Fix-1) + Typed Pressure + Factor Loss
 - Full dataset defaults: dataset_variant="full", min_occurrence=100
   (resolved to "full_minocc100")
@@ -14,7 +14,7 @@ Run:
     --processed-root data/processed \
     --models-root models \
     --encoding node_id \
-    --num-configs 20
+    --num-configs 5
 """
 
 import argparse
@@ -101,7 +101,7 @@ def main() -> None:
     ap.add_argument("--processed-root", type=Path, default=Path("data/processed"))
     ap.add_argument("--models-root", type=Path, default=Path("models"))
     ap.add_argument("--encoding", type=str, default="node_id")
-    ap.add_argument("--num-configs", type=int, default=20)
+    ap.add_argument("--num-configs", type=int, default=5)
     ap.add_argument("--min-occurrence", type=int, default=100)
     ap.add_argument("--dataset-variant", type=str, default="full")
     ap.add_argument(
@@ -125,46 +125,25 @@ def main() -> None:
     sample = _load_first_data_obj(artifacts[0].path)
     num_factor_types = _infer_num_factor_types(sample)
 
-    # ---- Search design (20 configs) ----
-    # Center around your ESWC best-ish backbone (4 layers, hidden ~400, dropout ~0.17, lr ~7.5e-4, wd ~1.1e-4),
-    # but adapt to new objective by scanning:
-    # - chooser beta (no-regression weight) as main trade-off dial
-    # - candidate cap/topk to test candidate search pressure
-    # - pressure type conditioning concat vs gate
-    # - modest LR/WD/dropout and hidden variations
-    #
-    # Keep epochs/patience suitable for full runs (you can adjust later).
+    # ---- Focused shortlist (5 configs) ----
+    # These are the selected candidates for constrained-budget model selection.
     grid = [
-        # Base family (concat) – beta sweep, mild LR/WD variations
-        HP("c0", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 0.3, 0.0, 20, 80, 0.10, "concat"),
+        # Beta sweep on concat pressure
         HP("c1", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 20, 80, 0.10, "concat"),
         HP("c2", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
         HP("c3", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c4", 256, 5.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c5", 256, 1.0e-3, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c6", 256, 7.5e-4, 5.0e-5, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c7", 256, 7.5e-4, 2.0e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        # Candidate-set sensitivity (concat)
-        HP("c8", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 10, 40, 0.10, "concat"),
-        HP("c9", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 30, 120, 0.10, "concat"),
-        # Primary satisfaction emphasis (gamma)
-        HP("c10", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.2, 20, 80, 0.10, "concat"),
-        HP("c11", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.5, 20, 80, 0.10, "concat"),
-        # Backbone capacity + regularization (concat)
-        HP("c12", 256, 7.5e-4, 1.1e-4, 0.12, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c13", 256, 7.5e-4, 1.1e-4, 0.25, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c14", 256, 7.5e-4, 1.1e-4, 0.17, 3, 320, 320, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c15", 256, 7.5e-4, 1.1e-4, 0.17, 5, 512, 512, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        # Pressure mode ablation: gate vs concat (keep same as strong configs)
+        # Pressure-mode ablation
         HP("g0", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "gate"),
-        HP("g1", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 20, 80, 0.10, "gate"),
-        HP("g2", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 20, 80, 0.10, "gate"),
-        # Factor loss weight scan (concat)
-        HP("f0", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.05, "concat"),
-        HP("f1", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.20, "concat"),
+        # Gamma stress test
+        HP("c10", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.2, 20, 80, 0.10, "concat"),
     ]
 
-    # truncate/extend to requested count
+    if args.num_configs > len(grid):
+        raise ValueError(
+            f"Requested --num-configs={args.num_configs}, but focused sweep only defines {len(grid)} configs."
+        )
+
+    # truncate to requested count (useful for quick smoke runs)
     grid = grid[: args.num_configs]
 
     created = 0
