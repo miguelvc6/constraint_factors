@@ -92,11 +92,28 @@ def _coerce_sequence(value: object) -> tuple[int, ...]:
     """Coerce a value to a tuple of ints, or empty tuple on failure."""
     if value is None:
         return ()
-    if isinstance(value, tuple):
-        return value
-    if isinstance(value, list):
-        return tuple(int(v) for v in value)
-    return ()
+    items: object
+    if isinstance(value, (tuple, list)):
+        items = value
+    elif isinstance(value, (str, bytes, bytearray, memoryview)):
+        return ()
+    elif hasattr(value, "tolist"):
+        items = value.tolist()
+    elif isinstance(value, Iterable):
+        items = list(value)
+    else:
+        return ()
+
+    if not isinstance(items, (tuple, list)):
+        items = [items]
+
+    normalized: list[int] = []
+    for item in items:
+        try:
+            normalized.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return tuple(normalized)
 
 
 def load_violation_contexts(base_path: Path, split: str, *, none_class: int = 0) -> list[ViolationContext]:

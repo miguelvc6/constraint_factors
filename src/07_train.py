@@ -320,6 +320,7 @@ def _batch_int_attr(
     *,
     default_value: int = 0,
     default_to_batch_index: bool = False,
+    min_value: int | None = None,
 ) -> list[int]:
     """
     Convert a batched graph attribute into a Python `list[int]` of length `batch_size`.
@@ -357,9 +358,14 @@ def _batch_int_attr(
     for idx, item in enumerate(flat):
         fallback = idx if default_to_batch_index else int(default_value)
         try:
-            values.append(int(item))
+            value = int(item)
         except (TypeError, ValueError):
-            values.append(fallback)
+            value = fallback
+        if min_value is not None and value < min_value:
+            raise RuntimeError(
+                f"Batched attribute '{attr_name}' contains value {value} below minimum {min_value}."
+            )
+        values.append(value)
     return values
 
 
@@ -594,6 +600,43 @@ def train(
         patience=train_cfg.scheduler_patience,
     )
     criterion = torch.nn.CrossEntropyLoss(reduction="none")
+    entity_allowed_mask: torch.Tensor | None = None
+    predicate_allowed_mask: torch.Tensor | None = None
+    if (
+        hasattr(model, "entity_class_ids")
+        and torch.is_tensor(getattr(model, "entity_class_ids"))
+        and int(getattr(model, "entity_class_ids").numel()) < model.num_target_ids
+    ):
+        entity_allowed_mask = torch.zeros(model.num_target_ids, dtype=torch.bool, device=device)
+        entity_ids = getattr(model, "entity_class_ids").to(device=device, dtype=torch.long).view(-1)
+        entity_allowed_mask[entity_ids] = True
+    if (
+        hasattr(model, "predicate_class_ids")
+        and torch.is_tensor(getattr(model, "predicate_class_ids"))
+        and int(getattr(model, "predicate_class_ids").numel()) < model.num_target_ids
+    ):
+        predicate_allowed_mask = torch.zeros(model.num_target_ids, dtype=torch.bool, device=device)
+        predicate_ids = getattr(model, "predicate_class_ids").to(device=device, dtype=torch.long).view(-1)
+        predicate_allowed_mask[predicate_ids] = True
+
+    def _assert_targets_supported_by_heads(targets: torch.Tensor, *, split: str, batch_idx: int) -> None:
+        if entity_allowed_mask is not None:
+            entity_targets = targets[:, ENTITY_SLOT_INDICES].reshape(-1)
+            entity_ok = entity_allowed_mask[entity_targets]
+            if not bool(entity_ok.all()):
+                bad_ids = torch.unique(entity_targets[~entity_ok].detach().cpu())[:10].tolist()
+                raise AssertionError(
+                    f"{split} batch {batch_idx}: found entity target ids outside entity_class_ids: {bad_ids}"
+                )
+        if predicate_allowed_mask is not None:
+            predicate_targets = targets[:, PREDICATE_SLOT_INDICES].reshape(-1)
+            predicate_ok = predicate_allowed_mask[predicate_targets]
+            if not bool(predicate_ok.all()):
+                bad_ids = torch.unique(predicate_targets[~predicate_ok].detach().cpu())[:10].tolist()
+                raise AssertionError(
+                    f"{split} batch {batch_idx}: found predicate target ids outside predicate_class_ids: {bad_ids}"
+                )
+
     factor_cfg = train_cfg.factor_loss
     factor_criterion: torch.nn.BCEWithLogitsLoss | None = None
     if factor_cfg.enabled:
@@ -844,6 +887,7 @@ def train(
             assert 0 <= t_min and t_max < model.num_target_ids, (
                 f"Expected targets in [0,{model.num_target_ids}), got [{t_min},{t_max}]"
             )
+            _assert_targets_supported_by_heads(targets, split="train", batch_idx=batch_idx)
             data_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
             optimizer.zero_grad(set_to_none=True)
@@ -900,11 +944,12 @@ def train(
                     "context_index",
                     graph_loss.size(0),
                     default_to_batch_index=True,
+                    min_value=0,
                 )
                 targets_rows = targets.detach().cpu().tolist()
                 policy_labels = []
                 for idx, context_index in enumerate(batch_context_indices):
-                    if context_index >= len(policy_train_contexts):
+                    if context_index < 0 or context_index >= len(policy_train_contexts):
                         raise RuntimeError("Policy context index out of bounds.")
                     context = policy_train_contexts[context_index]
                     decision = derive_policy_label(targets_rows[idx], context, none_class=NONE_CLASS_INDEX)
@@ -1046,12 +1091,14 @@ def train(
                     "context_index",
                     graph_loss.size(0),
                     default_to_batch_index=True,
+                    min_value=0,
                 )
                 batch_primary_indices = _batch_int_attr(
                     data,
                     "primary_factor_index",
                     graph_loss.size(0),
                     default_value=0,
+                    min_value=0,
                 )
                 gold_rows = targets.detach().cpu().tolist()
                 out_detached = out.detach()
@@ -1071,7 +1118,11 @@ def train(
                 packed_graph_index: list[int] = []
                 chooser_build_t0 = time.perf_counter() if timing_enabled else 0.0
                 for idx, context_index in enumerate(batch_context_indices):
-                    if context_index >= len(chooser_train_contexts) or context_index >= len(chooser_train_rows):
+                    if (
+                        context_index < 0
+                        or context_index >= len(chooser_train_contexts)
+                        or context_index >= len(chooser_train_rows)
+                    ):
                         raise RuntimeError("Chooser context index out of bounds.")
                     context = chooser_train_contexts[context_index]
                     row = chooser_train_rows[context_index]
@@ -1452,6 +1503,7 @@ def train(
                 if train_cfg.validate_factor_labels:
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
+                _assert_targets_supported_by_heads(targets, split="val", batch_idx=batch_idx)
                 data_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
                 phase_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -1500,11 +1552,12 @@ def train(
                         "context_index",
                         graph_loss.size(0),
                         default_to_batch_index=True,
+                        min_value=0,
                     )
                     targets_rows = targets.detach().cpu().tolist()
                     policy_labels = []
                     for idx, context_index in enumerate(batch_context_indices):
-                        if context_index >= len(policy_val_contexts):
+                        if context_index < 0 or context_index >= len(policy_val_contexts):
                             raise RuntimeError("Policy context index out of bounds.")
                         context = policy_val_contexts[context_index]
                         decision = derive_policy_label(targets_rows[idx], context, none_class=NONE_CLASS_INDEX)
@@ -1645,12 +1698,14 @@ def train(
                         "context_index",
                         graph_loss.size(0),
                         default_to_batch_index=True,
+                        min_value=0,
                     )
                     batch_primary_indices = _batch_int_attr(
                         data,
                         "primary_factor_index",
                         graph_loss.size(0),
                         default_value=0,
+                        min_value=0,
                     )
                     gold_rows = targets.detach().cpu().tolist()
                     out_detached = out.detach()
@@ -1670,7 +1725,11 @@ def train(
                     packed_graph_index: list[int] = []
                     chooser_build_t0 = time.perf_counter() if timing_enabled else 0.0
                     for idx, context_index in enumerate(batch_context_indices):
-                        if context_index >= len(chooser_val_contexts) or context_index >= len(chooser_val_rows):
+                        if (
+                            context_index < 0
+                            or context_index >= len(chooser_val_contexts)
+                            or context_index >= len(chooser_val_rows)
+                        ):
                             raise RuntimeError("Chooser context index out of bounds.")
                         context = chooser_val_contexts[context_index]
                         row = chooser_val_rows[context_index]

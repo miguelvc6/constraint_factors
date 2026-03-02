@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections import defaultdict, deque
 from typing import Callable, Sequence, Tuple
 
 import torch
@@ -874,12 +875,23 @@ def _select_factor_nodes(
                         idxs = torch.argsort(local_g)
                     else:
                         local_list = local_g.tolist()
-                        pos = {val: i for i, val in enumerate(local_list)}
-                        if any(val not in pos for val in expected.tolist()):
+                        positions: dict[int, deque[int]] = defaultdict(deque)
+                        for pos_idx, val in enumerate(local_list):
+                            positions[int(val)].append(pos_idx)
+
+                        reorder: list[int] = []
+                        missing = False
+                        for expected_val in expected.tolist():
+                            q = positions.get(int(expected_val))
+                            if not q:
+                                missing = True
+                                break
+                            reorder.append(q.popleft())
+                        if missing:
                             idxs = torch.argsort(local_g)
                         else:
                             idxs = torch.tensor(
-                                [pos[val] for val in expected.tolist()],
+                                reorder,
                                 device=node_emb.device,
                                 dtype=torch.long,
                             )
