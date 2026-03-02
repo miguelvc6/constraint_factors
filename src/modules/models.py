@@ -76,7 +76,7 @@ class BaseGraphModel(nn.Module, ABC):
         # self.initialization = self.create_conv_layer(input_channels, hidden_mp)
         self.initialization = nn.Sequential(
             nn.Linear(input_channels, hidden_mp),
-            nn.ReLU(),
+            nn.LeakyReLU(negative_slope=0.1),
             nn.Dropout(p=self._dropout),
             # plain last layer
             nn.Linear(hidden_mp, hidden_mp),
@@ -104,7 +104,7 @@ class BaseGraphModel(nn.Module, ABC):
         def make_branch() -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(head_hidden, branch_hidden),
-                nn.ReLU(),
+                nn.LeakyReLU(negative_slope=0.1),
             )
 
         self.subject_branch = make_branch()
@@ -138,12 +138,12 @@ class BaseGraphModel(nn.Module, ABC):
         entity_vocab = int(entity_ids_tensor.numel())
         predicate_vocab = int(predicate_ids_tensor.numel())
 
-        self.subject_add_head = nn.Linear(branch_hidden, entity_vocab, bias=False)
-        self.subject_del_head = nn.Linear(branch_hidden, entity_vocab, bias=False)
-        self.object_add_head = nn.Linear(branch_hidden, entity_vocab, bias=False)
-        self.object_del_head = nn.Linear(branch_hidden, entity_vocab, bias=False)
-        self.predicate_add_head = nn.Linear(branch_hidden, predicate_vocab, bias=False)
-        self.predicate_del_head = nn.Linear(branch_hidden, predicate_vocab, bias=False)
+        self.subject_add_head = nn.Linear(branch_hidden, entity_vocab)
+        self.subject_del_head = nn.Linear(branch_hidden, entity_vocab)
+        self.object_add_head = nn.Linear(branch_hidden, entity_vocab)
+        self.object_del_head = nn.Linear(branch_hidden, entity_vocab)
+        self.predicate_add_head = nn.Linear(branch_hidden, predicate_vocab)
+        self.predicate_del_head = nn.Linear(branch_hidden, predicate_vocab)
         self._hidden_channels = hidden_mp
         self._head_hidden = head_hidden
         self._branch_hidden = branch_hidden
@@ -359,7 +359,7 @@ class BaseGraphModel(nn.Module, ABC):
         graph_emb = global_mean_pool(x, batch)
 
         ## Classification Head
-        shared = F.relu(self.shared_projection(graph_emb))
+        shared = F.leaky_relu(self.shared_projection(graph_emb), negative_slope=0.1)
         shared = F.dropout(shared, p=self._dropout, training=self.training)
 
         # Role-specificic branches for subject, object, predicate predictions
@@ -371,10 +371,6 @@ class BaseGraphModel(nn.Module, ABC):
 
         predicate_features = self.predicate_branch(shared)
         predicate_features = F.dropout(predicate_features, p=self._dropout, training=self.training)
-
-        policy_logits = None
-        if self._policy_enabled and self.policy_head is not None:
-            policy_logits = self.policy_head(shared)
 
         policy_logits = None
         if self._policy_enabled and self.policy_head is not None:
@@ -750,7 +746,7 @@ class RepairGINFactorPressure(BaseGraphModel):
         node_emb = x
         graph_emb = global_mean_pool(x, batch)
 
-        shared = F.relu(self.shared_projection(graph_emb))
+        shared = F.leaky_relu(self.shared_projection(graph_emb), negative_slope=0.1)
         shared = F.dropout(shared, p=self._dropout, training=self.training)
 
         subject_features = self.subject_branch(shared)

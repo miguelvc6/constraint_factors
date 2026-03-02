@@ -229,6 +229,7 @@ class ChooserConfig:
     max_candidates_total: int = 80
     beta_no_regression: float = 0.5
     gamma_primary: float = 0.0
+    loss_weight: float = 0.5
     loss_mode: str = "fix1"  # fix1 | primary_only | global_fix
 
     @classmethod
@@ -246,7 +247,7 @@ class ChooserConfig:
         for key in ("topk_candidates", "max_candidates_total"):
             if key in filtered and filtered[key] is not None:
                 filtered[key] = int(filtered[key])
-        for key in ("beta_no_regression", "gamma_primary"):
+        for key in ("beta_no_regression", "gamma_primary", "loss_weight"):
             if key in filtered and filtered[key] is not None:
                 filtered[key] = float(filtered[key])
         if "loss_mode" in filtered and filtered["loss_mode"] is not None:
@@ -266,6 +267,7 @@ class ChooserConfig:
             "max_candidates_total": self.max_candidates_total,
             "beta_no_regression": self.beta_no_regression,
             "gamma_primary": self.gamma_primary,
+            "loss_weight": self.loss_weight,
             "loss_mode": self.loss_mode,
         }
 

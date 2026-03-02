@@ -88,6 +88,7 @@ class HP:
     # chooser
     beta: float
     gamma: float
+    chooser_w: float
     topk: int
     max_cands: int
     # factor loss
@@ -129,13 +130,13 @@ def main() -> None:
     # These are the selected candidates for constrained-budget model selection.
     grid = [
         # Beta sweep on concat pressure
-        HP("c1", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 20, 80, 0.10, "concat"),
-        HP("c2", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "concat"),
-        HP("c3", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 20, 80, 0.10, "concat"),
+        HP("c1", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 0.5, 20, 80, 0.10, "concat"),
+        HP("c2", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
+        HP("c3", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
         # Pressure-mode ablation
-        HP("g0", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 20, 80, 0.10, "gate"),
+        HP("g0", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "gate"),
         # Gamma stress test
-        HP("c10", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.2, 20, 80, 0.10, "concat"),
+        HP("c10", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.2, 0.35, 20, 80, 0.10, "concat"),
     ]
 
     if args.num_configs > len(grid):
@@ -199,6 +200,7 @@ def main() -> None:
                     "max_candidates_total": hp.max_cands,
                     "beta_no_regression": hp.beta,
                     "gamma_primary": hp.gamma,
+                    "loss_weight": hp.chooser_w,
                 },
                 # keep policy choice off for main optimization sweep
                 "policy_filter_strict": True,

@@ -535,10 +535,13 @@ def train(
         device_index = device.index if device.index is not None else torch.cuda.current_device()
         logger.info(f"GPU: {torch.cuda.get_device_name(device_index)}")
         log_cuda_memory("Initial GPU state", device)
-    amp_enabled = device.type == "cuda"
+    amp_disabled = os.environ.get("TRAIN_DISABLE_AMP", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    amp_enabled = device.type == "cuda" and not amp_disabled
     amp_dtype = torch.bfloat16 if amp_enabled else None
     if amp_enabled:
         logger.info("Automatic mixed precision enabled | dtype=%s", str(amp_dtype).replace("torch.", ""))
+    elif device.type == "cuda":
+        logger.info("Automatic mixed precision disabled (env: TRAIN_DISABLE_AMP=1)")
 
     # Dataset bookkeeping / loader construction.
     train_dataset_info = "streaming" if isinstance(train_data, IterableDataset) else "in-memory"
@@ -756,6 +759,7 @@ def train(
     }
 
     chooser_loss_mode = chooser_cfg.loss_mode
+    chooser_loss_weight = max(float(getattr(chooser_cfg, "loss_weight", 0.5)), 0.0)
     chooser_need_regression = chooser_loss_mode == "fix1" and chooser_cfg.beta_no_regression > 0
     chooser_need_primary = chooser_cfg.gamma_primary > 0
     chooser_placeholder_ids_for_candidates = (
@@ -1191,7 +1195,7 @@ def train(
                 chooser_evaluator_terms_s = (time.perf_counter() - chooser_eval_t0) if timing_enabled else 0.0
                 assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
 
-                graph_loss = graph_loss + chooser_losses
+                graph_loss = graph_loss + (chooser_loss_weight * chooser_losses)
                 train_chooser_loss_sum += float(chooser_losses.sum().item())
                 train_chooser_count += chooser_losses.numel()
                 chooser_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
@@ -1790,7 +1794,7 @@ def train(
                     chooser_evaluator_terms_s = (time.perf_counter() - chooser_eval_t0) if timing_enabled else 0.0
                     assert offset == packed_scores.numel(), "Packed chooser score size mismatch."
 
-                    graph_loss = graph_loss + chooser_losses
+                    graph_loss = graph_loss + (chooser_loss_weight * chooser_losses)
                     val_chooser_loss_sum += float(chooser_losses.sum().item())
                     val_chooser_count += chooser_losses.numel()
                     chooser_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
@@ -2360,10 +2364,11 @@ def main():
             "placeholder_ids_set": set(chooser_heuristics.placeholder_ids.values()),
         }
         logger.info(
-            "Chooser enabled | topk_candidates=%s max_candidates_total=%s loss_mode=%s",
+            "Chooser enabled | topk_candidates=%s max_candidates_total=%s loss_mode=%s loss_weight=%.3f",
             chooser_cfg.topk_candidates,
             chooser_cfg.max_candidates_total,
             chooser_cfg.loss_mode,
+            float(getattr(chooser_cfg, "loss_weight", 0.5)),
         )
 
     policy_state: dict[str, object] | None = None
