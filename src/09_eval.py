@@ -1137,6 +1137,8 @@ def evaluate_trained_model(
     write_per_constraint_csv: bool = False,
     chooser_support: ChooserSupport | None = None,
     policy_support: PolicySupport | None = None,
+    selection_weights: dict[str, float] | None = None,
+    selection_disruption_field: str = "mean_disruption_total",
 ) -> None:
     checkpoint_path = get_checkpoint_path(run_directory)
 
@@ -1193,7 +1195,7 @@ def evaluate_trained_model(
         chooser_support=chooser_support,
         policy_support=policy_support,
         selection_weights=selection_weights,
-        selection_disruption_field=args.score_disruption_field,
+        selection_disruption_field=selection_disruption_field,
     )
 
 
@@ -1514,6 +1516,8 @@ def main():
             write_per_constraint_csv=True if strict_global else (args.per_constraint_csv or global_metrics_enabled),
             chooser_support=chooser_support,
             policy_support=policy_support,
+            selection_weights=selection_weights,
+            selection_disruption_field=args.score_disruption_field,
         )
 
     else:  # Evaluate baselines
