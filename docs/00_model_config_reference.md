@@ -38,6 +38,7 @@ Experiment config JSON files are JSON objects that can include the keys below.
 | `factor_type_embedding_dim` | int | `8` | Embedding dimension for factor type conditioning. |
 | `pressure_enabled` | bool | `false` | Toggle factor-pressure injection during message passing. |
 | `pressure_type_conditioning` | string | `"none"` | How to condition pressure messages on factor types: `none`, `concat`, `gate`. |
+| `pressure_residual_scale` | float | `0.1` | Scale applied to degree-normalized pressure residual messages. |
 | `enable_policy_choice` | bool | `false` | Enable policy-choice head over graph embeddings. |
 | `policy_num_classes` | int | `6` | Number of policy classes. Must be `>= 6` for the default policy set. |
 
@@ -51,10 +52,10 @@ These fields are consumed by `07_train.py` and validated in `src/modules/config.
 | `num_epochs` | int | `5` | Max training epochs. |
 | `early_stopping_rounds` | int | `5` | Patience before early stopping triggers. |
 | `grad_clip` | float or null | `1.0` | Gradient norm cap; `null` disables clipping. |
-| `learning_rate` | float | `0.001` | Base learning rate for Adam. |
+| `learning_rate` | float | `0.0003` | Base learning rate for Adam. |
 | `weight_decay` | float | `0.0005` | Adam weight decay. |
 | `scheduler_factor` | float | `0.5` | Multiplicative drop factor for LR scheduler. |
-| `scheduler_patience` | int | `3` | Epochs with no improvement before LR reduction. |
+| `scheduler_patience` | int | `2` | Epochs with no improvement before LR reduction. |
 | `num_workers` | int | `0` | DataLoader worker processes. |
 | `pin_memory` | bool or null | `null` | Override DataLoader `pin_memory` (null keeps default). |
 | `validate_factor_labels` | bool | `false` | Strict factor label assertions per batch. |
@@ -168,5 +169,6 @@ The config loaders are strict and will raise on unknown keys. Additional behavio
 - `training_config.dynamic_reweighting` is accepted as a top-level fallback for `training_config.constraint_loss.dynamic_reweighting`.
 - `training_config.regression_weight` in rerankers also accepts the legacy key `beta`.
 - `pressure_type_conditioning` must be one of `none`, `concat`, `gate`.
+- `pressure_residual_scale` must be non-negative.
 - `chooser.loss_mode` must be `fix1`, `primary_only`, or `global_fix`.
 - `fix_probability_loss.schedule` must be `exponential` or `linear`.

@@ -130,13 +130,13 @@ def main() -> None:
     # These are the selected candidates for constrained-budget model selection.
     grid = [
         # Beta sweep on concat pressure
-        HP("c1", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 0.5, 20, 80, 0.10, "concat"),
-        HP("c2", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
-        HP("c3", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
+        HP("c1", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 0.5, 20, 80, 0.10, "concat"),
+        HP("c2", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
+        HP("c3", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
         # Pressure-mode ablation
-        HP("g0", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "gate"),
+        HP("g0", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "gate"),
         # Gamma stress test
-        HP("c10", 256, 7.5e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.2, 0.35, 20, 80, 0.10, "concat"),
+        HP("c10", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.2, 0.35, 20, 80, 0.10, "concat"),
     ]
 
     if args.num_configs > len(grid):
@@ -174,6 +174,7 @@ def main() -> None:
                 "num_factor_types": int(num_factor_types),
                 "pressure_enabled": True,
                 "pressure_type_conditioning": hp.pressure_mode,  # concat|gate
+                "pressure_residual_scale": 0.1,
             },
             "training_config": {
                 "batch_size": hp.batch_size,
@@ -182,7 +183,7 @@ def main() -> None:
                 "learning_rate": hp.lr,
                 "weight_decay": hp.wd,
                 "scheduler_factor": 0.5,
-                "scheduler_patience": 5,
+                "scheduler_patience": 2,
                 "num_workers": 4,
                 "pin_memory": True,
                 "validate_factor_labels": True,

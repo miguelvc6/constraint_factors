@@ -39,6 +39,7 @@ class BaseGraphModel(nn.Module, ABC):
         factor_type_embedding_dim: int = 8,
         pressure_enabled: bool = False,
         pressure_type_conditioning: str = "none",
+        pressure_residual_scale: float = 0.1,
         enable_policy_choice: bool = False,
         policy_num_classes: int = 6,
     ):
@@ -155,6 +156,7 @@ class BaseGraphModel(nn.Module, ABC):
         self._num_factor_types = int(num_factor_types)
         self._factor_type_embedding_dim = int(factor_type_embedding_dim)
         self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
+        self._pressure_residual_scale = float(pressure_residual_scale)
         if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0:
             self.factor_type_embeddings = nn.Embedding(
                 self._num_factor_types, self._factor_type_embedding_dim
@@ -532,11 +534,18 @@ class RepairGINFactorPressure(BaseGraphModel):
         *args,
         pressure_enabled: bool = False,
         pressure_type_conditioning: str = "none",
+        pressure_residual_scale: float = 0.1,
         **kwargs,
     ):
-        super().__init__(*args, pressure_type_conditioning=pressure_type_conditioning, **kwargs)
+        super().__init__(
+            *args,
+            pressure_type_conditioning=pressure_type_conditioning,
+            pressure_residual_scale=pressure_residual_scale,
+            **kwargs,
+        )
         self._pressure_enabled = bool(pressure_enabled)
         self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
+        self._pressure_residual_scale = float(pressure_residual_scale)
         if self._pressure_type_conditioning not in {"none", "concat", "gate"}:
             raise ValueError(
                 "pressure_type_conditioning must be 'none', 'concat', or 'gate'"
@@ -682,7 +691,11 @@ class RepairGINFactorPressure(BaseGraphModel):
         if self._pressure_type_conditioning == "gate" and type_emb is not None:
             gate = torch.sigmoid(self._pressure_type_gate(type_emb))
             messages = messages * gate
-        x = x + torch.zeros_like(x).index_add(0, dst, messages)
+        aggregated = torch.zeros_like(x).index_add(0, dst, messages)
+        degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+        degree.index_add_(0, dst, torch.ones(dst.size(0), device=x.device, dtype=x.dtype))
+        aggregated = aggregated / degree.clamp(min=1.0).unsqueeze(-1)
+        x = x + (self._pressure_residual_scale * aggregated)
         return x
 
     def forward(self, data):
@@ -953,6 +966,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         factor_type_embedding_dim=config.factor_type_embedding_dim,
         pressure_enabled=config.pressure_enabled,
         pressure_type_conditioning=getattr(config, "pressure_type_conditioning", "none"),
+        pressure_residual_scale=getattr(config, "pressure_residual_scale", 0.1),
         enable_policy_choice=getattr(config, "enable_policy_choice", False),
         policy_num_classes=getattr(config, "policy_num_classes", 6),
     )

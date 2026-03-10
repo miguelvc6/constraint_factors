@@ -316,6 +316,8 @@ class ModelConfig:
     """Toggle factor pressure injection during message passing."""
     pressure_type_conditioning: str = "none"
     """Condition pressure messages on factor types: none|concat|gate."""
+    pressure_residual_scale: float = 0.1
+    """Scale applied to degree-normalized pressure residual messages."""
     enable_policy_choice: bool = False
     """Enable policy choice head over graph embeddings."""
     policy_num_classes: int = 6
@@ -360,6 +362,11 @@ class ModelConfig:
             if value not in {"none", "concat", "gate"}:
                 raise ValueError("pressure_type_conditioning must be 'none', 'concat', or 'gate'")
             filtered["pressure_type_conditioning"] = value
+        if "pressure_residual_scale" in filtered and filtered["pressure_residual_scale"] is not None:
+            value = float(filtered["pressure_residual_scale"])
+            if value < 0.0:
+                raise ValueError("pressure_residual_scale must be non-negative")
+            filtered["pressure_residual_scale"] = value
         if "enable_policy_choice" in filtered and filtered["enable_policy_choice"] is not None:
             filtered["enable_policy_choice"] = bool(filtered["enable_policy_choice"])
         if "policy_num_classes" in filtered and filtered["policy_num_classes"] is not None:
@@ -383,10 +390,10 @@ class TrainingConfig:
     num_epochs: int = 5  # Maximum number of training epochs.
     early_stopping_rounds: int = 5  # Patience before early stopping triggers.
     grad_clip: float | None = 1.0  # Gradient norm cap; set None to disable clipping.
-    learning_rate: float = 1e-3  # Base learning rate for Adam.
+    learning_rate: float = 3e-4  # Base learning rate for Adam.
     weight_decay: float = 5e-4  # L2 penalty applied through Adam weight decay.
     scheduler_factor: float = 0.5  # Multiplicative drop factor for the LR scheduler.
-    scheduler_patience: int = 3  # Epochs with no improvement before lowering LR.
+    scheduler_patience: int = 2  # Epochs with no improvement before lowering LR.
     num_workers: int = 0  # Worker processes used by DataLoader.
     pin_memory: bool | None = None  # Override DataLoader pin_memory behaviour (None keeps the default).
     validate_factor_labels: bool = False  # Enable strict factor label assertions per batch.
