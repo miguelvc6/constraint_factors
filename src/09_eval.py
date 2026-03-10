@@ -1417,7 +1417,7 @@ def main():
             candidate_cfg = CandidateConfig(
                 topk_candidates=training_cfg.chooser.topk_candidates,
                 max_candidates_total=training_cfg.chooser.max_candidates_total,
-                include_gold=True,
+                include_gold=False,
             )
             chooser_support = ChooserSupport(
                 contexts=contexts,
@@ -1450,7 +1450,7 @@ def main():
                 raise RuntimeError("Mismatch between test graphs and violation contexts for policy choice.")
             for idx, graph in enumerate(test_data):
                 setattr(graph, "context_index", idx)
-            candidate_cfg = CandidateConfig()
+            candidate_cfg = CandidateConfig(include_gold=False)
             policy_support = PolicySupport(
                 contexts=contexts,
                 heuristics=heuristics,

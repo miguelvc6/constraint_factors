@@ -24,7 +24,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import torch
+
 VARIANT_MINOCC_RE = re.compile(r"minocc(\d+)", re.IGNORECASE)
+TRAIN_GRAPH_RE = re.compile(r"^train_graph-(?P<encoding>.+)\.pkl$")
+TRAIN_GRAPH_SHARD_RE = re.compile(r"^train_graph-(?P<encoding>.+)-shard\d+\.(?:pkl|pt)$")
 
 
 def _parse_min_occurrence(variant: str) -> int:
@@ -38,21 +42,51 @@ def _iter_graph_files(processed_root: Path) -> Iterable[tuple[str, str, Path]]:
     """
     Yield (variant, encoding, train_graph_path) pairs.
 
-    Looks for:
+    Looks for either:
       data/processed/<variant>/train_graph-<encoding>.pkl
-    Ignores shards for now (you can extend later if needed).
+    or sharded artifacts matching:
+      data/processed/<variant>/train_graph-<encoding>-shardNNN.{pkl,pt}
+
+    The yielded path is always the canonical base path
+    ``train_graph-<encoding>.pkl`` so downstream code can resolve either a
+    monolithic file or its shard set from one identifier.
     """
     if not processed_root.exists():
         raise FileNotFoundError(f"processed_root not found: {processed_root}")
 
     for variant_dir in sorted(p for p in processed_root.iterdir() if p.is_dir()):
         variant = variant_dir.name
-        for path in sorted(variant_dir.glob("train_graph-*.pkl")):
-            # train_graph-<encoding>.pkl
-            enc = path.name[len("train_graph-") : -len(".pkl")]
-            if "-shard" in enc.lower():
+        encodings: set[str] = set()
+        for candidate in sorted(variant_dir.iterdir()):
+            if not candidate.is_file():
                 continue
-            yield variant, enc, path
+            match = TRAIN_GRAPH_RE.match(candidate.name)
+            if match:
+                encodings.add(match.group("encoding"))
+                continue
+            match = TRAIN_GRAPH_SHARD_RE.match(candidate.name)
+            if match:
+                encodings.add(match.group("encoding"))
+
+        for enc in sorted(encodings):
+            yield variant, enc, variant_dir / f"train_graph-{enc}.pkl"
+
+
+def _discover_graph_artifacts(path: Path) -> list[Path]:
+    """Return the monolithic graph file or the sorted shard files for ``path``."""
+    path = Path(path)
+    if path.exists():
+        return [path]
+
+    artifacts: list[Path] = []
+    artifacts.extend(sorted(path.parent.glob(f"{path.stem}-shard*.pkl")))
+    artifacts.extend(sorted(path.parent.glob(f"{path.stem}-shard*.pt")))
+    return artifacts
+
+
+def _torch_load_trusted(path: Path) -> Any:
+    """Load trusted local torch payloads with PyTorch 2.6+ compatibility."""
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _load_first_data_obj(pkl_path: Path) -> Any | None:
@@ -61,9 +95,21 @@ def _load_first_data_obj(pkl_path: Path) -> Any | None:
     Load the first one without reading the full stream.
     """
     try:
-        with pkl_path.open("rb") as fh:
+        artifacts = _discover_graph_artifacts(pkl_path)
+        if not artifacts:
+            return None
+        first_path = artifacts[0]
+        if first_path.suffix == ".pt":
+            payload = _torch_load_trusted(first_path)
+            if isinstance(payload, list):
+                return payload[0] if payload else None
+            return payload
+        with first_path.open("rb") as fh:
             unpickler = pickle.Unpickler(fh)
-            return unpickler.load()
+            payload = unpickler.load()
+        if isinstance(payload, list):
+            return payload[0] if payload else None
+        return payload
     except Exception:
         return None
 

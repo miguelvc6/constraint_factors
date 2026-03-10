@@ -2305,28 +2305,38 @@ def main():
             none_class=NONE_CLASS_INDEX,
         )
 
-        def _prepare_contexts(split: str, dataset_obj: list[Data] | GraphStreamDataset) -> list | None:
-            if not isinstance(dataset_obj, list):
-                logger.warning(
-                    "Fix probability loss disabled for %s split: dataset is streamed and cannot carry contexts.",
-                    split,
-                )
-                return None
+        def _prepare_contexts(
+            split: str,
+            dataset_obj: list[Data] | GraphStreamDataset,
+            graph_path: Path,
+        ) -> list | None:
             contexts = load_violation_contexts(interim_path, split, none_class=NONE_CLASS_INDEX)
-            if len(contexts) != len(dataset_obj):
+            if isinstance(dataset_obj, list):
+                expected_count = len(dataset_obj)
+            else:
+                expected_count = _manifest_graph_count(graph_path)
+
+            if expected_count is not None and len(contexts) != expected_count:
                 logger.warning(
                     "Fix probability loss disabled: split=%s has %s graphs but %s contexts.",
                     split,
-                    len(dataset_obj),
+                    expected_count,
                     len(contexts),
                 )
                 return None
-            for idx, graph in enumerate(dataset_obj):
-                setattr(graph, "context_index", idx)
+
+            if isinstance(dataset_obj, list):
+                for idx, graph in enumerate(dataset_obj):
+                    setattr(graph, "context_index", idx)
+            else:
+                logger.info(
+                    "Fix probability loss for %s split will use streamed datasets with on-the-fly context_index assignment.",
+                    split,
+                )
             return contexts
 
-        train_contexts = _prepare_contexts("train", train_data)
-        val_contexts = _prepare_contexts("val", val_data)
+        train_contexts = _prepare_contexts("train", train_data, train_data_path)
+        val_contexts = _prepare_contexts("val", val_data, val_data_path)
 
         if train_contexts and val_contexts:
             fix_loss_state = {
