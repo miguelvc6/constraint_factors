@@ -363,8 +363,7 @@ def _maybe_prepare_global_support(
         message = f"Constraint registry not found at {registry_path}."
         if strict:
             raise RuntimeError(
-                message
-                + " Strict global metrics require the registry; rebuild interim data or disable strict mode."
+                message + " Strict global metrics require the registry; rebuild interim data or disable strict mode."
             )
         logging.warning("%s Skipping global metrics.", message)
         return None
@@ -551,9 +550,7 @@ def eval(
                         none_class=NONE_CLASS_INDEX,
                     )
                     if chooser_support is not None:
-                        candidate_tensor = torch.tensor(
-                            candidates_filtered, dtype=torch.long, device=logits.device
-                        )
+                        candidate_tensor = torch.tensor(candidates_filtered, dtype=torch.long, device=logits.device)
                         scores = model.score_candidates(graph_emb[idx], candidate_tensor)
                         if not policy_support.filter_strict:
                             mask_tensor = torch.tensor(
@@ -586,9 +583,7 @@ def eval(
                         placeholder_ids=set(chooser_support.heuristics.placeholder_ids.values()),
                         num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
                     )
-                    candidate_tensor = torch.tensor(
-                        candidates, dtype=torch.long, device=logits.device
-                    )
+                    candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=logits.device)
                     scores = model.score_candidates(graph_emb[idx], candidate_tensor)
                     best_idx = int(torch.argmax(scores).item())
                     batch_preds.append(list(candidates[best_idx]))
@@ -801,9 +796,7 @@ def load_split(base_path: Path, encoding: str, split: str) -> list[Data]:
     path = base_path / f"{split}_graph-{encoding}.pkl"
     artifacts = discover_graph_artifacts(path)
     if not artifacts:
-        raise FileNotFoundError(
-            f"Missing dataset split at {path} and no matching shards ({path.stem}-shard*)."
-        )
+        raise FileNotFoundError(f"Missing dataset split at {path} and no matching shards ({path.stem}-shard*).")
 
     if len(artifacts) > 1 or artifacts[0].format != "stream":
         graphs: list[Data] = []
@@ -974,7 +967,9 @@ def compute_model_selection_block(
         "primary_fix_rate": primary_fix_rate,
         "secondary_regression_rate_srr": secondary_regression_rate_srr,
         "fidelity_micro_f1": fidelity_micro_f1,
-        "disruption_total_ops_mean": float(disruption_total_ops_mean) if disruption_total_ops_mean is not None else None,
+        "disruption_total_ops_mean": float(disruption_total_ops_mean)
+        if disruption_total_ops_mean is not None
+        else None,
         "disruption_changed_triples_mean": float(disruption_changed_triples_mean)
         if disruption_changed_triples_mean is not None
         else None,
@@ -1178,7 +1173,11 @@ def evaluate_trained_model(
                 model.enable_chooser()
             model.load_state_dict(state_dict)
             model.to(device)
-            printable_config = {k: v for k, v in effective_model_cfg.to_dict().items() if k != "entity_class_ids"}
+            printable_config = {
+                k: v
+                for k, v in effective_model_cfg.to_dict().items()
+                if k not in ["entity_class_ids", "predicate_class_ids"]
+            }
             logging.info("Loaded checkpoint with config: %s", printable_config)
         else:
             raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)!r}")
@@ -1428,7 +1427,9 @@ def main():
 
         if args.use_policy_choice:
             if not model_cfg.enable_policy_choice:
-                raise RuntimeError("Policy choice evaluation requested but policy choice is disabled in model config.")
+                raise RuntimeError(
+                    "Policy choice evaluation requested but policy choice is disabled in model config."
+                )
             interim_base = Path("data/interim") / dataset_variant_name(
                 model_cfg.dataset_variant, model_cfg.min_occurrence
             )
@@ -1463,8 +1464,10 @@ def main():
                 "Strict global metrics require factor fields on test graphs. "
                 "Rebuild graphs with factor labels (factor_* fields) or disable strict mode."
             )
-        global_metrics_enabled = True if strict_global else (not args.no_global_metrics) and (
-            args.global_metrics or _data_has_factor_fields(test_data)
+        global_metrics_enabled = (
+            True
+            if strict_global
+            else (not args.no_global_metrics) and (args.global_metrics or _data_has_factor_fields(test_data))
         )
         if global_metrics_enabled:
             global_support = _maybe_prepare_global_support(
