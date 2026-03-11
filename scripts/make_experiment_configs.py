@@ -262,7 +262,14 @@ def main() -> None:
     if args.limit > 0:
         pairs = pairs[: args.limit]
     if not pairs:
-        raise SystemExit(f"No graph artifacts found under {args.processed_root}.")
+        raise SystemExit(
+            "No graph artifacts found under "
+            f"{args.processed_root}.\n"
+            "Build the paper graph artifacts first, for example:\n"
+            "  PYTHONPATH=src .venv/bin/python src/05_constraint_labeler.py --dataset full --min-occurrence 100 --constraint-scope local\n"
+            "  PYTHONPATH=src .venv/bin/python src/06_graph.py --dataset full --min-occurrence 100 --encoding node_id --constraint-scope local --constraint-representation factorized\n"
+            "  PYTHONPATH=src .venv/bin/python src/06_graph.py --dataset full --min-occurrence 100 --encoding node_id --constraint-representation eswc_passive"
+        )
 
     canonical_proposals: list[ProposalExperiment] = [
         ProposalExperiment(

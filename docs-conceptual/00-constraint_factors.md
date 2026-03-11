@@ -87,6 +87,12 @@ Include constraint instances attached to the properties appearing in the focus/c
 **(B) Local closure (broader):**  
 Include constraint instances attached to any property within 1-hop of the shared entities involved in the violation.
 
+### Repository instantiation for the current paper line
+
+In the current repository, the paper-facing pipeline instantiates the conservative `C_local` choice through the technical setting `constraint_scope=local` in `05_constraint_labeler.py` and `06_graph.py`.
+
+This should be read as the bounded local-closure version used by the current pipeline, not as an unbounded neighborhood expansion.
+
 ---
 
 ## 4) Per-Instance Subgraph Model

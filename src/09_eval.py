@@ -1153,6 +1153,33 @@ def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[
             graph.shape_id = shape_id_value
         graph.constraint_type = _safe_constraint_type(row.constraint_type)
 
+        factor_constraint_ids = getattr(row, "factor_constraint_ids", None)
+        if factor_constraint_ids is not None:
+            graph.factor_constraint_ids = torch.tensor(factor_constraint_ids, dtype=torch.long).view(-1)
+        factor_types = getattr(row, "factor_types", None)
+        if factor_types is not None:
+            graph.factor_types = torch.tensor(factor_types, dtype=torch.long).view(-1)
+        factor_checkable_pre = getattr(row, "factor_checkable_pre", None)
+        if factor_checkable_pre is not None:
+            graph.factor_checkable_pre = torch.tensor(factor_checkable_pre, dtype=torch.bool).view(-1)
+        factor_satisfied_pre = getattr(row, "factor_satisfied_pre", None)
+        if factor_satisfied_pre is not None:
+            graph.factor_satisfied_pre = torch.tensor(factor_satisfied_pre, dtype=torch.long).view(-1)
+        factor_checkable_post_gold = getattr(row, "factor_checkable_post_gold", None)
+        if factor_checkable_post_gold is not None:
+            graph.factor_checkable_post_gold = torch.tensor(
+                factor_checkable_post_gold, dtype=torch.bool
+            ).view(-1)
+        factor_satisfied_post_gold = getattr(row, "factor_satisfied_post_gold", None)
+        if factor_satisfied_post_gold is not None:
+            graph.factor_satisfied_post_gold = torch.tensor(
+                factor_satisfied_post_gold, dtype=torch.long
+            ).view(-1)
+        primary_factor_index = getattr(row, "primary_factor_index", None)
+        if primary_factor_index is not None:
+            if not (isinstance(primary_factor_index, float) and math.isnan(primary_factor_index)):
+                graph.primary_factor_index = int(primary_factor_index)
+
         data_list.append(graph)
 
         y_max = int(y.max().item()) if y.numel() else NONE_CLASS_INDEX
@@ -1163,6 +1190,17 @@ def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[
 
     del dataframe
     return data_list, max_index
+
+
+def _resolve_baseline_interim_paths(dataset: str, min_occurrence: int) -> tuple[Path, Path]:
+    variant = dataset_variant_name(dataset, min_occurrence)
+    base_path = Path("data/interim") / variant
+    labeled_path = Path("data/interim") / f"{variant}_labeled"
+    data_path = labeled_path if (labeled_path / "df_train.parquet").exists() else base_path
+    encoder_path = labeled_path / "globalintencoder.txt"
+    if not encoder_path.exists():
+        encoder_path = base_path / "globalintencoder.txt"
+    return data_path, encoder_path
 
 
 def load_placeholder_ids(encoder_path: Path) -> dict[str, int]:
@@ -1649,13 +1687,14 @@ def main():
             args.min_occurrence,
         )
         variant = dataset_variant_name(args.dataset, args.min_occurrence)
-        base_path = Path("data/interim") / variant
+        base_path, encoder_path = _resolve_baseline_interim_paths(args.dataset, args.min_occurrence)
+        logging.info("Baseline parquet source: %s", base_path)
 
         train_data, train_max = load_baseline_split_from_parquet(base_path, "train")
         test_data, test_max = load_baseline_split_from_parquet(base_path, "test")
         num_graph_nodes = max(train_max, test_max, NONE_CLASS_INDEX) + 1
 
-        placeholder_ids = load_placeholder_ids(base_path / "globalintencoder.txt")
+        placeholder_ids = load_placeholder_ids(encoder_path)
 
         repair_support = _maybe_prepare_repair_support(
             args.dataset,

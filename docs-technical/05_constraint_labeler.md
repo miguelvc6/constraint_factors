@@ -5,6 +5,8 @@
 - Produce both **pre-edit** and **post-gold-edit** labels without rebuilding graphs.
 - Track coverage and emit per-type summaries and coverage reports.
 
+For the paper-facing run, `--constraint-scope local` is the canonical setting. `focus` remains supported for exploratory or appendix work only.
+
 ## Inputs & Outputs
 **Inputs**
 - Parquet split file(s) produced by `02_dataframe_builder.py` (from `data/interim/<dataset_variant>`).
@@ -89,5 +91,6 @@ python src/05_constraint_labeler.py \
 
 Key flags:
 - `--constraint-scope {local,focus}` selects `local_constraint_ids` vs `local_constraint_ids_focus`.
+  The paper default is `local`.
 - `--assume-complete-entity-facts/--no-assume-complete-entity-facts` toggles completeness assumptions.
 - `--max-rows` caps rows per parquet for debugging.

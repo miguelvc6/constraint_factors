@@ -4,6 +4,14 @@
 - Convert the parquet splits plus the Wikidata text cache into PyTorch Geometric `Data` objects that encode every violation as a graph with rich node features.
 - Persist split-specific graph collections under `data/processed/<variant>/` so training and evaluation never have to touch the original TSVs again.
 
+For the paper-facing run, use:
+
+- `--constraint-scope local` for factorized graphs
+- `--constraint-representation factorized` for `A1`, `M1C`, `M1D`, and proposal graphs consumed by `G0`
+- `--constraint-representation eswc_passive` for `B0`
+
+`focus` scope remains supported as a non-paper exploratory option.
+
 ## Inputs & Outputs
 - **Inputs:** Interim parquet splits from `data/interim/<variant>/` or, when present, `data/interim/<variant>_labeled/` (unless `--use-unlabeled-interim` is passed), `globalintencoder.txt`, the constraint registry (`data/interim/constraint_registry_{dataset}.parquet`), the Wikidata cache (`data/interim/wikidata_text.parquet`), and CLI flags controlling encoding/sharding options.
 - **Outputs:** Graph artifacts in `data/processed/<variant>/` (`{split}_graph-<encoding>.pkl` for factorized runs, `{split}_graph_repr-eswc_passive-<encoding>.pkl` for passive runs, plus sharded `.pt/.pkl` variants), per-split manifests, `target_vocabs.json`, plus optional visualisations like `graph_visualization.png`.
@@ -25,6 +33,7 @@
 
 ## Common Pitfalls / Gotchas
 - Selecting `--encoding text_embedding` without having run `04_wikidata_retriever.py` first will raise lookup errors because literal/URI embeddings are missing.
+- For the paper suite, do not mix `constraint-scope` values across runs. Build the labeled parquet and factorized graphs with `local`, then keep that choice fixed throughout training and evaluation.
 - Large `--shard-size` values can exhaust RAM when saving; pick smaller shards or enable `--use-torch-save` if you see pickle spills.
 - `--overwrite unsafe` reduces temporary disk usage but interrupted runs can leave partial/corrupt files.
 - Graphs inherit the constraint type distribution of the parquet splits—mixing mismatched dataset variants (e.g., graphs built with min-occurrence 100 but training on 50) guarantees label/encoder inconsistencies.

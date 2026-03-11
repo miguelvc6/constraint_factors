@@ -29,6 +29,7 @@ Before running anything, freeze these decisions for the entire paper run:
 - encoding: one paper encoding only
 - proposal random seed: `42`
 - reranker random seed: `42`
+- constraint neighborhood for the paper line: `local`
 
 Reproducibility notes:
 
@@ -53,18 +54,19 @@ Strict-metrics precondition:
 
 Run in this order:
 
-1. Generate the canonical paper configs.
-2. Run heuristic baselines first.
-3. Run a brief `M1C` hyperparameter search only.
-4. Select one winning `M1C` configuration.
-5. Propagate the winning factorized-model settings to `A1`, `M1C`, and `M1D`, and reuse only the compatible training schedule for `B0`.
-6. Train and evaluate the canonical learned suite in order:
+1. Prepare paper artifacts.
+2. Generate the canonical paper configs.
+3. Run heuristic baselines first.
+4. Run a brief `M1C` hyperparameter search only.
+5. Select one winning `M1C` configuration.
+6. Propagate the winning factorized-model settings to `A1`, `M1C`, and `M1D`, and reuse only the compatible training schedule for `B0`.
+7. Train and evaluate the canonical learned suite in order:
    - `B0`
    - `A1`
    - final `M1C`
    - `M1D`
    - `G0`
-7. Freeze tables and figures from those final runs only.
+8. Freeze tables and figures from those final runs only.
 
 This order avoids spending time on secondary model families before the main model has a stable configuration.
 
@@ -77,10 +79,95 @@ Result coverage relative to the conceptual docs:
 - global-fix upper-bound reference: `G0`
 
 The policy-choice model is intentionally out of scope for this paper line and is therefore not scheduled here.
+`G0` is the repository's global-fix reference implementation for conceptual `M2`.
 
 ## 3. Step-by-step plan
 
-### Step 0. Generate canonical configs
+### Step 0. Prepare paper artifacts
+
+The paper line must materialize the artifact stack before config generation:
+
+1. optional text cache for `text_embedding`
+2. labeled interim parquet with `constraint-scope=local`
+3. factorized processed graphs
+4. passive processed graphs
+
+**Optional: build the text cache**
+
+Only needed when the paper encoding is `text_embedding`.
+
+```bash
+PYTHONPATH=src .venv/bin/python src/04_wikidata_retriever.py \
+  --dataset full \
+  --min-occurrence 100
+```
+
+**Build labeled interim parquet for the paper scope**
+
+```bash
+PYTHONPATH=src .venv/bin/python src/05_constraint_labeler.py \
+  --dataset full \
+  --min-occurrence 100 \
+  --constraint-scope local
+```
+
+**Build factorized executable-factor graphs**
+
+For `node_id`:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/06_graph.py \
+  --dataset full \
+  --min-occurrence 100 \
+  --encoding node_id \
+  --constraint-scope local \
+  --constraint-representation factorized
+```
+
+For `text_embedding`:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/06_graph.py \
+  --dataset full \
+  --min-occurrence 100 \
+  --encoding text_embedding \
+  --constraint-scope local \
+  --constraint-representation factorized
+```
+
+**Build passive ESWC-style graphs**
+
+For `node_id`:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/06_graph.py \
+  --dataset full \
+  --min-occurrence 100 \
+  --encoding node_id \
+  --constraint-representation eswc_passive
+```
+
+For `text_embedding`:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/06_graph.py \
+  --dataset full \
+  --min-occurrence 100 \
+  --encoding text_embedding \
+  --constraint-representation eswc_passive
+```
+
+Paper readiness check:
+
+- factorized train/test artifacts exist under `data/processed/full_minocc100/`
+- passive train/test artifacts exist under `data/processed/full_minocc100/`
+- labeled parquet exists under `data/interim/full_minocc100_labeled/`
+- coverage reports exist:
+  - `coverage_local.csv`
+  - `coverage_local.md`
+- baseline evaluation now emits global metrics when labeled parquet is available
+
+### Step 1. Generate canonical configs
 
 Use the canonical paper config generator:
 
@@ -98,7 +185,7 @@ This emits only:
 
 If appendix runs are needed later, generate them separately with `--include-experimental`.
 
-### Step 1. Run heuristic baselines first
+### Step 2. Run heuristic baselines first
 
 Run baselines before any neural training so the paper already has stable reference numbers:
 
@@ -124,10 +211,10 @@ If `AMB` is not used in the final main table, keep it as appendix support.
 
 Code note:
 
-- `src/09_eval.py --run-baselines` reads `data/interim/<variant>/` directly, not `data/interim/<variant>_labeled/`.
-- Because of that, `--strict-global-metrics` is only safe for baselines if the base interim parquet files themselves already contain the factor-label columns required for global metrics.
+- `src/09_eval.py --run-baselines` now prefers `data/interim/<variant>_labeled/` when it exists and falls back to `data/interim/<variant>/` otherwise.
+- This is the paper-safe path for getting heuristic `GFR`, `SRR`, `SIR`, and disruption metrics from the labeled parquet files.
 
-### Step 2. Run a brief `M1C` hyperparameter search
+### Step 3. Run a brief `M1C` hyperparameter search
 
 Search only on the paper’s main practical model: `M1C`.
 
@@ -173,7 +260,7 @@ Why this is acceptable even if training is long:
 - early stopping is enabled in the generated configs
 - evaluation is automatic and strict
 
-### Step 3. Select one winning `M1C` config
+### Step 4. Select one winning `M1C` config
 
 Choose the winner using the evaluation JSONs from the search runs.
 
@@ -196,7 +283,7 @@ Search outputs to inspect:
 
 If you need the per-constraint breakdown, inspect the resolved run directory under `models/`; the scheduler does not copy `per_constraint.csv` back into the config directory.
 
-### Step 4. Lock the paper hyperparameters
+### Step 5. Lock the paper hyperparameters
 
 Once one `M1C` run wins, copy these settings into the canonical proposal configs:
 
@@ -251,7 +338,7 @@ Do not run a second search on:
 - `B0`
 - `G0`
 
-### Step 5. Train and evaluate the final learned suite
+### Step 6. Train and evaluate the final learned suite
 
 Run the canonical learned models after the hyperparameters are locked.
 
