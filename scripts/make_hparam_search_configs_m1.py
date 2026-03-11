@@ -159,6 +159,7 @@ def main() -> None:
                 "encoding": encoding,
                 "min_occurrence": min_occ,
                 "model": "GIN_PRESSURE",
+                "factor_executor_impl": "per_type_v1",
                 # backbone (inspired by ESWC best, adapted)
                 "num_layers": hp.num_layers,
                 "hidden_channels": hp.hidden,
@@ -191,6 +192,7 @@ def main() -> None:
                 "factor_loss": {
                     "enabled": True,
                     "weight_pre": hp.factor_w,
+                    "weight_post_gold": hp.factor_w,
                     "only_checkable": True,
                     "per_graph_reduction": "mean",
                 },

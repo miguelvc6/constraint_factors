@@ -148,6 +148,7 @@ def _proposal_config_payload(
             "min_occurrence": min_occurrence,
             "model": exp.model_name,
             "constraint_representation": exp.constraint_representation,
+            "factor_executor_impl": "per_type_v1",
             "use_edge_attributes": True,
             "use_edge_subtraction": False,
             "use_role_embeddings": True,
@@ -179,8 +180,9 @@ def _proposal_config_payload(
                 "enabled": False,
             },
             "factor_loss": {
-                "enabled": False,
+                "enabled": exp.constraint_representation == "factorized",
                 "weight_pre": 0.1,
+                "weight_post_gold": 0.1,
             },
             "chooser": {
                 "enabled": exp.chooser_enabled,

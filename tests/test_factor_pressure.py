@@ -39,6 +39,7 @@ def test_pressure_forward_and_backward():
         predicate_class_ids=(0, 1, 2, 3),
         num_factor_types=3,
         factor_type_embedding_dim=4,
+        factor_executor_impl="per_type_v1",
         pressure_enabled=True,
     )
     model = RepairGINFactorPressure(
@@ -58,6 +59,7 @@ def test_pressure_forward_and_backward():
         predicate_class_ids=cfg.predicate_class_ids,
         num_factor_types=cfg.num_factor_types,
         factor_type_embedding_dim=cfg.factor_type_embedding_dim,
+        factor_executor_impl=cfg.factor_executor_impl,
         pressure_enabled=cfg.pressure_enabled,
     )
 
@@ -65,12 +67,15 @@ def test_pressure_forward_and_backward():
     outputs = model(data)
     assert "edit_logits" in outputs
     assert "factor_logits_pre" in outputs
+    assert "factor_logits_post_gold" in outputs
     edit_logits = outputs["edit_logits"]
     factor_logits = outputs["factor_logits_pre"]
+    factor_logits_post_gold = outputs["factor_logits_post_gold"]
     assert edit_logits.shape == (1, 6, model.num_target_ids)
     assert factor_logits.shape == (1,)
+    assert factor_logits_post_gold.shape == (1,)
 
-    loss = edit_logits.sum() + factor_logits.sum()
+    loss = edit_logits.sum() + factor_logits.sum() + factor_logits_post_gold.sum()
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.requires_grad]
     assert any(g is not None for g in grads)

@@ -182,6 +182,7 @@ class FixProbabilityLossConfig:
 class FactorLossConfig:
     enabled: bool = False
     weight_pre: float = 0.1
+    weight_post_gold: float = 0.1
     pos_weight: float | None = None
     only_checkable: bool = True
     per_graph_reduction: str = "mean"
@@ -198,6 +199,8 @@ class FactorLossConfig:
 
         if "weight_pre" in filtered and filtered["weight_pre"] is not None:
             filtered["weight_pre"] = float(filtered["weight_pre"])
+        if "weight_post_gold" in filtered and filtered["weight_post_gold"] is not None:
+            filtered["weight_post_gold"] = float(filtered["weight_post_gold"])
         if "pos_weight" in filtered and filtered["pos_weight"] is not None:
             filtered["pos_weight"] = float(filtered["pos_weight"])
         if "only_checkable" in filtered and filtered["only_checkable"] is not None:
@@ -216,6 +219,7 @@ class FactorLossConfig:
         return {
             "enabled": self.enabled,
             "weight_pre": self.weight_pre,
+            "weight_post_gold": self.weight_post_gold,
             "pos_weight": self.pos_weight,
             "only_checkable": self.only_checkable,
             "per_graph_reduction": self.per_graph_reduction,
@@ -365,6 +369,8 @@ class ModelConfig:
     """Number of policy classes for policy choice head."""
     constraint_representation: str = "factorized"
     """Graph representation regime: factorized or eswc_passive."""
+    factor_executor_impl: str = "per_type_v1"
+    """Factor executor implementation: per_type_v1 or legacy_shared."""
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ModelConfig":
@@ -421,6 +427,11 @@ class ModelConfig:
                     "constraint_representation must be 'factorized' or 'eswc_passive'"
                 )
             filtered["constraint_representation"] = value
+        if "factor_executor_impl" in filtered and filtered["factor_executor_impl"] is not None:
+            value = str(filtered["factor_executor_impl"]).lower()
+            if value not in {"per_type_v1", "legacy_shared"}:
+                raise ValueError("factor_executor_impl must be 'per_type_v1' or 'legacy_shared'")
+            filtered["factor_executor_impl"] = value
 
         if filtered.get("enable_policy_choice") and "policy_num_classes" in filtered:
             if int(filtered["policy_num_classes"]) < 6:

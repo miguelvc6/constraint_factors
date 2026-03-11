@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from typing import Callable, Sequence, Tuple
+from typing import Callable, NamedTuple, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +10,291 @@ from torch.nn import Linear, ReLU, Sequential
 from torch_geometric.nn import GATConv, GCNConv, GINConv, GINEConv, global_mean_pool
 
 from .config import ModelConfig
+
+
+FACTOR_ROLE_PREDICATE = 0
+FACTOR_ROLE_SUBJECT = 1
+FACTOR_ROLE_OBJECT = 2
+FACTOR_ROLE_IDS: tuple[int, int, int] = (
+    FACTOR_ROLE_PREDICATE,
+    FACTOR_ROLE_SUBJECT,
+    FACTOR_ROLE_OBJECT,
+)
+
+
+class FactorScopeRuntime(NamedTuple):
+    factor_node_index: torch.Tensor
+    factor_node_emb: torch.Tensor
+    factor_graph_index: torch.Tensor
+    factor_type_ids: torch.Tensor
+    predicate_summary: torch.Tensor
+    subject_summary: torch.Tensor
+    object_summary: torch.Tensor
+    predicate_counts: torch.Tensor
+    subject_counts: torch.Tensor
+    object_counts: torch.Tensor
+    predicate_factor_pos: torch.Tensor
+    predicate_dst_index: torch.Tensor
+    subject_factor_pos: torch.Tensor
+    subject_dst_index: torch.Tensor
+    object_factor_pos: torch.Tensor
+    object_dst_index: torch.Tensor
+
+
+class FactorTypeExecutor(nn.Module):
+    def __init__(self, input_dim: int, state_dim: int):
+        super().__init__()
+        self.state_mlp = nn.Sequential(
+            nn.Linear(input_dim, state_dim),
+            nn.ReLU(),
+            nn.Linear(state_dim, state_dim),
+            nn.ReLU(),
+        )
+        self.pre_head = nn.Linear(state_dim, 1)
+
+    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self.state_mlp(inputs)
+        logit = self.pre_head(state).squeeze(-1)
+        return state, logit
+
+
+class FactorPostEditHead(nn.Module):
+    def __init__(self, state_dim: int, edit_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + edit_dim, state_dim),
+            nn.ReLU(),
+            nn.Linear(state_dim, 1),
+        )
+
+    def forward(self, state: torch.Tensor, edit_repr: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([state, edit_repr], dim=-1)).squeeze(-1)
+
+
+def _select_factor_node_indices(
+    node_emb: torch.Tensor,
+    data,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    factor_node_index = getattr(data, "factor_node_index", None)
+    factor_node_mask = getattr(data, "is_factor_node", None)
+    batch = getattr(data, "batch", None)
+    if batch is None:
+        return None, None
+
+    mask = None
+    if factor_node_mask is not None:
+        mask = torch.as_tensor(
+            factor_node_mask, dtype=torch.bool, device=node_emb.device
+        ).view(-1)
+        if mask.numel() != node_emb.size(0):
+            mask = None
+
+    if mask is not None and mask.any():
+        factor_global_indices = torch.nonzero(mask, as_tuple=False).view(-1)
+        factor_graph_index = batch.index_select(0, factor_global_indices)
+
+        ptr = getattr(data, "ptr", None)
+        if factor_node_index is not None and ptr is not None:
+            factor_node_index = torch.as_tensor(
+                factor_node_index, device=node_emb.device
+            ).view(-1)
+            ptr = torch.as_tensor(ptr, device=node_emb.device).view(-1)
+            local_indices = factor_global_indices - ptr[factor_graph_index]
+
+            if factor_node_index.numel() == factor_global_indices.numel():
+                order: list[torch.Tensor] = []
+                offset = 0
+                num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+                for graph_id in range(num_graphs):
+                    graph_mask = factor_graph_index == graph_id
+                    count = int(graph_mask.sum().item())
+                    if count == 0:
+                        continue
+                    expected = factor_node_index[offset : offset + count]
+                    offset += count
+                    local_g = local_indices[graph_mask]
+                    if expected.numel() != count:
+                        idxs = torch.argsort(local_g)
+                    else:
+                        local_list = local_g.tolist()
+                        positions: dict[int, deque[int]] = defaultdict(deque)
+                        for pos_idx, val in enumerate(local_list):
+                            positions[int(val)].append(pos_idx)
+
+                        reorder: list[int] = []
+                        missing = False
+                        for expected_val in expected.tolist():
+                            q = positions.get(int(expected_val))
+                            if not q:
+                                missing = True
+                                break
+                            reorder.append(q.popleft())
+                        if missing:
+                            idxs = torch.argsort(local_g)
+                        else:
+                            idxs = torch.tensor(
+                                reorder,
+                                device=node_emb.device,
+                                dtype=torch.long,
+                            )
+                    factor_indices_g = torch.nonzero(graph_mask, as_tuple=False).view(-1)
+                    order.append(factor_indices_g.index_select(0, idxs))
+                if order:
+                    perm = torch.cat(order, dim=0)
+                    factor_global_indices = factor_global_indices.index_select(0, perm)
+                    factor_graph_index = factor_graph_index.index_select(0, perm)
+        return factor_global_indices, factor_graph_index
+
+    if factor_node_index is not None:
+        factor_node_index = torch.as_tensor(
+            factor_node_index, device=node_emb.device
+        ).view(-1)
+        factor_graph_index = batch.index_select(0, factor_node_index)
+        return factor_node_index, factor_graph_index
+
+    return None, None
+
+
+def _build_factor_scope_runtime(
+    node_emb: torch.Tensor,
+    data,
+    *,
+    factor_edge_types: tuple[int, int, int],
+    num_factor_types: int,
+) -> FactorScopeRuntime | None:
+    factor_node_index, factor_graph_index = _select_factor_node_indices(node_emb, data)
+    if factor_node_index is None or factor_graph_index is None or factor_node_index.numel() == 0:
+        return None
+
+    factor_node_emb = node_emb.index_select(0, factor_node_index)
+    num_factors = int(factor_node_index.numel())
+    hidden_dim = int(node_emb.size(-1))
+
+    fallback_type_id = max(int(num_factor_types), 0)
+    factor_types = getattr(data, "factor_types", None)
+    if factor_types is not None:
+        raw_factor_types = torch.as_tensor(
+            factor_types, dtype=torch.long, device=node_emb.device
+        ).view(-1)
+        if raw_factor_types.numel() != num_factors:
+            raise ValueError(
+                f"factor_types length {raw_factor_types.numel()} does not match factor count {num_factors}"
+            )
+        if num_factor_types > 0:
+            valid_mask = (raw_factor_types >= 0) & (raw_factor_types < int(num_factor_types))
+            factor_type_ids = torch.where(
+                valid_mask,
+                raw_factor_types,
+                torch.full_like(raw_factor_types, fallback_type_id),
+            )
+        else:
+            factor_type_ids = torch.full_like(raw_factor_types, fallback_type_id)
+    else:
+        factor_type_ids = torch.full(
+            (num_factors,),
+            fallback_type_id,
+            dtype=torch.long,
+            device=node_emb.device,
+        )
+
+    edge_index = getattr(data, "edge_index", None)
+    edge_type = getattr(data, "edge_type", None)
+    if edge_index is None or edge_type is None:
+        zero_summary = torch.zeros((num_factors, hidden_dim), device=node_emb.device, dtype=node_emb.dtype)
+        zero_counts = torch.zeros((num_factors, 1), device=node_emb.device, dtype=node_emb.dtype)
+        empty = torch.empty((0,), device=node_emb.device, dtype=torch.long)
+        return FactorScopeRuntime(
+            factor_node_index=factor_node_index,
+            factor_node_emb=factor_node_emb,
+            factor_graph_index=factor_graph_index,
+            factor_type_ids=factor_type_ids,
+            predicate_summary=zero_summary,
+            subject_summary=zero_summary.clone(),
+            object_summary=zero_summary.clone(),
+            predicate_counts=zero_counts,
+            subject_counts=zero_counts.clone(),
+            object_counts=zero_counts.clone(),
+            predicate_factor_pos=empty,
+            predicate_dst_index=empty,
+            subject_factor_pos=empty,
+            subject_dst_index=empty,
+            object_factor_pos=empty,
+            object_dst_index=empty,
+        )
+
+    edge_index = edge_index.to(device=node_emb.device)
+    edge_type = torch.as_tensor(edge_type, dtype=torch.long, device=node_emb.device).view(-1)
+    if edge_index.size(1) != edge_type.numel():
+        raise ValueError("edge_type length must match number of edges")
+
+    factor_pos_map = torch.full((node_emb.size(0),), -1, dtype=torch.long, device=node_emb.device)
+    factor_pos_map.index_copy_(
+        0,
+        factor_node_index,
+        torch.arange(num_factors, device=node_emb.device, dtype=torch.long),
+    )
+
+    def _role_summary(role_edge_type: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask = edge_type == int(role_edge_type)
+        if not mask.any():
+            return (
+                torch.zeros((num_factors, hidden_dim), device=node_emb.device, dtype=node_emb.dtype),
+                torch.zeros((num_factors, 1), device=node_emb.device, dtype=node_emb.dtype),
+                torch.empty((0,), device=node_emb.device, dtype=torch.long),
+                torch.empty((0,), device=node_emb.device, dtype=torch.long),
+            )
+        src = edge_index[0, mask]
+        dst = edge_index[1, mask]
+        factor_pos = factor_pos_map.index_select(0, src)
+        valid = factor_pos >= 0
+        if not valid.any():
+            return (
+                torch.zeros((num_factors, hidden_dim), device=node_emb.device, dtype=node_emb.dtype),
+                torch.zeros((num_factors, 1), device=node_emb.device, dtype=node_emb.dtype),
+                torch.empty((0,), device=node_emb.device, dtype=torch.long),
+                torch.empty((0,), device=node_emb.device, dtype=torch.long),
+            )
+        factor_pos = factor_pos[valid]
+        dst = dst[valid]
+        sums = torch.zeros((num_factors, hidden_dim), device=node_emb.device, dtype=node_emb.dtype)
+        sums.index_add_(0, factor_pos, node_emb.index_select(0, dst))
+        counts = torch.zeros((num_factors, 1), device=node_emb.device, dtype=node_emb.dtype)
+        counts.index_add_(
+            0,
+            factor_pos,
+            torch.ones((dst.numel(), 1), device=node_emb.device, dtype=node_emb.dtype),
+        )
+        means = sums / counts.clamp(min=1.0)
+        return means, counts, factor_pos, dst
+
+    predicate_summary, predicate_counts, predicate_factor_pos, predicate_dst_index = _role_summary(
+        factor_edge_types[0]
+    )
+    subject_summary, subject_counts, subject_factor_pos, subject_dst_index = _role_summary(
+        factor_edge_types[1]
+    )
+    object_summary, object_counts, object_factor_pos, object_dst_index = _role_summary(
+        factor_edge_types[2]
+    )
+
+    return FactorScopeRuntime(
+        factor_node_index=factor_node_index,
+        factor_node_emb=factor_node_emb,
+        factor_graph_index=factor_graph_index,
+        factor_type_ids=factor_type_ids,
+        predicate_summary=predicate_summary,
+        subject_summary=subject_summary,
+        object_summary=object_summary,
+        predicate_counts=predicate_counts,
+        subject_counts=subject_counts,
+        object_counts=object_counts,
+        predicate_factor_pos=predicate_factor_pos,
+        predicate_dst_index=predicate_dst_index,
+        subject_factor_pos=subject_factor_pos,
+        subject_dst_index=subject_dst_index,
+        object_factor_pos=object_factor_pos,
+        object_dst_index=object_dst_index,
+    )
 
 
 class BaseGraphModel(nn.Module, ABC):
@@ -37,6 +322,7 @@ class BaseGraphModel(nn.Module, ABC):
         predicate_class_ids: Sequence[int] | torch.Tensor | None = None,
         num_factor_types: int = 0,
         factor_type_embedding_dim: int = 8,
+        factor_executor_impl: str = "per_type_v1",
         pressure_enabled: bool = False,
         pressure_type_conditioning: str = "none",
         pressure_residual_scale: float = 0.1,
@@ -155,21 +441,48 @@ class BaseGraphModel(nn.Module, ABC):
         self._chooser_head: nn.Sequential | None = None
         self._num_factor_types = int(num_factor_types)
         self._factor_type_embedding_dim = int(factor_type_embedding_dim)
+        self._factor_executor_impl = str(factor_executor_impl).lower()
+        if self._factor_executor_impl not in {"per_type_v1", "legacy_shared"}:
+            raise ValueError("factor_executor_impl must be 'per_type_v1' or 'legacy_shared'")
         self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
         self._pressure_residual_scale = float(pressure_residual_scale)
-        if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0:
-            self.factor_type_embeddings = nn.Embedding(
-                self._num_factor_types, self._factor_type_embedding_dim
+        self._factor_state_dim = head_hidden
+        self._factor_scope_feature_dim = (hidden_mp * 4) + 3
+        self._factor_fallback_type_id = max(self._num_factor_types, 0)
+        self._num_factor_executor_modules = max(1, self._factor_fallback_type_id + 1)
+        if self._factor_executor_impl == "legacy_shared":
+            if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0:
+                self.factor_type_embeddings = nn.Embedding(
+                    self._num_factor_types, self._factor_type_embedding_dim
+                )
+                factor_input_dim = head_hidden + self._factor_type_embedding_dim
+            else:
+                self.factor_type_embeddings = None
+                factor_input_dim = head_hidden
+            self.factor_pre_head = nn.Sequential(
+                nn.Linear(factor_input_dim, head_hidden),
+                nn.ReLU(),
+                nn.Linear(head_hidden, 1),
             )
-            factor_input_dim = head_hidden + self._factor_type_embedding_dim
+            self._factor_executors = None
+            self._factor_post_heads = None
+            self._gold_edit_embeddings = None
         else:
             self.factor_type_embeddings = None
-            factor_input_dim = head_hidden
-        self.factor_pre_head = nn.Sequential(
-            nn.Linear(factor_input_dim, head_hidden),
-            nn.ReLU(),
-            nn.Linear(head_hidden, 1),
-        )
+            self.factor_pre_head = None
+            self._factor_executors = nn.ModuleList(
+                [
+                    FactorTypeExecutor(self._factor_scope_feature_dim, self._factor_state_dim)
+                    for _ in range(self._num_factor_executor_modules)
+                ]
+            )
+            self._factor_post_heads = nn.ModuleList(
+                [
+                    FactorPostEditHead(self._factor_state_dim, self._factor_state_dim)
+                    for _ in range(self._num_factor_executor_modules)
+                ]
+            )
+            self._gold_edit_embeddings = nn.Embedding(self.num_target_ids, self._factor_state_dim)
         self._policy_enabled = bool(enable_policy_choice)
         self._policy_num_classes = int(policy_num_classes)
         if self._policy_enabled:
@@ -289,6 +602,173 @@ class BaseGraphModel(nn.Module, ABC):
         joint = torch.cat([graph_expand, candidate_repr], dim=-1)
         return self._chooser_head(joint).squeeze(-1)
 
+    def _factor_edge_types(self) -> tuple[int, int, int]:
+        return (
+            getattr(self, "EDGE_FACTOR_TO_LOCAL_PREDICATE", 4),
+            getattr(self, "EDGE_FACTOR_TO_LOCAL_SUBJECT", 5),
+            getattr(self, "EDGE_FACTOR_TO_LOCAL_OBJECT", 6),
+        )
+
+    def _build_factor_scope_runtime(self, node_emb: torch.Tensor, data) -> FactorScopeRuntime | None:
+        return _build_factor_scope_runtime(
+            node_emb,
+            data,
+            factor_edge_types=self._factor_edge_types(),
+            num_factor_types=self._num_factor_types,
+        )
+
+    def _factor_scope_features(self, runtime: FactorScopeRuntime) -> torch.Tensor:
+        counts = torch.cat(
+            [
+                torch.log1p(runtime.predicate_counts),
+                torch.log1p(runtime.subject_counts),
+                torch.log1p(runtime.object_counts),
+            ],
+            dim=-1,
+        )
+        return torch.cat(
+            [
+                runtime.factor_node_emb,
+                runtime.predicate_summary,
+                runtime.subject_summary,
+                runtime.object_summary,
+                counts,
+            ],
+            dim=-1,
+        )
+
+    def _run_per_type_factor_executors(
+        self,
+        runtime: FactorScopeRuntime,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._factor_executors is None:
+            raise RuntimeError("Per-type factor executors are not initialized.")
+        inputs = self._factor_scope_features(runtime)
+        states = inputs.new_zeros((inputs.size(0), self._factor_state_dim))
+        logits = inputs.new_zeros((inputs.size(0),))
+        for type_id in torch.unique(runtime.factor_type_ids).tolist():
+            mask = runtime.factor_type_ids == int(type_id)
+            if not mask.any():
+                continue
+            state, logit = self._factor_executors[int(type_id)](inputs[mask])
+            states[mask] = state
+            logits[mask] = logit
+        return states, logits
+
+    def _run_per_type_post_heads(
+        self,
+        factor_states: torch.Tensor,
+        factor_type_ids: torch.Tensor,
+        edit_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._factor_post_heads is None:
+            raise RuntimeError("Per-type factor post heads are not initialized.")
+        logits = factor_states.new_zeros((factor_states.size(0),))
+        for type_id in torch.unique(factor_type_ids).tolist():
+            mask = factor_type_ids == int(type_id)
+            if not mask.any():
+                continue
+            logits[mask] = self._factor_post_heads[int(type_id)](factor_states[mask], edit_repr[mask])
+        return logits
+
+    def _gold_edit_representation(
+        self,
+        targets: torch.Tensor,
+        factor_graph_index: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self._gold_edit_embeddings is None:
+            return None
+        if targets.dim() == 1:
+            targets = targets.view(1, -1)
+        if targets.dim() != 2 or targets.size(-1) != 6:
+            raise ValueError(f"Expected gold targets shape (B,6), got {tuple(targets.shape)}")
+        target_ids = targets.to(dtype=torch.long, device=factor_graph_index.device).clamp(
+            min=0, max=self.num_target_ids - 1
+        )
+        edit_emb = self._gold_edit_embeddings(target_ids).mean(dim=1)
+        return edit_emb.index_select(0, factor_graph_index)
+
+    def _compute_factor_outputs(self, node_emb: torch.Tensor, data) -> dict[str, torch.Tensor | None]:
+        factor_mask_pre = None
+        factor_checkable = getattr(data, "factor_checkable_pre", None)
+        if factor_checkable is not None:
+            factor_mask_pre = torch.as_tensor(
+                factor_checkable, dtype=torch.bool, device=node_emb.device
+            ).view(-1)
+
+        factor_node_emb, factor_graph_index = _select_factor_nodes(node_emb, data)
+        factor_logits_pre = None
+        factor_logits_post_gold = None
+
+        if factor_node_emb is None or factor_node_emb.numel() == 0 or factor_graph_index is None:
+            return {
+                "factor_logits_pre": factor_logits_pre,
+                "factor_logits_post_gold": factor_logits_post_gold,
+                "factor_mask_pre": factor_mask_pre,
+                "factor_graph_index": factor_graph_index,
+            }
+
+        if self._factor_executor_impl == "legacy_shared":
+            factor_types = getattr(data, "factor_types", None)
+            factor_hidden = F.relu(self.shared_projection(factor_node_emb))
+            factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
+            factor_type_embeddings = self.factor_type_embeddings
+            if factor_type_embeddings is not None:
+                if factor_types is not None:
+                    factor_types_tensor = torch.as_tensor(
+                        factor_types, dtype=torch.long, device=node_emb.device
+                    ).view(-1)
+                    factor_type_emb = factor_type_embeddings(
+                        factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
+                    )
+                else:
+                    factor_type_emb = torch.zeros(
+                        factor_hidden.size(0),
+                        self._factor_type_embedding_dim,
+                        device=factor_hidden.device,
+                        dtype=factor_hidden.dtype,
+                    )
+                factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
+            if self.factor_pre_head is None:
+                raise RuntimeError("Legacy factor_pre_head is not initialized.")
+            factor_logits_pre = self.factor_pre_head(factor_hidden).squeeze(-1)
+            return {
+                "factor_logits_pre": factor_logits_pre,
+                "factor_logits_post_gold": factor_logits_post_gold,
+                "factor_mask_pre": factor_mask_pre,
+                "factor_graph_index": factor_graph_index,
+            }
+
+        runtime = self._build_factor_scope_runtime(node_emb, data)
+        if runtime is None:
+            return {
+                "factor_logits_pre": factor_logits_pre,
+                "factor_logits_post_gold": factor_logits_post_gold,
+                "factor_mask_pre": factor_mask_pre,
+                "factor_graph_index": factor_graph_index,
+            }
+
+        factor_states, factor_logits_pre = self._run_per_type_factor_executors(runtime)
+        targets = getattr(data, "y", None)
+        if targets is not None:
+            gold_edit_repr = self._gold_edit_representation(
+                torch.as_tensor(targets, device=node_emb.device),
+                runtime.factor_graph_index,
+            )
+            if gold_edit_repr is not None:
+                factor_logits_post_gold = self._run_per_type_post_heads(
+                    factor_states,
+                    runtime.factor_type_ids,
+                    gold_edit_repr,
+                )
+
+        return {
+            "factor_logits_pre": factor_logits_pre,
+            "factor_logits_post_gold": factor_logits_post_gold,
+            "factor_mask_pre": factor_mask_pre,
+            "factor_graph_index": runtime.factor_graph_index,
+        }
+
     @abstractmethod
     def create_conv_layer(self, in_channels: int, out_channels: int) -> nn.Module:
         """Return a torch_geometric convolution layer."""
@@ -398,48 +878,16 @@ class BaseGraphModel(nn.Module, ABC):
             6,
             self.num_target_ids,
         ), f"Expected {(graph_emb.shape[0], 6, self.num_target_ids)}, got {prediction.shape}"
-        factor_logits_pre = None
-        factor_mask_pre = None
-        factor_graph_index = None
-        factor_checkable = getattr(data, "factor_checkable_pre", None)
-        factor_types = getattr(data, "factor_types", None)
-
-        if factor_checkable is not None:
-            factor_mask_pre = torch.as_tensor(
-                factor_checkable, dtype=torch.bool, device=graph_emb.device
-            ).view(-1)
-
-        factor_node_emb, factor_graph_index = _select_factor_nodes(node_emb, data)
-
-        if factor_node_emb is not None and factor_node_emb.numel() > 0:
-            factor_hidden = F.relu(self.shared_projection(factor_node_emb))
-            factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
-            factor_type_embeddings = self.factor_type_embeddings
-            if factor_type_embeddings is not None:
-                if factor_types is not None:
-                    factor_types_tensor = torch.as_tensor(
-                        factor_types, dtype=torch.long, device=graph_emb.device
-                    ).view(-1)
-                    factor_type_emb = factor_type_embeddings(
-                        factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
-                    )
-                else:
-                    factor_type_emb = torch.zeros(
-                        factor_hidden.size(0),
-                        self._factor_type_embedding_dim,
-                        device=factor_hidden.device,
-                        dtype=factor_hidden.dtype,
-                    )
-                factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
-            factor_logits_pre = self.factor_pre_head(factor_hidden).squeeze(-1)
+        factor_outputs = self._compute_factor_outputs(node_emb, data)
 
         return {
             "edit_logits": prediction,
             "node_emb": node_emb,
             "graph_emb": graph_emb,
-            "factor_logits_pre": factor_logits_pre,
-            "factor_mask_pre": factor_mask_pre,
-            "factor_graph_index": factor_graph_index,
+            "factor_logits_pre": factor_outputs["factor_logits_pre"],
+            "factor_logits_post_gold": factor_outputs["factor_logits_post_gold"],
+            "factor_mask_pre": factor_outputs["factor_mask_pre"],
+            "factor_graph_index": factor_outputs["factor_graph_index"],
             "policy_logits": policy_logits,
         }
 
@@ -570,6 +1018,24 @@ class RepairGINFactorPressure(BaseGraphModel):
             self._pressure_type_gate = nn.Linear(self._pressure_type_dim, self.hidden_channels)
         else:
             self._pressure_type_gate = None
+        if self._factor_executor_impl == "per_type_v1":
+            self._pressure_role_modules = nn.ModuleDict(
+                {
+                    str(role_id): nn.ModuleList(
+                        [
+                            nn.Sequential(
+                                nn.Linear(self._factor_state_dim + self.hidden_channels, self.hidden_channels),
+                                nn.ReLU(),
+                                nn.Linear(self.hidden_channels, self.hidden_channels),
+                            )
+                            for _ in range(self._num_factor_executor_modules)
+                        ]
+                    )
+                    for role_id in FACTOR_ROLE_IDS
+                }
+            )
+        else:
+            self._pressure_role_modules = None
 
     def create_conv_layer(self, in_channels: int, out_channels: int):
         if self.use_edge_attributes:
@@ -593,6 +1059,50 @@ class RepairGINFactorPressure(BaseGraphModel):
     def _apply_pressure(self, x: torch.Tensor, data) -> torch.Tensor:
         if not self._pressure_enabled:
             return x
+        if self._factor_executor_impl == "per_type_v1":
+            runtime = self._build_factor_scope_runtime(x, data)
+            if runtime is None:
+                return x
+            factor_states, _ = self._run_per_type_factor_executors(runtime)
+            aggregated = torch.zeros_like(x)
+
+            def _apply_role(
+                role_id: int,
+                factor_pos: torch.Tensor,
+                dst_index: torch.Tensor,
+            ) -> None:
+                if factor_pos.numel() == 0 or dst_index.numel() == 0:
+                    return
+                role_modules = self._pressure_role_modules
+                if role_modules is None:
+                    return
+                per_edge_messages = x.new_zeros((dst_index.numel(), self.hidden_channels))
+                role_key = str(role_id)
+                type_ids = runtime.factor_type_ids.index_select(0, factor_pos)
+                dst_emb = x.index_select(0, dst_index)
+                factor_state = factor_states.index_select(0, factor_pos)
+                for type_id in torch.unique(type_ids).tolist():
+                    mask = type_ids == int(type_id)
+                    if not mask.any():
+                        continue
+                    message_input = torch.cat([factor_state[mask], dst_emb[mask]], dim=-1)
+                    per_edge_messages[mask] = role_modules[role_key][int(type_id)](message_input)
+                aggregated.index_add_(0, dst_index, per_edge_messages)
+
+            _apply_role(FACTOR_ROLE_PREDICATE, runtime.predicate_factor_pos, runtime.predicate_dst_index)
+            _apply_role(FACTOR_ROLE_SUBJECT, runtime.subject_factor_pos, runtime.subject_dst_index)
+            _apply_role(FACTOR_ROLE_OBJECT, runtime.object_factor_pos, runtime.object_dst_index)
+            degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+            for dst_index in (
+                runtime.predicate_dst_index,
+                runtime.subject_dst_index,
+                runtime.object_dst_index,
+            ):
+                if dst_index.numel() == 0:
+                    continue
+                degree.index_add_(0, dst_index, torch.ones(dst_index.size(0), device=x.device, dtype=x.dtype))
+            aggregated = aggregated / degree.clamp(min=1.0).unsqueeze(-1)
+            return x + (self._pressure_residual_scale * aggregated)
         edge_index = getattr(data, "edge_index", None)
         if edge_index is None:
             return x
@@ -792,48 +1302,16 @@ class RepairGINFactorPressure(BaseGraphModel):
             self.num_target_ids,
         ), f"Expected {(graph_emb.shape[0], 6, self.num_target_ids)}, got {prediction.shape}"
 
-        factor_logits_pre = None
-        factor_mask_pre = None
-        factor_graph_index = None
-        factor_checkable = getattr(data, "factor_checkable_pre", None)
-        factor_types = getattr(data, "factor_types", None)
-
-        if factor_checkable is not None:
-            factor_mask_pre = torch.as_tensor(
-                factor_checkable, dtype=torch.bool, device=graph_emb.device
-            ).view(-1)
-
-        factor_node_emb, factor_graph_index = _select_factor_nodes(node_emb, data)
-
-        if factor_node_emb is not None and factor_node_emb.numel() > 0:
-            factor_hidden = F.relu(self.shared_projection(factor_node_emb))
-            factor_hidden = F.dropout(factor_hidden, p=self._dropout, training=self.training)
-            factor_type_embeddings = self.factor_type_embeddings
-            if factor_type_embeddings is not None:
-                if factor_types is not None:
-                    factor_types_tensor = torch.as_tensor(
-                        factor_types, dtype=torch.long, device=graph_emb.device
-                    ).view(-1)
-                    factor_type_emb = factor_type_embeddings(
-                        factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
-                    )
-                else:
-                    factor_type_emb = torch.zeros(
-                        factor_hidden.size(0),
-                        self._factor_type_embedding_dim,
-                        device=factor_hidden.device,
-                        dtype=factor_hidden.dtype,
-                    )
-                factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
-            factor_logits_pre = self.factor_pre_head(factor_hidden).squeeze(-1)
+        factor_outputs = self._compute_factor_outputs(node_emb, data)
 
         return {
             "edit_logits": prediction,
             "node_emb": node_emb,
             "graph_emb": graph_emb,
-            "factor_logits_pre": factor_logits_pre,
-            "factor_mask_pre": factor_mask_pre,
-            "factor_graph_index": factor_graph_index,
+            "factor_logits_pre": factor_outputs["factor_logits_pre"],
+            "factor_logits_post_gold": factor_outputs["factor_logits_post_gold"],
+            "factor_mask_pre": factor_outputs["factor_mask_pre"],
+            "factor_graph_index": factor_outputs["factor_graph_index"],
             "policy_logits": policy_logits,
         }
 
@@ -842,89 +1320,10 @@ def _select_factor_nodes(
     node_emb: torch.Tensor,
     data,
 ) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
-    factor_node_index = getattr(data, "factor_node_index", None)
-    factor_node_mask = getattr(data, "is_factor_node", None)
-    batch = getattr(data, "batch", None)
-    if batch is None:
+    factor_node_index, factor_graph_index = _select_factor_node_indices(node_emb, data)
+    if factor_node_index is None or factor_graph_index is None:
         return None, None
-
-    factor_node_emb = None
-    factor_graph_index = None
-
-    mask = None
-    if factor_node_mask is not None:
-        mask = torch.as_tensor(
-            factor_node_mask, dtype=torch.bool, device=node_emb.device
-        ).view(-1)
-        if mask.numel() != node_emb.size(0):
-            mask = None
-
-    if mask is not None and mask.any():
-        factor_global_indices = torch.nonzero(mask, as_tuple=False).view(-1)
-        factor_node_emb = node_emb.index_select(0, factor_global_indices)
-        factor_graph_index = batch.index_select(0, factor_global_indices)
-
-        ptr = getattr(data, "ptr", None)
-        if factor_node_index is not None and ptr is not None:
-            factor_node_index = torch.as_tensor(
-                factor_node_index, device=node_emb.device
-            ).view(-1)
-            ptr = torch.as_tensor(ptr, device=node_emb.device).view(-1)
-            local_indices = factor_global_indices - ptr[factor_graph_index]
-
-            if factor_node_index.numel() == factor_node_emb.size(0):
-                order: list[torch.Tensor] = []
-                offset = 0
-                num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
-                for graph_id in range(num_graphs):
-                    graph_mask = factor_graph_index == graph_id
-                    count = int(graph_mask.sum().item())
-                    if count == 0:
-                        continue
-                    expected = factor_node_index[offset : offset + count]
-                    offset += count
-                    local_g = local_indices[graph_mask]
-                    if expected.numel() != count:
-                        idxs = torch.argsort(local_g)
-                    else:
-                        local_list = local_g.tolist()
-                        positions: dict[int, deque[int]] = defaultdict(deque)
-                        for pos_idx, val in enumerate(local_list):
-                            positions[int(val)].append(pos_idx)
-
-                        reorder: list[int] = []
-                        missing = False
-                        for expected_val in expected.tolist():
-                            q = positions.get(int(expected_val))
-                            if not q:
-                                missing = True
-                                break
-                            reorder.append(q.popleft())
-                        if missing:
-                            idxs = torch.argsort(local_g)
-                        else:
-                            idxs = torch.tensor(
-                                reorder,
-                                device=node_emb.device,
-                                dtype=torch.long,
-                            )
-                    factor_indices_g = torch.nonzero(graph_mask, as_tuple=False).view(-1)
-                    order.append(factor_indices_g.index_select(0, idxs))
-                if order:
-                    perm = torch.cat(order, dim=0)
-                    factor_node_emb = factor_node_emb.index_select(0, perm)
-                    factor_graph_index = factor_graph_index.index_select(0, perm)
-        return factor_node_emb, factor_graph_index
-
-    if factor_node_index is not None:
-        factor_node_index = torch.as_tensor(
-            factor_node_index, device=node_emb.device
-        ).view(-1)
-        factor_node_emb = node_emb.index_select(0, factor_node_index)
-        factor_graph_index = batch.index_select(0, factor_node_index)
-        return factor_node_emb, factor_graph_index
-
-    return None, None
+    return node_emb.index_select(0, factor_node_index), factor_graph_index
 
 
 class RepairGCN(BaseGraphModel):
@@ -964,6 +1363,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         predicate_class_ids=config.predicate_class_ids,
         num_factor_types=config.num_factor_types,
         factor_type_embedding_dim=config.factor_type_embedding_dim,
+        factor_executor_impl=getattr(config, "factor_executor_impl", "per_type_v1"),
         pressure_enabled=config.pressure_enabled,
         pressure_type_conditioning=getattr(config, "pressure_type_conditioning", "none"),
         pressure_residual_scale=getattr(config, "pressure_residual_scale", 0.1),
