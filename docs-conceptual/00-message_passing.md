@@ -10,6 +10,8 @@ The goal is to make explicit:
 - how this pressure interacts with GNN message passing,
 - and how repair decisions emerge without hardcoded heuristics.
 
+This conceptual specification does not assume that every decision-time safety quantity must be produced by a fully neural post-edit rollout. The main research plan remains compatible with symbolic candidate evaluation at repair-selection time, as long as executable factors shape the proposal model itself.
+
 ---
 
 ## 1. Graph Structure and Notation
@@ -275,5 +277,6 @@ This is the conceptual mechanism behind the broader executable-factor repair dir
 - Violations generate **continuous pressure**, not discrete rules.
 - Repair decisions emerge from representation dynamics.
 - This enables principled modeling of soft, interacting constraints under curator intent.
+- A symbolic candidate evaluator can still remain the paper's decision-time safety layer without weakening the core executable-factor contribution.
 
 This formulation makes constraints **first-class computational objects**, not annotations.

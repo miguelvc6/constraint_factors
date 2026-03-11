@@ -21,23 +21,7 @@ This document tracks the remaining gaps after the phase-1 paper-alignment refact
 
 ## Remaining gaps
 
-### 1. Candidate-level safety terms are still symbolic at decision time
-
-Current code:
-
-- uses per-type neural factor executors for pre-state factor scoring
-- uses per-type / per-role neural pressure messages during factorized message passing
-- predicts post-edit factor satisfaction for the historical gold edit as an auxiliary proposal loss
-- still evaluates candidate edits with the shared symbolic checker/evaluator stack for `M1C`, `M1D`, `G0`, and final metrics
-
-Still missing:
-
-- predicted-edit neural rollouts through the factor stack
-- direct neural estimation of candidate-level primary / secondary outcomes for arbitrary proposed edits
-
-This is now the main remaining conceptual gap relative to the strongest end-to-end neural formulation.
-
-### 2. Experimental side paths still exist in the codebase
+### 1. Experimental side paths still exist in the codebase
 
 They are no longer on the default paper surface, but the code still supports:
 
@@ -47,13 +31,30 @@ They are no longer on the default paper surface, but the code still supports:
 
 That is fine as long as they remain clearly marked experimental.
 
-### 3. Checker coverage remains bounded by implemented symbolic families
+### 2. Checker coverage remains bounded by implemented symbolic families
 
 The shared evaluator is only as broad as the supported symbolic checker set. Unsupported constraint families still limit how much of the local constraint set is fully checkable.
 
+## Deliberate scope boundary
+
+The repository still does **not** implement:
+
+- predicted-edit neural rollouts through the factor stack
+- direct neural estimation of candidate-level primary / secondary outcomes for arbitrary proposed edits
+
+For the current paper direction, these are treated as optional long-range extensions rather than priority gaps.
+
+The intended paper contribution is the executable-factor, pressure-aware, neuro-symbolic repair stack with:
+
+- per-type factor execution
+- per-role pressure during message passing
+- chooser and direct-loss safe-factor variants
+- shared symbolic candidate evaluation for decision-time safety metrics
+
+That scope is already coherent and publishable without replacing symbolic candidate evaluation with a fully neural candidate-level safety estimator.
+
 ## Priority order for future work
 
-1. Neural candidate-level post-edit factor prediction beyond the gold edit
-2. Predicted-edit neural rollouts or neural candidate-level safety estimation
-3. Expanded symbolic checker coverage
-4. Cleanup or retirement of long-tail experimental paths once they stop being useful
+1. Expanded symbolic checker coverage
+2. Cleanup or retirement of long-tail experimental paths once they stop being useful
+3. Optional exploratory work on neural candidate-level post-edit modeling, only if a later paper needs it

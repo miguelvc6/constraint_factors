@@ -47,6 +47,8 @@ Introduce **Executable Constraint Factors**:
 - incorporate factor-to-variable feedback during message passing,
 - train with an **intent-aware loss** that prioritizes fixing the primary constraint while discouraging secondary constraint regressions.
 
+Crucially, this research direction does **not** require a fully neural candidate-level safety estimator for arbitrary predicted edits. The core paper story is already complete if executable factors shape the proposal model while primary and secondary repair effects are measured with a shared symbolic evaluator.
+
 ### Key claims to validate
 - The proposed model improves **secondary regression rate** and **global satisfaction** without sacrificing primary fix rate.
 - A "Global Fix Model" provides an upper bound on global satisfaction but sacrifices fidelity.
@@ -216,8 +218,8 @@ $$
 
 #### (2) Primary constraint satisfaction (must fix triggering constraint)
 Compute predicted satisfaction of primary constraint after predicted edit:
-- Either approximate via candidate-based application (recommended) or
-- Use the factor output on the post-edit predicted state representation.
+- Canonically, via candidate-based application and shared symbolic evaluation.
+- Optionally, in later exploratory work, via a learned post-edit factor-state approximation.
 
 Loss:
 $$
@@ -233,6 +235,8 @@ $$
 \max\left(0, \hat{s}_c^{-} - \hat{s}_c^{+}\right)
 $$
 This penalizes **making secondary constraints worse** than pre-state.
+
+In the intended paper plan, the primary and secondary terms can remain grounded in symbolic candidate evaluation. A fully neural post-edit rollout mechanism is a possible later extension, but it is not necessary to validate the executable-factor hypothesis.
 
 ### Total loss (Main model)
 $$
