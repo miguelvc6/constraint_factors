@@ -1,132 +1,382 @@
-# Models & Evaluation Matrix
+# Paper-Focused Models & Evaluation Matrix
 
-Date: 2026-02-02
+Date: 2026-03-11
 
-This document specifies the implemented model variants, how they are trained/evaluated, and how to run the paper‑relevant suites with the current configuration system.
+This document presents a model catalog for a **paper-focused experimental plan**.
+Its goal is not to enumerate every runnable variant, but to define the **smallest model set that yields a strong, coherent conference paper**.
 
----
-
-## 1) Model Catalog (Implemented Variants)
-
-Legend for components:
-- **Factor head**: predicts factor satisfaction logits (pre‑state).
-- **Factor loss**: BCE on factor labels (pre‑state), masked by checkable.
-- **Typed pressure**: factor→variable pressure messages conditioned on factor types.
-- **Chooser**: candidate scoring head (proposal‑side Fix‑1).
-- **Policy head**: predicts discrete policy class.
-- **Reranker**: separate candidate scorer (08_train_reranker).
-
-| Name (paper short) | Training script | Components enabled | Objective / loss terms | Inference decision rule | Expected behavior |
-| --- | --- | --- | --- | --- | --- |
-| **P0 Proposal Imitation** | `07_train.py` | Factor head: optional; Factor loss: OFF; Typed pressure: OFF; Chooser: OFF; Policy head: OFF; Reranker: NO | `L_edit` (6‑slot CE) | Argmax per slot | Curator‑like edits; no explicit regression control. |
-| **P1 Proposal + Factor Loss** | `07_train.py` | Factor head: ON; Factor loss: ON; Typed pressure: OFF; Chooser: OFF; Policy head: OFF; Reranker: NO | `L_edit + λ·L_factor_pre` | Argmax per slot | Adds factor‑label supervision; no explicit Fix‑1. |
-| **P2 Proposal + Typed Pressure** | `07_train.py` | Factor head: optional; Factor loss: OFF; Typed pressure: ON; Chooser: OFF; Policy head: OFF; Reranker: NO | `L_edit` | Argmax per slot | Pressure‑augmented message passing; still imitation‑only. |
-| **P3 Proposal + Chooser (Fix‑1)** | `07_train.py` | Factor head: ON; Factor loss: ON; Typed pressure: OFF; Chooser: ON; Policy head: OFF; Reranker: NO | `L_edit + λ·L_factor_pre + L_chooser` where `L_chooser = CE(gold) + β·E[no‑regression] (+γ·primary)` | Chooser selects best candidate | Improves secondary regressions without reranker. |
-| **P4 Proposal + Chooser + Typed Pressure** | `07_train.py` | Factor head: ON; Factor loss: ON; Typed pressure: ON; Chooser: ON; Policy head: OFF; Reranker: NO | `L_edit + λ·L_factor_pre + L_chooser` | Chooser selects best candidate | Same as P3 but with pressure messages. |
-| **P5 Policy Choice** | `07_train.py` | Factor head: ON; Factor loss: ON; Typed pressure: ON; Chooser: OFF; Policy head: ON; Reranker: NO | `L_edit + λ·L_factor_pre + L_policy` | Policy‑filtered candidates, heuristic tie‑break | Strategy‑level decisions; restricted edit class. |
-| **P6 Policy Choice + Chooser** | `07_train.py` | Factor head: ON; Factor loss: ON; Typed pressure: ON; Chooser: ON; Policy head: ON; Reranker: NO | `L_edit + λ·L_factor_pre + L_policy + L_chooser` | Policy‑filtered chooser selection | Strategy + candidate‑level scoring. |
-| **R1 Reranker Fix‑1** | `08_train_reranker.py` | Reranker: ON (proposal model used for candidates) | `CE(gold) + β·E[no‑regression vs gold]` | Reranker chooses best candidate | Strong Fix‑1 behavior; not bound to slot argmax. |
-| **R2 Reranker GlobalFix** | `08_train_reranker.py` | Reranker: ON | `-E[global satisfaction]` | Reranker chooses best candidate | Maximizes GFR; may reduce fidelity. |
-| **Baselines** | `09_eval.py --run-baselines` | DFB / AMB / CSM heuristics | N/A | Heuristic repair | Sanity checks; not learned. |
-
-Policy class set (documented in code, `src/modules/policy.py`):
-- P0 NOOP
-- P1 DELETE_FOCUS_TRIPLE
-- P2 DELETE_CONFLICT_TRIPLE
-- P3 ADD_VALUE_TO_FOCUS_PREDICATE
-- P4 CHANGE_PREDICATE
-- P5 OTHER
+The central objective of the paper is to test whether **Executable Constraint Factors** make KG repair **safer** by reducing collateral damage on locally applicable constraints while preserving the strengths of the previous ESWC system.
 
 ---
 
-## 2) Evaluation Modes
+## 1) Paper objective and scientific claim
 
-### Scripts
-- **`src/09_eval.py`**: Evaluates trained proposal models, reranker predictions, or baselines.
-- **`src/08_train_reranker.py`**: Trains reranker and can emit reranker predictions for eval.
+### Continuation-paper positioning
+This paper should read as a **direct continuation** of the ESWC paper, not as a new benchmark over many loosely related architectures.
 
-### Flags / modes
-- `--strict-global-metrics`: fail fast unless GFR/SRR/SIR/disruption can be computed.
-- `--no-global-metrics`: disable global metrics (ignored in strict mode).
-- `--per-constraint-csv`: write per‑constraint CSV; forced on in strict mode.
-- `--use-chooser`: evaluate proposals using chooser head instead of slot argmax.
-- `--use-policy-choice`: apply policy‑filtered candidates before selection.
-- `--reranker-predictions <path>`: evaluate saved reranker outputs without model forward pass.
+The previous paper established that a structure-aware multi-relational GIN with a six-slot decoder can learn curator-like repairs from violation subgraphs.
+The new paper should establish the next step:
 
-### Output artifacts
-- `models/<run>/evaluations/model.json` contains:
-  - Standard fidelity metrics (precision/recall/F1)
-  - `global_metrics_computed: true|false`
-  - Optional `global_metrics` with `overall` and `per_constraint_type` keys
-  - If present, `overall_gfr`, `overall_srr`, `overall_sir`, and disruption means
-- `models/<run>/evaluations/per_constraint.csv` contains per‑constraint breakdown:
-  - `constraint_type`, `support`, `fidelity_micro_f1`
-  - `primary_fix_rate`, `primary_exact_rate`, `primary_alternative_rate`, `primary_total`
-  - `gfr`, `srr`, `sir`
-  - disruption means (`disruption_add_mean`, `disruption_del_mean`, `disruption_total_ops_mean`, `disruption_changed_mean`)
+> **By upgrading passive constraint context into executable constraint factors and adding intent-aware candidate selection, we can reduce secondary regressions without giving up curator alignment.**
+
+### What the paper must demonstrate
+The experiments should support four linked claims:
+
+1. **Previous-work baseline:** the ESWC-style model remains strong on historical fidelity and primary repair.
+2. **Representation upgrade:** executable factorization improves the local repair state representation beyond the previous passive-constraint setup.
+3. **Decision upgrade:** intent-aware candidate selection reduces secondary regressions beyond imitation-only decoding.
+4. **Trade-off frontier:** a global-satisfaction reference can improve consistency further, but at the cost of curator fidelity.
+
+Everything in the model suite should serve one of these claims.
 
 ---
 
-## 3) Experiment Suite Mapping
+## 2) Design principles for a publishable model suite
 
-### Starter paper suite (minimal recommended runs)
-Use these to cover the key figures/tables:
+To maximize clarity and acceptance probability, the model suite should obey the following rules:
 
-1) **Fidelity vs SRR frontier**
-- `p0_imitation` (proposal argmax)
-- `p3_chooser_fix1` (proposal + chooser)
-- `r1_fix1_reranker` (reranker Fix‑1)
-- `r2_global_fix_reranker` (global satisfaction upper bound)
+1. **One strict prior-work baseline.**
+   The main baseline must be an explicit reproduction of the published ESWC model family, not a generic "old-style" objective in the new codebase.
 
-2) **Typed pressure ablation**
-- `p3_chooser_fix1` (no typed pressure)
-- `p4_chooser_fix1_typed_pressure` (typed pressure)
+2. **One main proposed model.**
+   The paper should have a single clearly identifiable answer to the research question.
 
-3) **Chooser / Fix‑1 ablation**
-- `p1_factor_loss` (no chooser)
-- `p3_chooser_fix1` (chooser)
+3. **Only a small number of ablations.**
+   Each ablation must isolate one causal question. If a model does not answer a distinct scientific question, it should be removed from the main paper.
 
-4) **Reranker vs integrated chooser**
-- `p3_chooser_fix1` (proposal + chooser)
-- `r1_fix1_reranker` (reranker Fix‑1)
+4. **One reference extreme.**
+   A global-fix model is useful as a frontier point, but it is not the main method.
 
-5) **Policy choice comparisons**
-- `p5_policy_choice` (policy only)
-- `p6_policy_choice_with_chooser` (policy + chooser)
+5. **Heuristics are anchors, not the story.**
+   Symbolic baselines should remain in the tables for context, but the paper should not spend much narrative budget on them.
+
+6. **Keep the backbone fixed whenever possible.**
+   The previous paper already established the best encoder family. The new paper should not reopen backbone selection unless absolutely necessary.
 
 ---
 
-## 4) Exact Config Keys (config.json)
+## 3) Fixed backbone and fairness constraints
 
-### Model config keys (`model_config`)
-- `model`: model class name (`GIN`, `GIN_PRESSURE`, or `RERANKER`)
-- `pressure_enabled`: bool
-- `pressure_type_conditioning`: `none|concat|gate`
-- `enable_policy_choice`: bool
-- `policy_num_classes`: int (default policy set requires >= 6)
-- `num_factor_types`: int
+For fairness and narrative continuity, all learned proposal models in the new paper should share the same base recipe unless the model definition fundamentally requires otherwise.
 
-### Training config keys (`training_config`)
-- `factor_loss.enabled`: bool
-- `factor_loss.weight_pre`: float
-- `fix_probability_loss.enabled`: bool
-- `chooser.enabled`: bool
-- `chooser.topk_candidates`: int
-- `chooser.max_candidates_total`: int
-- `chooser.beta_no_regression`: float
-- `chooser.gamma_primary`: float
-- `chooser.loss_mode`: `fix1|primary_only|global_fix`
-- `policy_filter_strict`: bool
+### Fixed recipe for learned proposal models
+Use the previous paper's best setting as the default backbone:
 
-### Reranker config keys (`training_config` in reranker configs)
-- `objective`: `main|global_fix`
-- `topk_candidates`, `topk_per_slot`, `max_candidates_total`, `include_gold`, `regression_weight`
+- **Graph topology:** non-flattened multi-relational representation
+- **Backbone:** GIN/GINE family
+- **Node features:** frozen text embeddings
+- **Structural features:** role embeddings enabled
+- **Decoder:** six-slot decoder
+- **Training:** dynamic per-type reweighting enabled
+- **Old soft fix-probability loss:** disabled
+
+This is important for two reasons:
+
+- It makes the continuation claim credible: the new paper improves on the **best previously validated family**, not on a weakened baseline.
+- It avoids diffusion into a second architecture-search paper.
+
+### Exception: strict ESWC baseline
+The prior-work baseline should preserve the **old representation regime**:
+
+- violated constraint included as in the ESWC system,
+- no locally applicable executable factor expansion,
+- no typed pressure,
+- no chooser,
+- pure edit-imitation decoding.
+
+This model should be presented as a **reproduction of the previous paper's model family**, not merely as a loss ablation.
 
 ---
 
-## 5) Example Config Snippets
+## 4) Final paper model set
 
-### Proposal + Chooser + Typed Pressure
+This is the recommended model set for the main paper.
+
+### Core learned models
+
+| Paper name | Role in paper | Training script | Core idea | Objective | Inference | Include in main tables? |
+| --- | --- | --- | --- | --- | --- | --- |
+| **B0 ESWC-Reproduction** | Main baseline | `07_train.py` | Reproduce the previous published model family as faithfully as possible | `L_edit` | Slot argmax | **Yes** |
+| **A1 Factorized Imitation** | Representation ablation | `07_train.py` | Add executable factor nodes and typed pressure, but keep imitation-only training | `L_edit` | Slot argmax | **Yes** |
+| **M1 Safe Factor Model** | Main proposed model | `07_train.py` | Executable factors + typed pressure + candidate chooser trained to prefer primary-fixing, low-regression candidates | `L_edit + L_chooser` | Chooser selects candidate | **Yes** |
+| **G0 GlobalFix Reference** | Frontier / upper-bound reference | `08_train_reranker.py` | Candidate scorer optimized for global satisfaction rather than curator fidelity | `L_global` | Reranker selects candidate | **Yes** |
+
+### Heuristic baselines
+
+| Paper name | Role in paper | Include in main tables? | Notes |
+| --- | --- | --- | --- |
+| **CSM** | Strong symbolic anchor | **Yes** | Must remain because it was the strongest symbolic baseline in the previous paper. |
+| **DFB** | Low-fidelity / high-deletion anchor | **Yes** | Useful for showing that validity alone is insufficient. |
+| **AMB** | Constraint-specific anchor | Optional | Keep for per-constraint appendix or for inverse-like constraints; not necessary in every global table. |
+
+---
+
+## 5) Model definitions
+
+### B0) ESWC-Reproduction
+**Purpose**
+Provide the defensible prior-work baseline for the continuation paper.
+
+**Definition**
+A faithful reproduction of the published ESWC model family:
+
+- previous subgraph formulation,
+- passive constraint context rather than executable local factor expansion,
+- multi-relational GIN/GINE backbone,
+- frozen text embeddings,
+- role embeddings,
+- six-slot decoder,
+- dynamic per-type reweighting,
+- no chooser,
+- no typed pressure,
+- no global or no-regression candidate objective.
+
+**Objective**
+\[
+\mathcal{L}_{\text{B0}} = \mathcal{L}_{edit}
+\]
+
+**Expected behavior**
+- strong historical fidelity,
+- strong primary fix rate,
+- no explicit control over secondary regressions.
+
+**Why it is in the paper**
+This is the model the new method must beat or at least match on fidelity while improving SRR/GFR.
+
+---
+
+### A1) Factorized Imitation
+**Purpose**
+Isolate the contribution of the **representation upgrade**.
+
+**Definition**
+Same proposal architecture family as the main model, but without the chooser:
+
+- locally applicable constraints added as executable factor nodes,
+- typed factor-to-variable pressure enabled,
+- same backbone and decoder family as the paper default,
+- no chooser,
+- no policy head,
+- no reranker.
+
+**Objective**
+\[
+\mathcal{L}_{\text{A1}} = \mathcal{L}_{edit}
+\]
+
+**Expected behavior**
+- fidelity close to B0,
+- similar or slightly better primary fix,
+- some improvement in SRR/GFR if the factorized representation already helps,
+- still fundamentally imitation-driven.
+
+**Why it is in the paper**
+It answers: *Are executable factors useful even before adding explicit safe-selection behavior?*
+
+---
+
+### M1) Safe Factor Model
+**Purpose**
+Serve as the paper's **main proposed model**.
+
+**Definition**
+A factorized proposal model with intent-aware candidate selection:
+
+- executable factor nodes over the locally applicable constraint set,
+- typed pressure during message passing,
+- proposal model produces candidate edits,
+- chooser scores candidates using primary-fix and no-regression preferences,
+- no policy abstraction in the main paper.
+
+**Recommended training view**
+The model should operationalize the idea that the system remains curator-oriented, but among plausible repairs it should prefer those that do not damage secondary constraints.
+
+**Objective (paper-level view)**
+\[
+\mathcal{L}_{\text{M1}} = \mathcal{L}_{edit} + \mathcal{L}_{chooser}
+\]
+
+where the chooser should favor:
+
+- candidates that fix the **primary** violated constraint,
+- candidates with lower **secondary regression**,
+- optionally slight preference for lower disruption when tied.
+
+**Expected behavior**
+- small or acceptable drop in fidelity relative to B0,
+- same or better primary fix,
+- clearly improved SRR,
+- improved GFR,
+- low disruption relative to global-fix models.
+
+**Why it is in the paper**
+This is the model that directly instantiates the main hypothesis and should be the best practical trade-off point.
+
+---
+
+### G0) GlobalFix Reference
+**Purpose**
+Provide the "consistency-first" frontier point.
+
+**Definition**
+A candidate reranker trained to prefer edits that maximize global or local-set satisfaction after execution.
+
+**Objective**
+\[
+\mathcal{L}_{\text{G0}} = -\mathbb{E}[\text{GlobalSatisfaction}(G^{\Delta})]
+\]
+
+**Expected behavior**
+- highest or near-highest GFR,
+- low SRR,
+- reduced historical fidelity,
+- higher disruption,
+- useful as a reference extreme, not as the main system.
+
+**Why it is in the paper**
+It makes the frontier legible: the paper is not claiming global optimality, but a better fidelity–safety trade-off.
+
+---
+
+## 6) Models explicitly removed from the main paper
+
+The following implemented variants should **not** appear in the main narrative unless later experiments show a compelling and unexpected result.
+
+### Remove from the main paper
+- **Factor-loss-only variants**
+  These are auxiliary-training controls, not a distinct scientific contribution.
+
+- **Policy-choice models**
+  These introduce a second paper thesis (planner/executor modularity and interpretability). They are interesting, but they compete with the main executable-factor story.
+
+- **Fix-1 reranker as a main competitor**
+  This creates unnecessary duplication with the integrated chooser. Unless it substantially outperforms M1, it should remain an appendix or engineering note.
+
+### Allowed as appendix / reserve experiments
+- **M1 without typed pressure**
+  Use only if you need a precise pressure ablation.
+
+- **AMB in global tables**
+  Include only if reviewers are likely to ask for consistency with the previous paper's exact baseline set.
+
+- **Current-codebase imitation-only variant without strict ESWC reproduction**
+  Useful internally, but not a substitute for B0.
+
+---
+
+## 7) Final experiment suite
+
+### Suite A — Main result table (mandatory)
+This is the core paper table.
+
+Include:
+- DFB
+- CSM
+- B0 ESWC-Reproduction
+- A1 Factorized Imitation
+- M1 Safe Factor Model
+- G0 GlobalFix Reference
+
+Report:
+- Historical Fidelity (Precision / Recall / F1)
+- Primary Fix Rate
+- Global Fix Rate (GFR)
+- Secondary Regression Rate (SRR)
+- Secondary Improvement Rate (SIR)
+- Disruption / edit-size measures
+
+### Suite B — Ablation table (mandatory)
+This table should explain *where the gain comes from*.
+
+Include:
+- B0 ESWC-Reproduction
+- A1 Factorized Imitation
+- M1 Safe Factor Model
+
+Interpretation:
+- **B0 → A1** isolates the benefit of executable factorization and typed pressure.
+- **A1 → M1** isolates the benefit of intent-aware candidate selection.
+
+### Suite C — Frontier figure (mandatory)
+A scatter or Pareto-style figure showing the central trade-off.
+
+Recommended axes:
+- x-axis: Historical Fidelity F1
+- y-axis: Secondary Regression control or Global Fix Rate
+
+Recommended plotted points:
+- DFB
+- CSM
+- B0
+- A1
+- M1
+- G0
+
+This figure should visually communicate that **M1 is the practical frontier point**, while **G0 is the consistency-maximizing extreme**.
+
+### Suite D — Per-constraint breakdown (mandatory)
+At minimum compare:
+- CSM
+- B0
+- M1
+
+This prevents the paper from appearing to win only through easy constraint families.
+
+### Suite E — Typed pressure ablation (optional but recommended)
+Include only if stable and informative.
+
+Compare:
+- `M1-no-pressure`
+- `M1`
+
+Use this suite only if it adds a crisp message. Do not expand into a large architecture table.
+
+---
+
+## 8) Evaluation protocol
+
+### Primary metrics
+Retain the previous paper's core metrics:
+
+1. **Historical Fidelity**
+   Triple-and-operation match precision, recall, and micro-F1.
+
+2. **Primary Fix Rate**
+   Fraction of instances where the triggering constraint is repaired.
+
+### New safety metrics
+These are the differentiating metrics of the new paper:
+
+3. **Global Fix Rate (GFR)**
+   Satisfaction fraction across the locally applicable constraint set after applying the predicted edit.
+
+4. **Secondary Regression Rate (SRR)**
+   Fraction of secondary constraints that were satisfied pre-edit and become violated post-edit.
+
+5. **Secondary Improvement Rate (SIR)**
+   Fraction of previously unsatisfied secondary constraints that become satisfied post-edit.
+
+6. **Disruption / Edit Minimality**
+   Number of changed triples, delete/add ratio, and total operation count.
+
+### Required evaluation rules
+- Compute global/secondary metrics in **strict mode** for all learned models in the main suite.
+- Report both **overall** and **per-constraint-type** results where support is sufficient.
+- Do not rely on fidelity alone.
+- Do not report only GFR without SRR; the paper's claim is about **safer local repair**, not merely higher consistency.
+
+---
+
+## 9) Recommended configuration policy
+
+### General rule
+Do not search over many backbones or input encodings in this paper.
+The ESWC paper already established that landscape.
+
+### Recommended learned-model defaults
+Use the following defaults unless a model definition requires a change:
+
 ```json
 {
   "model_config": {
@@ -136,9 +386,10 @@ Use these to cover the key figures/tables:
     "enable_policy_choice": false
   },
   "training_config": {
-    "factor_loss": { "enabled": true, "weight_pre": 0.1 },
+    "factor_loss": { "enabled": false, "weight_pre": 0.0 },
+    "fix_probability_loss": { "enabled": false },
     "chooser": {
-      "enabled": true,
+      "enabled": false,
       "loss_mode": "fix1",
       "beta_no_regression": 0.5,
       "gamma_primary": 0.0,
@@ -147,68 +398,3 @@ Use these to cover the key figures/tables:
     }
   }
 }
-```
-
-### Reranker Fix‑1
-```json
-{
-  "model_config": { "model": "RERANKER" },
-  "training_config": {
-    "objective": "main",
-    "topk_candidates": 20,
-    "topk_per_slot": 5,
-    "max_candidates_total": 80,
-    "include_gold": true,
-    "regression_weight": 0.5
-  },
-  "proposal_config": {
-    "model": "GIN_PRESSURE",
-    "config_tag": "m1_main_fix1"
-  }
-}
-```
-
-### Policy Choice
-```json
-{
-  "model_config": {
-    "model": "GIN_PRESSURE",
-    "enable_policy_choice": true,
-    "policy_num_classes": 6
-  },
-  "training_config": {
-    "policy_filter_strict": true
-  }
-}
-```
-
----
-
-## 6) Cross‑Check: Runnable vs Disabled
-
-Runnable from scheduler with current configs:
-- Proposal variants: `p0_imitation`, `p1_factor_loss`, `p2_typed_pressure`, `p3_chooser_fix1`, `p4_chooser_fix1_typed_pressure`, `p5_policy_choice`, `p6_policy_choice_with_chooser`.
-- Rerankers: `m1_fix1_reranker`, `m2_global_fix_reranker`.
-- Baselines: `--run-baselines` in `09_eval.py`.
-
-Disabled / not implemented:
-- `m3_policy_choice_reranker` in generator remains **disabled** (explicitly set `disabled: true`).
-
----
-
-## 7) Scheduler Behavior (Paper Suite)
-
-- `src/10_scheduler.py --paper-suite`:
-  - Enables `--strict-global-metrics` during eval.
-  - Automatically passes `--use-chooser` if `training_config.chooser.enabled`.
-  - Automatically passes `--use-policy-choice` if `model_config.enable_policy_choice`.
-
----
-
-## 8) Notes for New Collaborators
-
-- Candidate generation is shared between proposal and reranker via `src/modules/candidates.py`.
-- Policy filtering is deterministic and documented in `src/modules/policy.py`.
-- `chooser` supports streamed datasets when graph ordering is stable and context/parquet sidecars align by index.
-- `policy` still requires in-memory datasets; stream datasets are materialized before policy-choice training.
-- Global metrics require registry + encoder + factor fields; strict mode will fail fast if missing.
