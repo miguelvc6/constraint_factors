@@ -11,6 +11,15 @@ The plan is optimized for:
 - minimal wasted long-running training
 - one consistent dataset/encoding/backbone policy
 
+Conceptual-to-technical mapping for this paper line:
+
+- conceptual `M0 ESWC model` -> technical `B0`
+- conceptual `M1 Main model` -> technical `A1`, `M1C`, and `M1D`
+- conceptual `M2 Global Fix model` -> technical `G0`
+- heuristic results -> `DFB`, `AMB`, `CSM`
+
+`A1` is the representation-only step inside the broader conceptual `M1` story, while `M1C` and `M1D` are the two decision-level safe-factor realizations of that same model family.
+
 ## 1. Fixed run policy
 
 Before running anything, freeze these decisions for the entire paper run:
@@ -48,7 +57,7 @@ Run in this order:
 2. Run heuristic baselines first.
 3. Run a brief `M1C` hyperparameter search only.
 4. Select one winning `M1C` configuration.
-5. Propagate the winning backbone/optimizer settings to `B0`, `A1`, `M1C`, and `M1D`.
+5. Propagate the winning factorized-model settings to `A1`, `M1C`, and `M1D`, and reuse only the compatible training schedule for `B0`.
 6. Train and evaluate the canonical learned suite in order:
    - `B0`
    - `A1`
@@ -58,6 +67,16 @@ Run in this order:
 7. Freeze tables and figures from those final runs only.
 
 This order avoids spending time on secondary model families before the main model has a stable configuration.
+
+Result coverage relative to the conceptual docs:
+
+- heuristic references: `DFB`, `AMB`, `CSM`
+- prior passive-context baseline: `B0`
+- representation effect inside the main executable-factor story: `A1`
+- main safe-factor results: `M1C`, `M1D`
+- global-fix upper-bound reference: `G0`
+
+The policy-choice model is intentionally out of scope for this paper line and is therefore not scheduled here.
 
 ## 3. Step-by-step plan
 
@@ -181,6 +200,8 @@ If you need the per-constraint breakdown, inspect the resolved run directory und
 
 Once one `M1C` run wins, copy these settings into the canonical proposal configs:
 
+Backbone and optimizer:
+
 - `num_layers`
 - `hidden_channels`
 - `head_hidden`
@@ -192,13 +213,36 @@ Once one `M1C` run wins, copy these settings into the canonical proposal configs
 - `scheduler_patience`
 - `early_stopping_rounds`
 
-Apply them to:
+Factorized-model settings to lock alongside the backbone:
+
+- `pressure_type_conditioning`
+- `pressure_residual_scale`
+- `factor_executor_impl`
+- `factor_loss.weight_pre`
+- `factor_loss.weight_post_gold`
+- chooser settings selected by the sweep:
+  - `chooser.topk_candidates`
+  - `chooser.max_candidates_total`
+  - `chooser.beta_no_regression`
+  - `chooser.gamma_primary`
+  - `chooser.loss_weight`
+
+Apply the full locked factorized setting bundle to:
 
 - `a1_factorized_imitation`
 - `m1c_safe_factor_chooser`
 - `m1d_safe_factor_direct`
 
-Reuse them for `b0_eswc_reproduction` as well, unless the passive baseline becomes unstable. If that happens, keep the same optimizer schedule and only simplify what the model definition requires.
+For `b0_eswc_reproduction`, reuse only the compatible shared training schedule:
+
+- `learning_rate`
+- `weight_decay`
+- `batch_size`
+- `scheduler_factor`
+- `scheduler_patience`
+- `early_stopping_rounds`
+
+Do not copy factorized-only settings such as pressure or factor-loss weights into `B0`, because `B0` uses `constraint_representation="eswc_passive"`.
 
 Do not run a second search on:
 
@@ -313,6 +357,14 @@ Only the following runs should feed the paper tables:
   - `G0`
 
 The hyperparameter search runs must not appear in the final paper tables.
+
+These runs are sufficient to support the conceptual paper claims:
+
+- `B0` gives the passive-context ESWC-style comparison point
+- `A1` tests whether executable-factor structure helps before safety-aware decision logic
+- `M1C` and `M1D` are the main safe-factor results
+- `G0` serves as the global-satisfaction reference / upper-bound style comparison
+- `DFB`, `AMB`, and `CSM` provide heuristic anchors
 
 ## 6. Minimal reproducibility checklist
 

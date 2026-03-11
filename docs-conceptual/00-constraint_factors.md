@@ -52,7 +52,6 @@ Crucially, this research direction does **not** require a fully neural candidate
 ### Key claims to validate
 - The proposed model improves **secondary regression rate** and **global satisfaction** without sacrificing primary fix rate.
 - A "Global Fix Model" provides an upper bound on global satisfaction but sacrifices fidelity.
-- A "Policy Choice Model" demonstrates robustness and interpretability at the strategy level.
 
 ---
 
@@ -287,12 +286,6 @@ Expected to optimize Global Fix Rate, sacrifice fidelity.
 
 The Global Fix Model is included as a reference point rather than a practical repair system. It illustrates the trade-off between curator fidelity and global constraint satisfaction and serves as an approximate upper bound on achievable global fix rates.
 
-#### M3) Policy Choice Model (Fix 2)
-Predict a strategy class rather than exact edit:
-- Classes: `{delete_focus, delete_conflict, add_mirror, add_required, abstain, ...}`
-Train with cross-entropy against a strategy label derived from historical edit.
-Use a deterministic executor to map policy → edit for fix-rate metrics.
-
 ### Heuristic baselines
 
 #### H1) DeleteFocusBaseline (DFB)
@@ -342,10 +335,6 @@ Measures how invasive the predicted edit is:
 - `delete/add ratio`
 - optional graph-edit distance proxy.
 
-### Policy model metrics
-#### (G) Policy Accuracy
-Top-1 strategy prediction accuracy vs derived policy labels.
-
 ---
 
 ## 11) Expected Behaviors and Evaluation Outcomes
@@ -355,7 +344,6 @@ Top-1 strategy prediction accuracy vs derived policy labels.
 | ESWC       |       High |        High |     Medium | Medium |        Low |
 | Main       | Slightly ↓ |      Same/↑ |          ↑ |     ↓↓ |        Low |
 | Global Fix |         ↓↓ |        High |         ↑↑ |      ↓ |         ↑↑ |
-| Policy     |     Medium |      Medium |     Medium | Medium |     Medium |
 | DFB        |        Low | High (some) |   Unstable |   High |       High |
 | CSM        |     Medium |      Medium |     Medium | Medium |        Low |
 
