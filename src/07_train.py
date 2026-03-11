@@ -18,13 +18,14 @@ from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
-from modules.candidates import CandidateConfig, build_candidates
+from modules.candidates import CandidateConfig, build_candidates, score_candidates_from_logits
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import (
     GlobalIntEncoder,
     GraphStreamDataset,
     base_dataset_name,
     dataset_variant_name,
+    graph_dataset_filename,
     infer_node_feature_spec,
 )
 from modules.model_store import (
@@ -476,6 +477,7 @@ def train(
     device: torch.device | str = torch.device("cpu"),
     fix_loss_state: dict[str, object] | None = None,
     chooser_state: dict[str, object] | None = None,
+    direct_safety_state: dict[str, object] | None = None,
     policy_state: dict[str, object] | None = None,
     estimated_train_batches: int | None = None,
     estimated_val_batches: int | None = None,
@@ -516,12 +518,47 @@ def train(
         chooser_candidate_cfg = cast(CandidateConfig | None, chooser_state.get("candidate_cfg"))
         chooser_placeholder_ids = cast(set[int] | None, chooser_state.get("placeholder_ids_set"))
 
+    direct_safety_cfg = train_cfg.direct_safety
+    direct_safety_enabled = bool(direct_safety_cfg.enabled)
+    direct_safety_heuristics = None
+    direct_safety_train_rows = None
+    direct_safety_val_rows = None
+    direct_safety_train_contexts = None
+    direct_safety_val_contexts = None
+    direct_safety_evaluator = None
+    direct_safety_candidate_cfg = None
+    direct_safety_placeholder_ids: set[int] | None = None
+    if direct_safety_enabled and direct_safety_state:
+        direct_safety_heuristics = cast(
+            ConstraintRepairHeuristics | None, direct_safety_state.get("heuristics")
+        )
+        direct_safety_train_rows = cast(list | None, direct_safety_state.get("train_rows"))
+        direct_safety_val_rows = cast(list | None, direct_safety_state.get("val_rows"))
+        direct_safety_train_contexts = cast(
+            list[ViolationContext] | None, direct_safety_state.get("train_contexts")
+        )
+        direct_safety_val_contexts = cast(
+            list[ViolationContext] | None, direct_safety_state.get("val_contexts")
+        )
+        direct_safety_evaluator = cast(
+            CandidateConstraintEvaluator | None, direct_safety_state.get("evaluator")
+        )
+        direct_safety_candidate_cfg = cast(
+            CandidateConfig | None, direct_safety_state.get("candidate_cfg")
+        )
+        direct_safety_placeholder_ids = cast(
+            set[int] | None, direct_safety_state.get("placeholder_ids_set")
+        )
+
     policy_enabled = bool(getattr(model, "_policy_enabled", False))
     policy_train_contexts = None
     policy_val_contexts = None
     if policy_enabled and policy_state:
         policy_train_contexts = cast(list[ViolationContext] | None, policy_state.get("train_contexts"))
         policy_val_contexts = cast(list[ViolationContext] | None, policy_state.get("val_contexts"))
+
+    if chooser_enabled and direct_safety_enabled:
+        raise RuntimeError("chooser and direct_safety cannot be enabled at the same time.")
 
     # Unpack training configuration.
     batch_size = train_cfg.batch_size
@@ -832,6 +869,16 @@ def train(
         chooser_predicate_allowed_ids,
         chooser_entity_allowed_ids,
     )
+    direct_safety_placeholder_ids_for_candidates = (
+        direct_safety_placeholder_ids
+        if direct_safety_placeholder_ids is not None
+        else (
+            set(direct_safety_heuristics.placeholder_ids.values())
+            if direct_safety_heuristics is not None
+            else set()
+        )
+    )
+    direct_safety_slot_allowed_ids = chooser_slot_allowed_ids
 
     logger.info("Starting training loop for %d epochs", num_epochs)
     epoch_iter = progress_bar(range(num_epochs), desc="Training Epochs", leave=True)
@@ -860,6 +907,8 @@ def train(
         train_factor_correct = 0
         train_chooser_loss_sum = 0.0
         train_chooser_count = 0
+        train_direct_safety_loss_sum = 0.0
+        train_direct_safety_count = 0
         train_policy_loss_sum = 0.0
         train_policy_count = 0
         train_policy_correct = 0
@@ -1191,7 +1240,7 @@ def train(
                     chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                     if chooser_loss_mode == "global_fix":
                         constraint_t0 = time.perf_counter() if timing_enabled else 0.0
-                        details = chooser_evaluator.evaluate_candidates(
+                        metrics_summary = chooser_evaluator.evaluate_candidate_metrics(
                             row,
                             candidates=candidates,
                             primary_factor_index=primary_index,
@@ -1199,7 +1248,7 @@ def train(
                         chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
                         math_t0 = time.perf_counter() if timing_enabled else 0.0
                         satisfaction = torch.tensor(
-                            [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
+                            [m.global_satisfied_fraction for m in metrics_summary],
                             dtype=graph_loss.dtype,
                             device=graph_loss.device,
                         )
@@ -1210,23 +1259,22 @@ def train(
                         ce_loss = -log_probs[gold_index]
                         chooser_loss = ce_loss
                         chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
-                        regression_rates: list[float] | None = None
-                        primary_flags: list[float] | None = None
                         if chooser_need_regression or chooser_need_primary:
                             constraint_t0 = time.perf_counter() if timing_enabled else 0.0
-                            regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                            metrics_summary = chooser_evaluator.evaluate_candidate_metrics(
                                 row,
                                 candidates=candidates,
-                                gold_index=gold_index,
                                 primary_factor_index=primary_index,
-                                need_regression=chooser_need_regression,
-                                need_primary=chooser_need_primary,
                             )
                             chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
-                        if chooser_need_regression and regression_rates is not None:
+                        else:
+                            metrics_summary = []
+                        if chooser_need_regression and metrics_summary:
                             math_t0 = time.perf_counter() if timing_enabled else 0.0
                             regression_tensor = torch.tensor(
-                                regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
+                                [m.srr for m in metrics_summary],
+                                dtype=graph_loss.dtype,
+                                device=graph_loss.device,
                             )
                             gold_regression = regression_tensor[gold_index]
                             reg_penalty = torch.sum(
@@ -1234,10 +1282,12 @@ def train(
                             )
                             chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
                             chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
-                        if chooser_need_primary and primary_flags is not None:
+                        if chooser_need_primary and metrics_summary:
                             math_t0 = time.perf_counter() if timing_enabled else 0.0
                             primary_tensor = torch.tensor(
-                                primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
+                                [float(m.primary_satisfied) for m in metrics_summary],
+                                dtype=graph_loss.dtype,
+                                device=graph_loss.device,
                             )
                             primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                             chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
@@ -1250,6 +1300,105 @@ def train(
                 train_chooser_loss_sum += float(chooser_losses.sum().item())
                 train_chooser_count += chooser_losses.numel()
                 chooser_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
+
+            if direct_safety_enabled:
+                phase_t0 = time.perf_counter() if timing_enabled else 0.0
+                if direct_safety_evaluator is None or direct_safety_heuristics is None:
+                    raise RuntimeError("Direct safety enabled but evaluator/heuristics are not initialized.")
+                if direct_safety_candidate_cfg is None:
+                    direct_safety_candidate_cfg = CandidateConfig(
+                        topk_candidates=direct_safety_cfg.topk_candidates,
+                        max_candidates_total=direct_safety_cfg.max_candidates_total,
+                    )
+                if direct_safety_train_contexts is None or direct_safety_train_rows is None:
+                    raise RuntimeError("Direct safety enabled but training contexts/rows are missing.")
+                batch_context_indices = _batch_int_attr(
+                    data,
+                    "context_index",
+                    graph_loss.size(0),
+                    default_to_batch_index=True,
+                    min_value=0,
+                )
+                batch_primary_indices = _batch_int_attr(
+                    data,
+                    "primary_factor_index",
+                    graph_loss.size(0),
+                    default_value=0,
+                    min_value=0,
+                )
+                out_detached = out.detach()
+                batch_slot_vals, batch_slot_ids = _compute_batch_slot_topk(
+                    out_detached,
+                    topk_per_slot=direct_safety_candidate_cfg.topk_per_slot,
+                    slot_allowed_ids=direct_safety_slot_allowed_ids,
+                )
+                direct_safety_losses = torch.zeros(
+                    graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                )
+                for idx, context_index in enumerate(batch_context_indices):
+                    if (
+                        context_index < 0
+                        or context_index >= len(direct_safety_train_contexts)
+                        or context_index >= len(direct_safety_train_rows)
+                    ):
+                        raise RuntimeError("Direct safety context index out of bounds.")
+                    context = direct_safety_train_contexts[context_index]
+                    row = direct_safety_train_rows[context_index]
+                    primary_index = int(batch_primary_indices[idx])
+                    add_topk = _topk_triples_from_slot_topk_row(
+                        batch_slot_vals,
+                        batch_slot_ids,
+                        row_index=idx,
+                        slots=(0, 1, 2),
+                        topk_triples=direct_safety_candidate_cfg.topk_candidates,
+                    )
+                    del_topk = _topk_triples_from_slot_topk_row(
+                        batch_slot_vals,
+                        batch_slot_ids,
+                        row_index=idx,
+                        slots=(3, 4, 5),
+                        topk_triples=direct_safety_candidate_cfg.topk_candidates,
+                    )
+                    candidates, _ = build_candidates(
+                        gold_slots=targets[idx].detach().cpu().tolist(),
+                        context=context,
+                        heuristics=direct_safety_heuristics,
+                        proposal_logits=out_detached[idx],
+                        cfg=direct_safety_candidate_cfg,
+                        placeholder_ids=direct_safety_placeholder_ids_for_candidates,
+                        num_target_ids=model.num_target_ids,
+                        slot_allowed_ids=direct_safety_slot_allowed_ids,
+                        precomputed_add_topk=add_topk,
+                        precomputed_del_topk=del_topk,
+                    )
+                    candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=graph_loss.device)
+                    scores = score_candidates_from_logits(out[idx], candidate_tensor)
+                    log_probs = F.log_softmax(scores, dim=0)
+                    probs = log_probs.exp()
+                    metrics_summary = direct_safety_evaluator.evaluate_candidate_metrics(
+                        row,
+                        candidates=candidates,
+                        primary_factor_index=primary_index,
+                    )
+                    primary_tensor = torch.tensor(
+                        [float(m.primary_satisfied) for m in metrics_summary],
+                        dtype=graph_loss.dtype,
+                        device=graph_loss.device,
+                    )
+                    secondary_tensor = torch.tensor(
+                        [m.srr for m in metrics_summary],
+                        dtype=graph_loss.dtype,
+                        device=graph_loss.device,
+                    )
+                    primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
+                    secondary_penalty = torch.sum(probs * secondary_tensor)
+                    direct_safety_losses[idx] = (
+                        direct_safety_cfg.alpha_primary * primary_penalty
+                        + direct_safety_cfg.beta_secondary * secondary_penalty
+                    )
+                graph_loss = graph_loss + direct_safety_losses
+                train_direct_safety_loss_sum += float(direct_safety_losses.sum().item())
+                train_direct_safety_count += direct_safety_losses.numel()
 
             # Optional - Rebalance weights based on constraint types
             phase_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -1387,7 +1536,7 @@ def train(
                 else:
                     eta_label = "n/a"
                 logger.info(
-                    "Epoch %s train %s | dt=%s loss=%.4f speed=%s eta_epoch=%s all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
+                    "Epoch %s train %s | dt=%s loss=%.4f speed=%s eta_epoch=%s all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s direct_safety_loss=%s policy_loss=%s",
                     epoch + 1,
                     progress_label,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1398,6 +1547,11 @@ def train(
                     100 * train_slot_correct / max(train_slot_total, 1),
                     f"{train_factor_loss_sum / max(train_factor_count, 1):.4f}" if factor_cfg.enabled else "n/a",
                     f"{train_chooser_loss_sum / max(train_chooser_count, 1):.4f}" if chooser_enabled else "n/a",
+                    (
+                        f"{train_direct_safety_loss_sum / max(train_direct_safety_count, 1):.4f}"
+                        if direct_safety_enabled
+                        else "n/a"
+                    ),
                     f"{train_policy_loss_sum / max(train_policy_count, 1):.4f}" if policy_enabled else "n/a",
                 )
             if timing_enabled and train_timing_window_count >= timing_log_every:
@@ -1439,6 +1593,7 @@ def train(
         train_factor_loss = train_factor_loss_sum / max(train_factor_count, 1)
         train_factor_acc = 100 * train_factor_correct / max(train_factor_count, 1)
         train_chooser_loss = train_chooser_loss_sum / max(train_chooser_count, 1)
+        train_direct_safety_loss = train_direct_safety_loss_sum / max(train_direct_safety_count, 1)
         train_policy_loss = train_policy_loss_sum / max(train_policy_count, 1)
         train_policy_acc = 100 * train_policy_correct / max(train_policy_count, 1)
         if timing_enabled and train_timing_epoch_count > 0:
@@ -1484,6 +1639,8 @@ def train(
         val_factor_correct = 0
         val_chooser_loss_sum = 0.0
         val_chooser_count = 0
+        val_direct_safety_loss_sum = 0.0
+        val_direct_safety_count = 0
         val_policy_loss_sum = 0.0
         val_policy_count = 0
         val_policy_correct = 0
@@ -1798,7 +1955,7 @@ def train(
                         chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
                         if chooser_loss_mode == "global_fix":
                             constraint_t0 = time.perf_counter() if timing_enabled else 0.0
-                            details = chooser_evaluator.evaluate_candidates(
+                            metrics_summary = chooser_evaluator.evaluate_candidate_metrics(
                                 row,
                                 candidates=candidates,
                                 primary_factor_index=primary_index,
@@ -1806,7 +1963,7 @@ def train(
                             chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
                             math_t0 = time.perf_counter() if timing_enabled else 0.0
                             satisfaction = torch.tensor(
-                                [float(d.get("global_satisfied_fraction", 0.0)) for d in details],
+                                [m.global_satisfied_fraction for m in metrics_summary],
                                 dtype=graph_loss.dtype,
                                 device=graph_loss.device,
                             )
@@ -1817,23 +1974,22 @@ def train(
                             ce_loss = -log_probs[gold_index]
                             chooser_loss = ce_loss
                             chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
-                            regression_rates: list[float] | None = None
-                            primary_flags: list[float] | None = None
                             if chooser_need_regression or chooser_need_primary:
                                 constraint_t0 = time.perf_counter() if timing_enabled else 0.0
-                                regression_rates, primary_flags = chooser_evaluator.evaluate_candidates_loss_terms(
+                                metrics_summary = chooser_evaluator.evaluate_candidate_metrics(
                                     row,
                                     candidates=candidates,
-                                    gold_index=gold_index,
                                     primary_factor_index=primary_index,
-                                    need_regression=chooser_need_regression,
-                                    need_primary=chooser_need_primary,
                                 )
                                 chooser_eval_constraint_s += (time.perf_counter() - constraint_t0) if timing_enabled else 0.0
-                            if chooser_need_regression and regression_rates is not None:
+                            else:
+                                metrics_summary = []
+                            if chooser_need_regression and metrics_summary:
                                 math_t0 = time.perf_counter() if timing_enabled else 0.0
                                 regression_tensor = torch.tensor(
-                                    regression_rates, dtype=graph_loss.dtype, device=graph_loss.device
+                                    [m.srr for m in metrics_summary],
+                                    dtype=graph_loss.dtype,
+                                    device=graph_loss.device,
                                 )
                                 gold_regression = regression_tensor[gold_index]
                                 reg_penalty = torch.sum(
@@ -1841,10 +1997,12 @@ def train(
                                 )
                                 chooser_loss = chooser_loss + chooser_cfg.beta_no_regression * reg_penalty
                                 chooser_eval_math_s += (time.perf_counter() - math_t0) if timing_enabled else 0.0
-                            if chooser_need_primary and primary_flags is not None:
+                            if chooser_need_primary and metrics_summary:
                                 math_t0 = time.perf_counter() if timing_enabled else 0.0
                                 primary_tensor = torch.tensor(
-                                    primary_flags, dtype=graph_loss.dtype, device=graph_loss.device
+                                    [float(m.primary_satisfied) for m in metrics_summary],
+                                    dtype=graph_loss.dtype,
+                                    device=graph_loss.device,
                                 )
                                 primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
                                 chooser_loss = chooser_loss + chooser_cfg.gamma_primary * primary_penalty
@@ -1857,6 +2015,105 @@ def train(
                     val_chooser_loss_sum += float(chooser_losses.sum().item())
                     val_chooser_count += chooser_losses.numel()
                     chooser_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
+
+                if direct_safety_enabled:
+                    phase_t0 = time.perf_counter() if timing_enabled else 0.0
+                    if direct_safety_evaluator is None or direct_safety_heuristics is None:
+                        raise RuntimeError("Direct safety enabled but evaluator/heuristics are not initialized.")
+                    if direct_safety_candidate_cfg is None:
+                        direct_safety_candidate_cfg = CandidateConfig(
+                            topk_candidates=direct_safety_cfg.topk_candidates,
+                            max_candidates_total=direct_safety_cfg.max_candidates_total,
+                        )
+                    if direct_safety_val_contexts is None or direct_safety_val_rows is None:
+                        raise RuntimeError("Direct safety enabled but validation contexts/rows are missing.")
+                    batch_context_indices = _batch_int_attr(
+                        data,
+                        "context_index",
+                        graph_loss.size(0),
+                        default_to_batch_index=True,
+                        min_value=0,
+                    )
+                    batch_primary_indices = _batch_int_attr(
+                        data,
+                        "primary_factor_index",
+                        graph_loss.size(0),
+                        default_value=0,
+                        min_value=0,
+                    )
+                    out_detached = out.detach()
+                    batch_slot_vals, batch_slot_ids = _compute_batch_slot_topk(
+                        out_detached,
+                        topk_per_slot=direct_safety_candidate_cfg.topk_per_slot,
+                        slot_allowed_ids=direct_safety_slot_allowed_ids,
+                    )
+                    direct_safety_losses = torch.zeros(
+                        graph_loss.size(0), device=graph_loss.device, dtype=graph_loss.dtype
+                    )
+                    for idx, context_index in enumerate(batch_context_indices):
+                        if (
+                            context_index < 0
+                            or context_index >= len(direct_safety_val_contexts)
+                            or context_index >= len(direct_safety_val_rows)
+                        ):
+                            raise RuntimeError("Direct safety context index out of bounds.")
+                        context = direct_safety_val_contexts[context_index]
+                        row = direct_safety_val_rows[context_index]
+                        primary_index = int(batch_primary_indices[idx])
+                        add_topk = _topk_triples_from_slot_topk_row(
+                            batch_slot_vals,
+                            batch_slot_ids,
+                            row_index=idx,
+                            slots=(0, 1, 2),
+                            topk_triples=direct_safety_candidate_cfg.topk_candidates,
+                        )
+                        del_topk = _topk_triples_from_slot_topk_row(
+                            batch_slot_vals,
+                            batch_slot_ids,
+                            row_index=idx,
+                            slots=(3, 4, 5),
+                            topk_triples=direct_safety_candidate_cfg.topk_candidates,
+                        )
+                        candidates, _ = build_candidates(
+                            gold_slots=targets[idx].detach().cpu().tolist(),
+                            context=context,
+                            heuristics=direct_safety_heuristics,
+                            proposal_logits=out_detached[idx],
+                            cfg=direct_safety_candidate_cfg,
+                            placeholder_ids=direct_safety_placeholder_ids_for_candidates,
+                            num_target_ids=model.num_target_ids,
+                            slot_allowed_ids=direct_safety_slot_allowed_ids,
+                            precomputed_add_topk=add_topk,
+                            precomputed_del_topk=del_topk,
+                        )
+                        candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=graph_loss.device)
+                        scores = score_candidates_from_logits(out[idx], candidate_tensor)
+                        log_probs = F.log_softmax(scores, dim=0)
+                        probs = log_probs.exp()
+                        metrics_summary = direct_safety_evaluator.evaluate_candidate_metrics(
+                            row,
+                            candidates=candidates,
+                            primary_factor_index=primary_index,
+                        )
+                        primary_tensor = torch.tensor(
+                            [float(m.primary_satisfied) for m in metrics_summary],
+                            dtype=graph_loss.dtype,
+                            device=graph_loss.device,
+                        )
+                        secondary_tensor = torch.tensor(
+                            [m.srr for m in metrics_summary],
+                            dtype=graph_loss.dtype,
+                            device=graph_loss.device,
+                        )
+                        primary_penalty = torch.sum(probs * (1.0 - primary_tensor))
+                        secondary_penalty = torch.sum(probs * secondary_tensor)
+                        direct_safety_losses[idx] = (
+                            direct_safety_cfg.alpha_primary * primary_penalty
+                            + direct_safety_cfg.beta_secondary * secondary_penalty
+                        )
+                    graph_loss = graph_loss + direct_safety_losses
+                    val_direct_safety_loss_sum += float(direct_safety_losses.sum().item())
+                    val_direct_safety_count += direct_safety_losses.numel()
 
                 # Accumulate validation metrics
                 phase_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -1962,7 +2219,7 @@ def train(
                     else:
                         eta_label = "n/a"
                     logger.info(
-                        "Epoch %s val %s | dt=%s loss=%.4f speed=%s eta_epoch=%s all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s policy_loss=%s",
+                        "Epoch %s val %s | dt=%s loss=%.4f speed=%s eta_epoch=%s all6_acc=%.2f%% slot_acc=%.2f%% factor_loss=%s chooser_loss=%s direct_safety_loss=%s policy_loss=%s",
                         epoch + 1,
                         progress_label,
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1973,6 +2230,11 @@ def train(
                         100 * val_slot_correct / max(val_slot_total, 1),
                         f"{val_factor_loss_sum / max(val_factor_count, 1):.4f}" if factor_cfg.enabled else "n/a",
                         f"{val_chooser_loss_sum / max(val_chooser_count, 1):.4f}" if chooser_enabled else "n/a",
+                        (
+                            f"{val_direct_safety_loss_sum / max(val_direct_safety_count, 1):.4f}"
+                            if direct_safety_enabled
+                            else "n/a"
+                        ),
                         f"{val_policy_loss_sum / max(val_policy_count, 1):.4f}" if policy_enabled else "n/a",
                     )
                 if timing_enabled and val_timing_window_count >= timing_log_every:
@@ -2011,6 +2273,7 @@ def train(
         val_factor_loss = val_factor_loss_sum / max(val_factor_count, 1)
         val_factor_acc = 100 * val_factor_correct / max(val_factor_count, 1)
         val_chooser_loss = val_chooser_loss_sum / max(val_chooser_count, 1)
+        val_direct_safety_loss = val_direct_safety_loss_sum / max(val_direct_safety_count, 1)
         val_policy_loss = val_policy_loss_sum / max(val_policy_count, 1)
         val_policy_acc = 100 * val_policy_correct / max(val_policy_count, 1)
         if timing_enabled and val_timing_epoch_count > 0:
@@ -2053,6 +2316,8 @@ def train(
         history["val_acc_slot"].append(val_acc_slot)
         history.setdefault("train_chooser_loss", []).append(train_chooser_loss)
         history.setdefault("val_chooser_loss", []).append(val_chooser_loss)
+        history.setdefault("train_direct_safety_loss", []).append(train_direct_safety_loss)
+        history.setdefault("val_direct_safety_loss", []).append(val_direct_safety_loss)
         history.setdefault("train_policy_loss", []).append(train_policy_loss)
         history.setdefault("val_policy_loss", []).append(val_policy_loss)
         history.setdefault("train_policy_acc", []).append(train_policy_acc)
@@ -2153,6 +2418,13 @@ def train(
                 train_factor_acc,
                 val_factor_acc,
             )
+        if direct_safety_enabled:
+            logger.info(
+                "Epoch %s direct safety metrics | train_loss=%.4f val_loss=%.4f",
+                epoch + 1,
+                train_direct_safety_loss,
+                val_direct_safety_loss,
+            )
 
         if device.type == "cuda":
             log_cuda_memory(f"Epoch {epoch + 1} post-epoch", device)
@@ -2229,8 +2501,16 @@ def main():
     path = Path("data/processed") / dataset_variant
     logger.debug("Resolved dataset base path to %s", path)
 
-    train_data_path = path / f"train_graph-{model_cfg.encoding}.pkl"
-    val_data_path = path / f"val_graph-{model_cfg.encoding}.pkl"
+    train_data_path = path / graph_dataset_filename(
+        "train",
+        model_cfg.encoding,
+        constraint_representation=model_cfg.constraint_representation,
+    )
+    val_data_path = path / graph_dataset_filename(
+        "val",
+        model_cfg.encoding,
+        constraint_representation=model_cfg.constraint_representation,
+    )
     train_data = load_graph_dataset(train_data_path)
     val_data = load_graph_dataset(val_data_path)
 
@@ -2440,6 +2720,91 @@ def main():
             float(getattr(chooser_cfg, "loss_weight", 0.5)),
         )
 
+    direct_safety_state: dict[str, object] | None = None
+    direct_safety_cfg = training_cfg.direct_safety
+    if direct_safety_cfg.enabled:
+        if chooser_cfg.enabled:
+            raise RuntimeError("Chooser and direct safety cannot both be enabled in the same training config.")
+        placeholder_ids = placeholder_ids_from_encoder(encoder)
+        direct_safety_heuristics = ConstraintRepairHeuristics(
+            encoder=encoder,
+            placeholder_ids=placeholder_ids,
+            none_class=NONE_CLASS_INDEX,
+        )
+        train_contexts = load_violation_contexts(interim_path, "train", none_class=NONE_CLASS_INDEX)
+        val_contexts = load_violation_contexts(interim_path, "val", none_class=NONE_CLASS_INDEX)
+        train_rows = _load_parquet_rows(interim_path, "train")
+        val_rows = _load_parquet_rows(interim_path, "val")
+        if len(train_rows) != len(train_contexts) or len(val_rows) != len(val_contexts):
+            raise RuntimeError("Mismatch between parquet rows and violation contexts for direct safety.")
+        if isinstance(train_data, list) and isinstance(val_data, list):
+            if len(train_contexts) != len(train_data) or len(val_contexts) != len(val_data):
+                raise RuntimeError("Mismatch between graph dataset size and violation contexts for direct safety.")
+            for idx, graph in enumerate(train_data):
+                if not hasattr(graph, "context_index"):
+                    setattr(graph, "context_index", idx)
+            for idx, graph in enumerate(val_data):
+                if not hasattr(graph, "context_index"):
+                    setattr(graph, "context_index", idx)
+        else:
+            train_graph_count = _manifest_graph_count(train_data_path)
+            val_graph_count = _manifest_graph_count(val_data_path)
+            if train_graph_count is not None and len(train_contexts) != train_graph_count:
+                raise RuntimeError(
+                    f"Mismatch between train manifest graph_count={train_graph_count} and "
+                    f"direct safety contexts={len(train_contexts)}."
+                )
+            if val_graph_count is not None and len(val_contexts) != val_graph_count:
+                raise RuntimeError(
+                    f"Mismatch between val manifest graph_count={val_graph_count} and "
+                    f"direct safety contexts={len(val_contexts)}."
+                )
+            logger.info("Direct safety training will use streamed datasets with on-the-fly context_index assignment.")
+        registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
+        if not registry_path.exists():
+            fallback_name = base_dataset_name(model_cfg.dataset_variant)
+            fallback_path = Path("data") / "interim" / f"constraint_registry_{fallback_name}.parquet"
+            if fallback_path.exists():
+                logger.info(
+                    "Using constraint registry %s for dataset variant %s",
+                    fallback_path,
+                    model_cfg.dataset_variant,
+                )
+                registry_path = fallback_path
+            else:
+                raise FileNotFoundError(
+                    f"Constraint registry not found at {registry_path} or {fallback_path}"
+                )
+        evaluator = CandidateConstraintEvaluator(
+            str(registry_path),
+            encoder=encoder,
+            assume_complete=True,
+            constraint_scope="local",
+            use_encoded_ids=True,
+        )
+        candidate_cfg = CandidateConfig(
+            topk_candidates=direct_safety_cfg.topk_candidates,
+            max_candidates_total=direct_safety_cfg.max_candidates_total,
+            include_gold=True,
+        )
+        direct_safety_state = {
+            "heuristics": direct_safety_heuristics,
+            "train_rows": train_rows,
+            "val_rows": val_rows,
+            "train_contexts": train_contexts,
+            "val_contexts": val_contexts,
+            "evaluator": evaluator,
+            "candidate_cfg": candidate_cfg,
+            "placeholder_ids_set": set(direct_safety_heuristics.placeholder_ids.values()),
+        }
+        logger.info(
+            "Direct safety enabled | topk_candidates=%s max_candidates_total=%s alpha_primary=%.3f beta_secondary=%.3f",
+            direct_safety_cfg.topk_candidates,
+            direct_safety_cfg.max_candidates_total,
+            direct_safety_cfg.alpha_primary,
+            direct_safety_cfg.beta_secondary,
+        )
+
     policy_state: dict[str, object] | None = None
     if model_cfg.enable_policy_choice:
         if isinstance(train_data, GraphStreamDataset):
@@ -2542,6 +2907,7 @@ def main():
         device=device,
         fix_loss_state=fix_loss_state,
         chooser_state=chooser_state,
+        direct_safety_state=direct_safety_state,
         policy_state=policy_state,
         estimated_train_batches=estimated_train_batches,
         estimated_val_batches=estimated_val_batches,

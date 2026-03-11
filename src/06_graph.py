@@ -65,6 +65,7 @@ from modules.data_encoders import (
     PrecomputedWikidataCache,
     dataset_variant_name,
     discover_graph_artifacts,
+    graph_dataset_filename,
     dump_in_shards,
     dump_stream,
     iter_stream,
@@ -138,6 +139,7 @@ def create_graph(
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
     constraint_scope: Literal["local", "focus"] = "local",
+    constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
     store_node_names: bool = False,
     include_debug_fields: bool = True,
     embedding_dtype: np.dtype | None = None,
@@ -222,6 +224,7 @@ def create_graph(
     factor_checkable_post_gold_tensor: torch.Tensor | None = None
     factor_satisfied_post_gold_tensor: torch.Tensor | None = None
     factor_types_tensor: torch.Tensor | None = None
+    factorized_representation = constraint_representation == "factorized"
 
     def _resolve_registry_id(raw_id: str) -> int | None:
         raw = raw_id.strip()
@@ -522,27 +525,30 @@ def create_graph(
     ]
 
     # add constraint factor branches
-    if constraint_scope == "focus":
-        constraint_ids_raw = graph.get("local_constraint_ids_focus")
-        if constraint_ids_raw is None:
-            constraint_ids_raw = graph.get("local_constraint_ids")
-    else:
-        constraint_ids_raw = graph.get("local_constraint_ids")
-    if isinstance(constraint_ids_raw, Iterable) and not isinstance(constraint_ids_raw, (str, bytes)):
-        factor_ids = [int(cid) for cid in constraint_ids_raw if cid is not None]
-    else:
-        factor_ids = []
-    if "factor_constraint_ids" in graph:
-        expected_ids_raw = graph.get("factor_constraint_ids") or []
-        if isinstance(expected_ids_raw, Iterable) and not isinstance(expected_ids_raw, (str, bytes)):
-            expected_ids = [int(cid) for cid in expected_ids_raw if cid is not None]
+    if factorized_representation:
+        if constraint_scope == "focus":
+            constraint_ids_raw = graph.get("local_constraint_ids_focus")
+            if constraint_ids_raw is None:
+                constraint_ids_raw = graph.get("local_constraint_ids")
         else:
-            expected_ids = []
-        if expected_ids and expected_ids != factor_ids:
-            raise AssertionError(
-                "Factor constraint id order mismatch between labeled data and graph builder."
-            )
-    if not factor_ids:
+            constraint_ids_raw = graph.get("local_constraint_ids")
+        if isinstance(constraint_ids_raw, Iterable) and not isinstance(constraint_ids_raw, (str, bytes)):
+            factor_ids = [int(cid) for cid in constraint_ids_raw if cid is not None]
+        else:
+            factor_ids = []
+        if "factor_constraint_ids" in graph:
+            expected_ids_raw = graph.get("factor_constraint_ids") or []
+            if isinstance(expected_ids_raw, Iterable) and not isinstance(expected_ids_raw, (str, bytes)):
+                expected_ids = [int(cid) for cid in expected_ids_raw if cid is not None]
+            else:
+                expected_ids = []
+            if expected_ids and expected_ids != factor_ids:
+                raise AssertionError(
+                    "Factor constraint id order mismatch between labeled data and graph builder."
+                )
+        if not factor_ids:
+            factor_ids = [int(graph["constraint_id"])]
+    else:
         factor_ids = [int(graph["constraint_id"])]
 
     required_factor_fields = (
@@ -553,7 +559,7 @@ def create_graph(
         "factor_types",
         "factor_constraint_ids",
     )
-    if all(graph.get(field) is not None for field in required_factor_fields):
+    if factorized_representation and all(graph.get(field) is not None for field in required_factor_fields):
         expected_len = len(factor_ids)
 
         def _normalize_factor_list(value: Any, name: str) -> list[Any]:
@@ -661,118 +667,120 @@ def create_graph(
                     matches.append(obj_gid)
             return matches
 
-        constrained_gid = None
-        if constrained_property:
-            constrained_gid = _resolve_registry_id(constrained_property)
-            if constrained_gid is not None:
-                _add_observed(constrained_gid)
-
-        if constraint_type == "conflictWith":
-            for obj_raw in param_objects:
-                if _is_property_token(obj_raw):
-                    obj_gid = _resolve_registry_id(obj_raw)
-                    if obj_gid is not None:
-                        _add_observed(obj_gid)
-            other_predicate_gid = int(graph.get("other_predicate") or 0)
-            if other_predicate_gid:
-                _add_observed(other_predicate_gid)
-        elif constraint_type == "inverse":
-            inverse_gids = _collect_param_object_gids(param_inverse_gid)
-            if not inverse_gids and constrained_gid is not None:
-                inverse_gids = [constrained_gid]
-            for obj_gid in inverse_gids:
-                _add_observed(obj_gid)
-        elif constraint_type == "itemRequiresStatement":
-            for obj_gid in _collect_param_object_gids(param_property_gid):
-                _add_observed(obj_gid)
-        elif constraint_type == "valueRequiresStatement":
-            for obj_gid in _collect_param_object_gids(param_property_gid):
-                _add_observed(obj_gid)
-        elif constraint_type == "type":
-            relation_gids = _collect_param_object_gids(param_relation_gid)
-            if not relation_gids:
-                relation_gids = list(default_relation_gids)
-            for obj_gid in relation_gids:
-                _add_observed(obj_gid)
-        elif constraint_type == "valueType":
-            relation_gids = _collect_param_object_gids(param_relation_gid)
-            if not relation_gids:
-                relation_gids = list(default_relation_gids)
-            for obj_gid in relation_gids:
-                _add_observed(obj_gid)
-
-        subject_scope_ids: set[int] | None
-        if constraint_type in {"single", "conflictWith", "itemRequiresStatement"}:
-            subject_id = focus_local_nodes.get("subject")
-            subject_scope_ids = {subject_id} if subject_id is not None else set()
-        elif constraint_type in {"valueRequiresStatement", "valueType"}:
-            object_id = focus_local_nodes.get("object")
-            if object_id is not None and not _is_literal_node(graph, "object"):
-                subject_scope_ids = {object_id}
-            else:
-                subject_scope_ids = set()
-        elif constraint_type == "distinct":
-            subject_scope_ids = set()
-            focus_subject_id = focus_local_nodes.get("subject")
-            if focus_subject_id is not None:
-                subject_scope_ids.add(focus_subject_id)
-            other_subject_gid = int(graph.get("other_subject") or 0)
-            if other_subject_gid:
-                other_subject_id = global_to_local_id_encoder.global_to_local.get(other_subject_gid)
-                if other_subject_id is not None:
-                    subject_scope_ids.add(other_subject_id)
-        else:
-            subject_scope_ids = None
-
         matched_predicate_local_ids = 0
         wiring_edges_created = 0
         matched_focus_predicate = False
         scope_predicate_counts: dict[int, int] = {}
+        constrained_gid = None
+        if factorized_representation:
+            if constrained_property:
+                constrained_gid = _resolve_registry_id(constrained_property)
+                if constrained_gid is not None:
+                    _add_observed(constrained_gid)
 
-        def _collect_pred_local_ids(predicate_gid: int, subject_ids: set[int] | None) -> list[int]:
-            if subject_ids is None:
-                return list(pred_global_to_pred_local_ids.get(predicate_gid, []))
-            pred_ids: list[int] = []
-            for subj_id in sorted(subject_ids):
-                pred_ids.extend(subj_local_to_pred_global_to_pred_local_ids.get(subj_id, {}).get(predicate_gid, []))
-            return pred_ids
+            if constraint_type == "conflictWith":
+                for obj_raw in param_objects:
+                    if _is_property_token(obj_raw):
+                        obj_gid = _resolve_registry_id(obj_raw)
+                        if obj_gid is not None:
+                            _add_observed(obj_gid)
+                other_predicate_gid = int(graph.get("other_predicate") or 0)
+                if other_predicate_gid:
+                    _add_observed(other_predicate_gid)
+            elif constraint_type == "inverse":
+                inverse_gids = _collect_param_object_gids(param_inverse_gid)
+                if not inverse_gids and constrained_gid is not None:
+                    inverse_gids = [constrained_gid]
+                for obj_gid in inverse_gids:
+                    _add_observed(obj_gid)
+            elif constraint_type == "itemRequiresStatement":
+                for obj_gid in _collect_param_object_gids(param_property_gid):
+                    _add_observed(obj_gid)
+            elif constraint_type == "valueRequiresStatement":
+                for obj_gid in _collect_param_object_gids(param_property_gid):
+                    _add_observed(obj_gid)
+            elif constraint_type == "type":
+                relation_gids = _collect_param_object_gids(param_relation_gid)
+                if not relation_gids:
+                    relation_gids = list(default_relation_gids)
+                for obj_gid in relation_gids:
+                    _add_observed(obj_gid)
+            elif constraint_type == "valueType":
+                relation_gids = _collect_param_object_gids(param_relation_gid)
+                if not relation_gids:
+                    relation_gids = list(default_relation_gids)
+                for obj_gid in relation_gids:
+                    _add_observed(obj_gid)
 
-        scope_pred_local_ids: list[int] = []
-        scope_pred_local_ids_seen: set[int] = set()
-        for predicate_gid in observed_predicates:
-            local_pred_ids = _collect_pred_local_ids(predicate_gid, subject_scope_ids)
-            if local_pred_ids:
-                scope_predicate_counts[predicate_gid] = len(local_pred_ids)
-            for pred_local_id in local_pred_ids:
-                if pred_local_id in scope_pred_local_ids_seen:
-                    continue
-                scope_pred_local_ids_seen.add(pred_local_id)
-                scope_pred_local_ids.append(pred_local_id)
+            subject_scope_ids: set[int] | None
+            if constraint_type in {"single", "conflictWith", "itemRequiresStatement"}:
+                subject_id = focus_local_nodes.get("subject")
+                subject_scope_ids = {subject_id} if subject_id is not None else set()
+            elif constraint_type in {"valueRequiresStatement", "valueType"}:
+                object_id = focus_local_nodes.get("object")
+                if object_id is not None and not _is_literal_node(graph, "object"):
+                    subject_scope_ids = {object_id}
+                else:
+                    subject_scope_ids = set()
+            elif constraint_type == "distinct":
+                subject_scope_ids = set()
+                focus_subject_id = focus_local_nodes.get("subject")
+                if focus_subject_id is not None:
+                    subject_scope_ids.add(focus_subject_id)
+                other_subject_gid = int(graph.get("other_subject") or 0)
+                if other_subject_gid:
+                    other_subject_id = global_to_local_id_encoder.global_to_local.get(other_subject_gid)
+                    if other_subject_id is not None:
+                        subject_scope_ids.add(other_subject_id)
+            else:
+                subject_scope_ids = None
 
-        matched_predicate_local_ids = len(scope_pred_local_ids)
-        for pred_local_id in scope_pred_local_ids:
-            edges.append((factor_local_id, pred_local_id))
-            edge_types.append(EDGE_FACTOR_TO_LOCAL_PREDICATE)
-            edges.append((pred_local_id, factor_local_id))
-            edge_types.append(EDGE_LOCAL_PREDICATE_TO_FACTOR)
-            wiring_edges_created += 1
-            if focus_local_nodes.get("predicate") == pred_local_id:
-                matched_focus_predicate = True
+            def _collect_pred_local_ids(predicate_gid: int, subject_ids: set[int] | None) -> list[int]:
+                if subject_ids is None:
+                    return list(pred_global_to_pred_local_ids.get(predicate_gid, []))
+                pred_ids: list[int] = []
+                for subj_id in sorted(subject_ids):
+                    pred_ids.extend(
+                        subj_local_to_pred_global_to_pred_local_ids.get(subj_id, {}).get(predicate_gid, [])
+                    )
+                return pred_ids
 
-        if constrained_gid is not None:
-            local_triples = pred_global_to_local_triples.get(constrained_gid, [])
-            for subject_id, predicate_id, object_id in local_triples:
-                edges.append((factor_local_id, subject_id))
-                edge_types.append(EDGE_FACTOR_TO_LOCAL_SUBJECT)
-                edges.append((subject_id, factor_local_id))
-                edge_types.append(EDGE_LOCAL_SUBJECT_TO_FACTOR)
-                edges.append((factor_local_id, object_id))
-                edge_types.append(EDGE_FACTOR_TO_LOCAL_OBJECT)
-                edges.append((object_id, factor_local_id))
-                edge_types.append(EDGE_LOCAL_OBJECT_TO_FACTOR)
-                wiring_edges_created += 2
-                if focus_local_nodes.get("predicate") == predicate_id:
+            scope_pred_local_ids: list[int] = []
+            scope_pred_local_ids_seen: set[int] = set()
+            for predicate_gid in observed_predicates:
+                local_pred_ids = _collect_pred_local_ids(predicate_gid, subject_scope_ids)
+                if local_pred_ids:
+                    scope_predicate_counts[predicate_gid] = len(local_pred_ids)
+                for pred_local_id in local_pred_ids:
+                    if pred_local_id in scope_pred_local_ids_seen:
+                        continue
+                    scope_pred_local_ids_seen.add(pred_local_id)
+                    scope_pred_local_ids.append(pred_local_id)
+
+            matched_predicate_local_ids = len(scope_pred_local_ids)
+            for pred_local_id in scope_pred_local_ids:
+                edges.append((factor_local_id, pred_local_id))
+                edge_types.append(EDGE_FACTOR_TO_LOCAL_PREDICATE)
+                edges.append((pred_local_id, factor_local_id))
+                edge_types.append(EDGE_LOCAL_PREDICATE_TO_FACTOR)
+                wiring_edges_created += 1
+                if focus_local_nodes.get("predicate") == pred_local_id:
                     matched_focus_predicate = True
+
+            if constrained_gid is not None:
+                local_triples = pred_global_to_local_triples.get(constrained_gid, [])
+                for subject_id, predicate_id, object_id in local_triples:
+                    edges.append((factor_local_id, subject_id))
+                    edge_types.append(EDGE_FACTOR_TO_LOCAL_SUBJECT)
+                    edges.append((subject_id, factor_local_id))
+                    edge_types.append(EDGE_LOCAL_SUBJECT_TO_FACTOR)
+                    edges.append((factor_local_id, object_id))
+                    edge_types.append(EDGE_FACTOR_TO_LOCAL_OBJECT)
+                    edges.append((object_id, factor_local_id))
+                    edge_types.append(EDGE_LOCAL_OBJECT_TO_FACTOR)
+                    wiring_edges_created += 2
+                    if focus_local_nodes.get("predicate") == predicate_id:
+                        matched_focus_predicate = True
 
         for predicate_id_raw, object_id_raw in zip(param_predicates, param_objects):
             try:
@@ -809,7 +817,7 @@ def create_graph(
                 primary_factor_focus_scope_ok = matched_focus_predicate
 
     assert primary_factor_index >= 0, "Primary constraint_id missing from factor list."
-    if debug_factor_wiring and primary_factor_focus_scope_ok is not None:
+    if factorized_representation and debug_factor_wiring and primary_factor_focus_scope_ok is not None:
         assert primary_factor_focus_scope_ok, "Primary factor missing scope edge to focus predicate."
         if factor_local_ids:
             factor_set = set(factor_local_ids)
@@ -876,6 +884,7 @@ def create_graph(
     data_graph.shape_id = int(graph["constraint_id"])
     # Standardize on `constraint_type` across the pipeline
     data_graph.constraint_type = str(graph["constraint_type"])
+    data_graph.constraint_representation = constraint_representation
     data_graph.factor_constraint_ids = torch.tensor(factor_constraint_ids, dtype=torch.long)
     data_graph.factor_node_index = torch.tensor(factor_local_ids, dtype=torch.long)
     data_graph.primary_factor_index = int(primary_factor_index)
@@ -974,6 +983,7 @@ def compute_torch_geometric_objects(
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
     constraint_scope: Literal["local", "focus"] = "local",
+    constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
     store_node_names: bool = False,
     include_debug_fields: bool = True,
     embedding_dtype: np.dtype | None = None,
@@ -998,6 +1008,7 @@ def compute_torch_geometric_objects(
             constraint_registry=constraint_registry,
             encoding=encoding,
             constraint_scope=constraint_scope,
+            constraint_representation=constraint_representation,
             store_node_names=store_node_names,
             include_debug_fields=include_debug_fields,
             embedding_dtype=embedding_dtype,
@@ -1281,12 +1292,14 @@ def _write_split_manifest(
     encoding: str,
     dataset_variant: str,
     constraint_scope: str,
+    constraint_representation: str,
 ) -> None:
     manifest = {
         "split": split,
         "dataset_variant": dataset_variant,
         "encoding": encoding,
         "constraint_scope": constraint_scope,
+        "constraint_representation": constraint_representation,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "graph_count": int(graph_count),
         "shard_count": int(shard_count),
@@ -1320,6 +1333,7 @@ def main(
     encoding: Literal["node_id", "text_embedding"],
     dataset_variant: str,
     constraint_scope: Literal["local", "focus"] = "local",
+    constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
     store_node_names: bool = False,
     persistence_profile: str = PERSISTENCE_PROFILE_RESEARCH_SAFE,
     shard_size: int = 0,
@@ -1386,7 +1400,11 @@ def main(
                 split_predicate_targets.add(idx)
                 total_predicate_targets.add(idx)
 
-        output_path = PROCESSED_DATA_PATH / f"{split}_graph-{encoding}.pkl"
+        output_path = PROCESSED_DATA_PATH / graph_dataset_filename(
+            split,
+            encoding,
+            constraint_representation=constraint_representation,
+        )
         existing_artifacts = discover_graph_artifacts(output_path)
         if overwrite_mode == OVERWRITE_MODE_SKIP and existing_artifacts:
             logging.info(
@@ -1456,6 +1474,7 @@ def main(
             constraint_registry,
             encoding=encoding,
             constraint_scope=constraint_scope,
+            constraint_representation=constraint_representation,
             store_node_names=store_node_names,
             include_debug_fields=include_debug_fields,
             embedding_dtype=embedding_dtype,
@@ -1515,6 +1534,7 @@ def main(
             encoding=encoding,
             dataset_variant=dataset_variant,
             constraint_scope=constraint_scope,
+            constraint_representation=constraint_representation,
         )
 
         del generator
@@ -1713,6 +1733,12 @@ def parse_args():
         help="Which constraint neighborhood to use for factor nodes (default: local).",
     )
     parser.add_argument(
+        "--constraint-representation",
+        choices=["factorized", "eswc_passive"],
+        default="factorized",
+        help="Graph representation regime: factorized (default) or eswc_passive.",
+    )
+    parser.add_argument(
         "--use-unlabeled-interim",
         action="store_true",
         help="Force using data/interim/<variant> even if a labeled interim dataset exists.",
@@ -1756,6 +1782,8 @@ def parse_args():
         parser.error("--resume-partial-shards requires --shard-size > 0")
     if args.resume_partial_shards and args.overwrite == OVERWRITE_MODE_SKIP:
         parser.error("--resume-partial-shards is incompatible with --overwrite skip")
+    if args.constraint_representation == "eswc_passive" and args.constraint_scope != "local":
+        parser.error("--constraint-scope is only meaningful for factorized graphs")
 
     return args
 
@@ -1838,6 +1866,7 @@ if __name__ == "__main__":
         encoding=args.encoding,
         dataset_variant=dataset_variant,
         constraint_scope=args.constraint_scope,
+        constraint_representation=args.constraint_representation,
         persistence_profile=args.persistence_profile,
         shard_size=args.shard_size,
         use_torch_save=args.use_torch_save,

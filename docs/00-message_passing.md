@@ -1,268 +1,74 @@
-# Executable Constraint Factors: Message Passing and Constraint Execution
+# Message Passing and Constraint Execution
 
-This document specifies the **message-passing equations** and computational semantics of **constraint factors as executable subprograms**, expanding the informal description into a precise, paper-ready formulation.
+Date: 2026-03-11
 
-The goal is to make explicit:
-- how constraint semantics are computed,
-- how constraint violations generate *pressure*,
-- how this pressure interacts with GNN message passing,
-- and how repair decisions emerge without hardcoded heuristics.
+This document separates the current repository implementation from the longer-range research ideal.
 
----
+## Current v1 implementation
 
-## 1. Graph Structure and Notation
+The repository currently implements a factor-aware message-passing model with these properties:
 
-We work with a **heterogeneous factor graph** per violation instance.
+- factor nodes are present in `factorized` graphs
+- factor nodes carry type ids and primary-factor indexing
+- message passing can inject typed-conditioned pressure from factor nodes
+- factor scoring is shared across factor instances, with optional type conditioning
 
-### Node sets
-- **Variable nodes** \( v \in \mathcal{V} \)
-  - entities, predicates, literals, role-specific nodes
-- **Constraint factor nodes** \( c \in \mathcal{C} \)
-  - each corresponds to a *constraint instance*
-  - each has a constraint type \( t(c) \in \mathcal{T} \)
+This is best described as:
 
-### Scope of a constraint
-Each factor node \( c \) has a scope:
-\[
-\mathrm{scope}(c) \subseteq \mathcal{V}
-\]
-representing the variables involved in that constraint.
+- a generic factor-message mechanism
+- plus typed conditioning
+- plus shared symbolic evaluation over candidate edits
 
-Examples:
-- `conflictWith(p,q)` → scope = {predicate node \(p\), predicate node \(q\), optional subject node \(s\)}
-- `single(p)` → scope = {subject \(s\), predicate \(p\), all value nodes \(o_i\)}
+It is not yet a full library of per-type executable neural subprograms.
 
----
+## Current implementation contract
 
-## 2. Variable-to-Variable Message Passing (Base GNN)
+At the code level, phase 1 assumes:
 
-Let \( h_v^{(k)} \in \mathbb{R}^d \) be the embedding of variable node \(v\) at layer \(k\).
+- `B0` uses `constraint_representation="eswc_passive"`
+- `A1`, `M1C`, `M1D`, and proposal sources for `G0` use `constraint_representation="factorized"`
+- `M1C`, `M1D`, and `G0` all consume the same candidate-level symbolic evaluator outputs:
+  - primary satisfied flag
+  - secondary regression rate
+  - global satisfied fraction
+  - disruption fields used by evaluation
 
-We use a standard GNN backbone (e.g., GIN over a multi-relational graph):
+That shared evaluator contract is the mechanism that keeps safety metrics aligned across chooser, direct-loss, reranker, and final evaluation.
 
-\[
-\tilde{h}_v^{(k+1)} =
-\mathrm{GNN}\Big(
-h_v^{(k)},
-\big\{ (h_u^{(k)}, e_{u\to v}) : u \in \mathcal{N}(v) \big\}
-\Big)
-\]
+## Deferred research-ideal design
 
-This step captures **structural and semantic context** from the data graph alone, without constraints.
+The stronger research formulation remains deferred:
 
----
+- one executable factor module per constraint type, `f_t`
+- optional per-type or per-role message functions, `g_{t,r}`
+- explicit scope aggregation and message emission specialized by factor family
+- potentially direct post-edit neural factor prediction inside the proposal model
 
-## 3. Constraint Execution: Violation / Satisfaction Computation
-
-Constraint factors are **executable operators**, not passive nodes.
-
-### 3.1 Type-specific constraint function
-
-Each constraint type \( t \in \mathcal{T} \) has a shared neural function:
-\[
-f_t : \mathbb{R}^{|\mathrm{scope}(c)| \cdot d} \rightarrow \mathbb{R}
-\]
-
-All constraint instances of the same type share parameters.
-
----
-
-### 3.2 Example: `conflictWith` constraint
-
-For a `conflictWith(p,q)` constraint with optional subject \(s\), define:
+In notation, that deferred version would look like:
 
 \[
-z_c^{(k)} = 
-\big[
-h_p^{(k)} \;\Vert\; h_q^{(k)} \;\Vert\; h_s^{(k)}
-\big]
-\]
-
-Violation score:
-\[
-\mathrm{viol}_c^{(k)} =
-\sigma\big( W_{conflict} \cdot z_c^{(k)} \big)
-\]
-
-where:
-- \( \sigma \) is a sigmoid,
-- \( \mathrm{viol}_c \in [0,1] \).
-
-**Interpretation**
-- \( \mathrm{viol}_c \approx 0 \): configuration compatible
-- \( \mathrm{viol}_c \approx 1 \): strong violation
-
-This learned function **replaces**:
-- heuristic rule matching,
-- handcrafted fix-probability losses.
-
----
-
-### 3.3 Satisfaction score
-
-We define satisfaction as:
-\[
-\hat{s}_c^{(k)} = 1 - \mathrm{viol}_c^{(k)}
-\]
-
-This is the quantity used in:
-- auxiliary satisfaction losses,
-- secondary no-regression constraints,
-- global fix evaluation.
-
----
-
-## 4. Constraint-to-Variable Feedback (Repair Pressure)
-
-Constraint execution alone is insufficient; constraints must **influence representations**.
-
-Each factor emits **directed, role-conditioned pressure messages** to its scoped variables.
-
----
-
-### 4.1 Pressure generation
-
-For each \( v \in \mathrm{scope}(c) \):
-
-\[
-m_{c \rightarrow v}^{(k)} =
-g_{t(c), r(v,c)}
-\big(
-z_c^{(k)},\;
-h_v^{(k)},\;
-\mathrm{viol}_c^{(k)}
-\big)
-\]
-
-where:
-- \( r(v,c) \) is the *role* of variable \(v\) in constraint \(c\),
-- \( g_{t,r} \) is a small MLP, shared per (constraint type, role).
-
----
-
-### 4.2 Simplified example (conflictWith)
-
-For predicates \(p, q\):
-
-\[
-m_{c \rightarrow p}^{(k)} =
-- \alpha \cdot \mathrm{viol}_c^{(k)} \cdot h_p^{(k)}
+z_c = \mathrm{AGG}(\{h_v : v \in S(c)\})
 \]
 
 \[
-m_{c \rightarrow q}^{(k)} =
-- \alpha \cdot \mathrm{viol}_c^{(k)} \cdot h_q^{(k)}
+\hat{s}_c = f_{t(c)}(z_c)
 \]
-
-Optionally, for subject \(s\):
 
 \[
-m_{c \rightarrow s}^{(k)} =
-- \alpha_s \cdot \mathrm{viol}_c^{(k)} \cdot h_s^{(k)}
+m_{c \to v} = g_{t(c), r(v,c)}(z_c, h_v)
 \]
 
----
+That is still a valid future direction, but it is not what the repository should currently claim to implement.
 
-### 4.3 Interpretation of pressure
+## Repository wording rule
 
-- High violation → strong negative feedback
-- Pressure pushes embeddings **away from a locally stable manifold**
-- Variables involved in violations become *less compatible* with the current configuration
+When describing the current codebase:
 
-This is **not** symbolic deletion:
-- no rule says “delete focus triple”
-- instead, representations encode *tension*
+- say "typed-conditioned generic factor pressure/messages"
+- do not say "true per-type executable factor programs" unless that refactor has actually landed
 
----
+When describing future work:
 
-## 5. Variable State Update with Constraint Pressure
+- refer to the per-type `f_t` / `g_{t,r}` architecture as a deferred research-ideal extension
 
-The final variable update at layer \(k+1\) is:
-
-\[
-h_v^{(k+1)} =
-\tilde{h}_v^{(k+1)}
-+
-\sum_{c : v \in \mathrm{scope}(c)}
-m_{c \rightarrow v}^{(k)}
-\]
-
-Thus:
-- standard GNN aggregation builds context,
-- constraint pressure reshapes representations toward consistency.
-
-Multiple constraints can simultaneously act on the same variable, allowing:
-- constraint interaction,
-- trade-offs,
-- partial satisfaction.
-
----
-
-## 6. Emergent Repair Behavior
-
-### 6.1 No hardcoded repair logic
-
-There is:
-- no explicit “delete focus” rule,
-- no enumerated fix patterns inside the model.
-
-Instead:
-- constraint pressure accumulates in embeddings,
-- the decoder reads this tension.
-
----
-
-### 6.2 Decoder intuition
-
-Let \( h_G \) be the pooled graph embedding.
-
-High constraint pressure on:
-- a predicate embedding → higher probability of deletion
-- missing required structures → higher probability of addition
-
-The decoder learns mappings like:
-- “when pressure concentrates on this slot, delete”
-- “when pressure indicates absence, add”
-
-This is **learned**, not prescribed.
-
----
-
-## 7. Multi-Constraint Interaction
-
-Because multiple factors emit pressure:
-- constraints can reinforce each other,
-- or partially cancel out.
-
-Example:
-- primary constraint pushes for deletion,
-- secondary constraint resists deletion due to value requirements,
-- final decision balances both.
-
-This interaction is impossible in:
-- flattened graphs with passive constraint nodes,
-- post-hoc constraint losses.
-
----
-
-## 8. Why This Is Fundamentally Different from Flattened Graphs
-
-| Aspect | Flattened graph | Executable constraint factors |
-|---|---|---|
-| Constraint node | Passive context | Active operator |
-| Semantics | Implicit correlations | Explicit learned function |
-| Execution | Outside GNN | Inside message passing |
-| Interaction | Single constraint | Multi-constraint superposition |
-| Repair logic | Pattern imitation | Pressure-driven emergence |
-
----
-
-## 9. Summary
-
-- Constraints are modeled as **typed neural operators**.
-- Each constraint instance executes a validation subprogram.
-- Violations generate **continuous pressure**, not discrete rules.
-- Repair decisions emerge from representation dynamics.
-- This enables principled modeling of soft, interacting constraints under curator intent.
-
-This formulation makes constraints **first-class computational objects**, not annotations.
+This distinction keeps the docs honest and prevents overclaiming relative to the implementation.

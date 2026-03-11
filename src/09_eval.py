@@ -32,13 +32,14 @@ from torch_geometric.loader import DataLoader
 from tqdm.autonotebook import tqdm
 
 from modules.baselines import evaluate_baselines
-from modules.candidates import CandidateConfig, build_candidates
+from modules.candidates import CandidateConfig, build_candidates, score_candidates_from_logits
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import (
     GlobalIntEncoder,
     base_dataset_name,
     dataset_variant_name,
     discover_graph_artifacts,
+    graph_dataset_filename,
 )
 from modules.model_store import baseline_dir, config_copy_path, evaluations_dir, get_checkpoint_path
 from modules.models import BaseGraphModel, build_model
@@ -61,10 +62,11 @@ from modules.policy import (
 NONE_CLASS_INDEX = 0  # Bass-style datasets reserve class 0 for "no triple"
 ACTIONS = ("add", "del")
 PAPER_SUITE_TAGS: set[str] = {
-    "m0_eswc_like",
-    "m1_main_fix1",
-    "m1_fix1_reranker",
-    "m2_global_fix_reranker",
+    "b0_eswc_reproduction",
+    "a1_factorized_imitation",
+    "m1c_safe_factor_chooser",
+    "m1d_safe_factor_direct",
+    "g0_globalfix_reference",
 }
 
 
@@ -170,6 +172,13 @@ class PolicySupport:
     heuristics: ConstraintRepairHeuristics
     candidate_cfg: CandidateConfig
     filter_strict: bool = True
+
+
+@dataclass
+class DirectSafetySupport:
+    contexts: Sequence[ViolationContext]
+    heuristics: ConstraintRepairHeuristics
+    candidate_cfg: CandidateConfig
 
 
 def _repair_samples_from_predictions(
@@ -481,6 +490,7 @@ def eval(
     postprocess: Callable[[torch.Tensor, torch.Tensor, list[str]], None] | None = None,
     precomputed_predictions: torch.Tensor | None = None,
     chooser_support: ChooserSupport | None = None,
+    direct_safety_support: DirectSafetySupport | None = None,
     policy_support: PolicySupport | None = None,
 ) -> dict[str, object]:
     """Evaluate a model and return Bass-style precision/recall/F1 metrics."""
@@ -495,8 +505,12 @@ def eval(
         raise ValueError("Either a model or precomputed_predictions must be provided.")
     if precomputed_predictions is not None and chooser_support is not None:
         raise ValueError("Chooser support cannot be used with precomputed predictions.")
+    if precomputed_predictions is not None and direct_safety_support is not None:
+        raise ValueError("Direct safety support cannot be used with precomputed predictions.")
     if precomputed_predictions is not None and policy_support is not None:
         raise ValueError("Policy support cannot be used with precomputed predictions.")
+    if chooser_support is not None and direct_safety_support is not None:
+        raise ValueError("Chooser support and direct safety support cannot be used together.")
     if precomputed_predictions is None and model is not None:
         model.eval()
     predictions, targets = [], []
@@ -585,6 +599,28 @@ def eval(
                     )
                     candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=logits.device)
                     scores = model.score_candidates(graph_emb[idx], candidate_tensor)
+                    best_idx = int(torch.argmax(scores).item())
+                    batch_preds.append(list(candidates[best_idx]))
+                predictions.append(torch.tensor(batch_preds, dtype=torch.long).cpu())
+            elif direct_safety_support is not None:
+                graphs = data.to_data_list()
+                batch_preds = []
+                for idx, graph in enumerate(graphs):
+                    context_index = int(getattr(graph, "context_index", idx))
+                    if context_index >= len(direct_safety_support.contexts):
+                        raise RuntimeError("Direct safety context index out of bounds.")
+                    context = direct_safety_support.contexts[context_index]
+                    candidates, _ = build_candidates(
+                        graph=graph,
+                        context=context,
+                        heuristics=direct_safety_support.heuristics,
+                        proposal_logits=logits[idx].detach(),
+                        cfg=direct_safety_support.candidate_cfg,
+                        placeholder_ids=set(direct_safety_support.heuristics.placeholder_ids.values()),
+                        num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
+                    )
+                    candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=logits.device)
+                    scores = score_candidates_from_logits(logits[idx], candidate_tensor)
                     best_idx = int(torch.argmax(scores).item())
                     batch_preds.append(list(candidates[best_idx]))
                 predictions.append(torch.tensor(batch_preds, dtype=torch.long).cpu())
@@ -730,6 +766,7 @@ def _run_and_save(
     precomputed_predictions: torch.Tensor | None = None,
     write_per_constraint_csv: bool = False,
     chooser_support: ChooserSupport | None = None,
+    direct_safety_support: DirectSafetySupport | None = None,
     policy_support: PolicySupport | None = None,
     selection_weights: dict[str, float] | None = None,
     selection_disruption_field: str = "mean_disruption_total",
@@ -744,6 +781,7 @@ def _run_and_save(
         postprocess=postprocess,
         precomputed_predictions=normalized_predictions,
         chooser_support=chooser_support,
+        direct_safety_support=direct_safety_support,
         policy_support=policy_support,
     )
     metrics["global_metrics_computed"] = bool(
@@ -791,9 +829,19 @@ def get_device() -> torch.device:
     return dev
 
 
-def load_split(base_path: Path, encoding: str, split: str) -> list[Data]:
+def load_split(
+    base_path: Path,
+    encoding: str,
+    split: str,
+    *,
+    constraint_representation: str = "factorized",
+) -> list[Data]:
     """Load a dataset split saved as a monolithic file or shard collection."""
-    path = base_path / f"{split}_graph-{encoding}.pkl"
+    path = base_path / graph_dataset_filename(
+        split,
+        encoding,
+        constraint_representation=constraint_representation,
+    )
     artifacts = discover_graph_artifacts(path)
     if not artifacts:
         raise FileNotFoundError(f"Missing dataset split at {path} and no matching shards ({path.stem}-shard*).")
@@ -851,10 +899,27 @@ def _data_has_factor_fields(test_data: Sequence[Data]) -> bool:
 
 
 def _infer_config_tag_from_run_dir(run_directory: Path) -> str:
-    name = run_directory.name
-    if "_" in name:
-        return name.rsplit("_", 1)[-1]
-    return name
+    parts = run_directory.name.split("_")
+    if len(parts) < 3:
+        return run_directory.name
+    idx = 1
+    while idx < len(parts) and parts[idx].upper() == parts[idx]:
+        idx += 1
+    if idx >= len(parts):
+        return run_directory.name
+    return "_".join(parts[idx:])
+
+
+def _is_paper_suite_config(model_cfg: ModelConfig, training_cfg: TrainingConfig | None) -> bool:
+    if model_cfg.model == "RERANKER":
+        return True
+    if model_cfg.constraint_representation == "eswc_passive":
+        return True
+    if training_cfg is None:
+        return False
+    if training_cfg.chooser.enabled or training_cfg.direct_safety.enabled:
+        return True
+    return bool(model_cfg.pressure_enabled and model_cfg.constraint_representation == "factorized")
 
 
 def _summarize_repair_per_type(repair_metrics: dict[str, object] | None) -> dict[str, dict[str, float | int]]:
@@ -1131,6 +1196,7 @@ def evaluate_trained_model(
     precomputed_predictions: torch.Tensor | None = None,
     write_per_constraint_csv: bool = False,
     chooser_support: ChooserSupport | None = None,
+    direct_safety_support: DirectSafetySupport | None = None,
     policy_support: PolicySupport | None = None,
     selection_weights: dict[str, float] | None = None,
     selection_disruption_field: str = "mean_disruption_total",
@@ -1192,6 +1258,7 @@ def evaluate_trained_model(
         precomputed_predictions=precomputed_predictions,
         write_per_constraint_csv=write_per_constraint_csv,
         chooser_support=chooser_support,
+        direct_safety_support=direct_safety_support,
         policy_support=policy_support,
         selection_weights=selection_weights,
         selection_disruption_field=selection_disruption_field,
@@ -1352,7 +1419,11 @@ def main():
             training_payload = {k: v for k, v in dict(training_payload).items() if k in allowed}
         training_cfg = TrainingConfig.from_mapping(training_payload)
         config_tag = _infer_config_tag_from_run_dir(run_directory)
-        strict_global = bool(args.strict_global_metrics or (config_tag in PAPER_SUITE_TAGS))
+        strict_global = bool(
+            args.strict_global_metrics
+            or _is_paper_suite_config(model_cfg, training_cfg)
+            or any(config_tag.startswith(tag) for tag in PAPER_SUITE_TAGS)
+        )
         if strict_global and args.no_global_metrics:
             raise RuntimeError(
                 "Strict global metrics cannot be combined with --no-global-metrics. "
@@ -1373,11 +1444,17 @@ def main():
 
         variant = dataset_variant_name(model_cfg.dataset_variant, model_cfg.min_occurrence)
         base_path = Path("data/processed") / variant
-        test_data = load_split(base_path, model_cfg.encoding, "test")
+        test_data = load_split(
+            base_path,
+            model_cfg.encoding,
+            "test",
+            constraint_representation=model_cfg.constraint_representation,
+        )
 
         postprocess_fns: list[Callable[[torch.Tensor, torch.Tensor, list[str]], None]] = []
         postprocess_states: list[dict[str, object]] = []
         chooser_support: ChooserSupport | None = None
+        direct_safety_support: DirectSafetySupport | None = None
         policy_support: PolicySupport | None = None
 
         repair_support = _maybe_prepare_repair_support(
@@ -1420,6 +1497,43 @@ def main():
                 include_gold=False,
             )
             chooser_support = ChooserSupport(
+                contexts=contexts,
+                heuristics=heuristics,
+                candidate_cfg=candidate_cfg,
+            )
+
+        if training_cfg.direct_safety.enabled and not args.reranker_predictions:
+            if args.use_chooser:
+                raise RuntimeError("Direct safety evaluation cannot be combined with chooser evaluation.")
+            if args.use_policy_choice:
+                raise RuntimeError("Direct safety evaluation cannot be combined with policy-choice evaluation.")
+            interim_base = Path("data/interim") / dataset_variant_name(
+                model_cfg.dataset_variant, model_cfg.min_occurrence
+            )
+            encoder_path = interim_base / "globalintencoder.txt"
+            if not encoder_path.exists():
+                raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
+            encoder = GlobalIntEncoder()
+            encoder.load(encoder_path)
+            encoder.freeze()
+            placeholder_ids = load_placeholder_ids(encoder_path)
+            heuristics = ConstraintRepairHeuristics(
+                encoder=encoder,
+                placeholder_ids=placeholder_ids,
+                none_class=NONE_CLASS_INDEX,
+            )
+            contexts = load_violation_contexts(interim_base, "test", none_class=NONE_CLASS_INDEX)
+            if len(contexts) != len(test_data):
+                raise RuntimeError("Mismatch between test graphs and violation contexts for direct safety evaluation.")
+            for idx, graph in enumerate(test_data):
+                if not hasattr(graph, "context_index"):
+                    setattr(graph, "context_index", idx)
+            candidate_cfg = CandidateConfig(
+                topk_candidates=training_cfg.direct_safety.topk_candidates,
+                max_candidates_total=training_cfg.direct_safety.max_candidates_total,
+                include_gold=False,
+            )
+            direct_safety_support = DirectSafetySupport(
                 contexts=contexts,
                 heuristics=heuristics,
                 candidate_cfg=candidate_cfg,
@@ -1518,6 +1632,7 @@ def main():
             precomputed_predictions=precomputed_predictions,
             write_per_constraint_csv=True if strict_global else (args.per_constraint_csv or global_metrics_enabled),
             chooser_support=chooser_support,
+            direct_safety_support=direct_safety_support,
             policy_support=policy_support,
             selection_weights=selection_weights,
             selection_disruption_field=args.score_disruption_field,

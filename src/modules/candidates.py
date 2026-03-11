@@ -242,3 +242,25 @@ def build_candidates(
     gold_index = deduped.index(gold)
 
     return deduped, gold_index
+
+
+def score_candidates_from_logits(
+    proposal_logits: torch.Tensor,
+    candidate_slots: torch.Tensor,
+) -> torch.Tensor:
+    """Score candidate edits by summing the corresponding per-slot proposal logits."""
+    if proposal_logits.dim() != 2 or proposal_logits.size(0) != NUM_SLOTS:
+        raise ValueError(
+            f"proposal_logits must be shaped ({NUM_SLOTS}, vocab), got {tuple(proposal_logits.shape)}"
+        )
+    if candidate_slots.dim() != 2 or candidate_slots.size(-1) != NUM_SLOTS:
+        raise ValueError(
+            f"candidate_slots must be shaped (num_candidates, {NUM_SLOTS}), got {tuple(candidate_slots.shape)}"
+        )
+    candidate_slots = candidate_slots.to(device=proposal_logits.device, dtype=torch.long)
+    if candidate_slots.numel() == 0:
+        return proposal_logits.new_zeros((0,))
+    if int(candidate_slots.min().item()) < 0 or int(candidate_slots.max().item()) >= proposal_logits.size(-1):
+        raise ValueError("candidate_slots contains out-of-range ids for proposal logits.")
+    gathered = proposal_logits.gather(1, candidate_slots.transpose(0, 1)).transpose(0, 1)
+    return gathered.sum(dim=-1)

@@ -21,6 +21,7 @@ from modules.data_encoders import (
     GraphStreamDataset,
     base_dataset_name,
     dataset_variant_name,
+    graph_dataset_filename,
     infer_node_feature_spec,
 )
 from modules.model_store import (
@@ -36,7 +37,7 @@ from modules.models import build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
 from modules.candidates import CandidateConfig, build_candidates
 from modules.reranker import CandidateReranker, RerankerConfig, build_reranker
-from modules.reranker_eval import CandidateConstraintEvaluator, _metrics_from_details
+from modules.reranker_eval import CandidateConstraintEvaluator
 from modules.training_utils import (
     load_graph_dataset,
     placeholder_ids_from_encoder,
@@ -548,13 +549,11 @@ def _run_epoch(
             log_probs = F.log_softmax(scores, dim=0)
             probs = log_probs.exp()
 
-            metrics = _evaluate_candidate_set(
-                evaluator,
+            metrics_summary = evaluator.evaluate_candidate_metrics(
                 row,
                 candidates=candidates,
-                primary_index=int(getattr(graph, "primary_factor_index", 0)),
+                primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
             )
-            metrics_summary = [_metrics_from_details(detail) for detail in metrics]
 
             primary_oracle = max(m.primary_satisfied for m in metrics_summary)
             global_oracle = max(m.global_satisfied_fraction for m in metrics_summary)
@@ -584,31 +583,8 @@ def _run_epoch(
                 loss = -expected_satisfaction
             else:
                 ce_loss = -log_probs[gold_index]
-                gold_details = metrics[gold_index]
-                gold_post = gold_details.get("post_satisfied", [])
-                gold_post_checkable = gold_details.get("post_checkable", [])
-                primary_idx = int(getattr(graph, "primary_factor_index", 0))
-                regression_rates: list[float] = []
-                for detail in metrics:
-                    post = detail.get("post_satisfied", [])
-                    post_checkable = detail.get("post_checkable", [])
-                    regress = 0
-                    denom = 0
-                    for idx in range(min(len(post), len(gold_post))):
-                        if idx == primary_idx:
-                            continue
-                        if idx >= len(post_checkable) or idx >= len(gold_post_checkable):
-                            continue
-                        if not post_checkable[idx] or not gold_post_checkable[idx]:
-                            continue
-                        if gold_post[idx]:
-                            denom += 1
-                            if not post[idx]:
-                                regress += 1
-                    rate = float(regress) / denom if denom else 0.0
-                    regression_rates.append(rate)
                 regression_tensor = torch.tensor(
-                    regression_rates, dtype=torch.float32, device=device
+                    [m.srr for m in metrics_summary], dtype=torch.float32, device=device
                 )
                 gold_regression = regression_tensor[gold_index]
                 reg_penalty = torch.sum(
@@ -667,8 +643,16 @@ def main() -> None:
     processed_root = Path("data") / "processed" / dataset_variant
     interim_path = Path("data") / "interim" / dataset_variant
 
-    train_path = processed_root / f"train_graph-{model_cfg.encoding}.pkl"
-    val_path = processed_root / f"val_graph-{model_cfg.encoding}.pkl"
+    train_path = processed_root / graph_dataset_filename(
+        "train",
+        model_cfg.encoding,
+        constraint_representation=model_cfg.constraint_representation,
+    )
+    val_path = processed_root / graph_dataset_filename(
+        "val",
+        model_cfg.encoding,
+        constraint_representation=model_cfg.constraint_representation,
+    )
 
     train_data = load_graph_dataset(train_path)
     val_data = load_graph_dataset(val_path)
@@ -887,7 +871,11 @@ def main() -> None:
         json.dump(history, fh, indent=2)
 
     # Generate reranker predictions for evaluation.
-    test_path = processed_root / f"test_graph-{model_cfg.encoding}.pkl"
+    test_path = processed_root / graph_dataset_filename(
+        "test",
+        model_cfg.encoding,
+        constraint_representation=model_cfg.constraint_representation,
+    )
     if test_path.exists():
         test_data = load_graph_dataset(test_path)
         if isinstance(test_data, GraphStreamDataset):

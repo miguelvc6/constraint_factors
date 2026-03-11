@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate a focused 5-config hyperparameter sweep for the MAIN model (Fix-1):
-- Proposal + Chooser(Fix-1) + Typed Pressure + Factor Loss
+Generate a focused 5-config hyperparameter sweep for the appendix-only chooser model:
+- ``M1C`` proposal + chooser(Fix-1) + typed pressure
 - Full dataset defaults: dataset_variant="full", min_occurrence=100
   (resolved to "full_minocc100")
 - Default encoding: "node_id"
 
 It writes configs under:
-  models/hp_m1_<tag>__full__<encoding>/config.json
+  models/hp_m1c_<tag>__full__<encoding>/config.json
 
 Run:
   python scripts/make_hparam_search_configs_m1.py \
@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 
-from modules.data_encoders import dataset_variant_name, discover_graph_artifacts
+from modules.data_encoders import dataset_variant_name, discover_graph_artifacts, graph_dataset_filename
 
 
 def _torch_load_trusted(path: Path) -> Any:
@@ -114,7 +114,7 @@ def main() -> None:
     encoding = args.encoding
     min_occ = int(args.min_occurrence)
 
-    train_graph = args.processed_root / variant / f"train_graph-{encoding}.pkl"
+    train_graph = args.processed_root / variant / graph_dataset_filename("train", encoding)
     artifacts = discover_graph_artifacts(train_graph)
     if not artifacts:
         raise FileNotFoundError(
@@ -149,7 +149,7 @@ def main() -> None:
 
     created = 0
     for hp in grid:
-        exp_name = f"hp_m1_{hp.tag}__{variant}__{encoding}"
+        exp_name = f"hp_m1c_{hp.tag}__{variant}__{encoding}"
         exp_dir = args.models_root / exp_name
         cfg_path = exp_dir / "config.json"
 
@@ -210,8 +210,8 @@ def main() -> None:
             # If your loader is strict, delete the "meta" block.
             "meta": {
                 "seed": args.seed,
-                "family": "hp_search_m1_fix1",
-                "note": "Main model sweep on full dataset (proposal+chooser+typed pressure).",
+                "family": "hp_search_m1c_appendix",
+                "note": "Appendix sweep for chooser-based safe-factor model (M1C).",
             },
         }
 

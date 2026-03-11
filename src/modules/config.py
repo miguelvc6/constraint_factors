@@ -273,6 +273,47 @@ class ChooserConfig:
 
 
 @dataclass
+class DirectSafetyConfig:
+    enabled: bool = False
+    alpha_primary: float = 1.0
+    beta_secondary: float = 0.5
+    topk_candidates: int = 20
+    max_candidates_total: int = 80
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "DirectSafetyConfig":
+        instance = cls()
+        return instance.updated(data or {})
+
+    def updated(self, data: Mapping[str, Any] | None = None, **overrides: Any) -> "DirectSafetyConfig":
+        payload = dict(data or {})
+        payload.update(overrides)
+        filtered = _filter_fields(type(self), payload)
+
+        if "enabled" in filtered and filtered["enabled"] is not None:
+            filtered["enabled"] = bool(filtered["enabled"])
+        for key in ("alpha_primary", "beta_secondary"):
+            if key in filtered and filtered[key] is not None:
+                filtered[key] = float(filtered[key])
+        for key in ("topk_candidates", "max_candidates_total"):
+            if key in filtered and filtered[key] is not None:
+                filtered[key] = int(filtered[key])
+
+        current = {f.name: getattr(self, f.name) for f in fields(type(self))}
+        current.update(filtered)
+        return type(self)(**current)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "alpha_primary": self.alpha_primary,
+            "beta_secondary": self.beta_secondary,
+            "topk_candidates": self.topk_candidates,
+            "max_candidates_total": self.max_candidates_total,
+        }
+
+
+@dataclass
 class ModelConfig:
     dataset_variant: str = "full" 
     """Which intermediate dataset variant to consume."""
@@ -322,6 +363,8 @@ class ModelConfig:
     """Enable policy choice head over graph embeddings."""
     policy_num_classes: int = 6
     """Number of policy classes for policy choice head."""
+    constraint_representation: str = "factorized"
+    """Graph representation regime: factorized or eswc_passive."""
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ModelConfig":
@@ -371,6 +414,13 @@ class ModelConfig:
             filtered["enable_policy_choice"] = bool(filtered["enable_policy_choice"])
         if "policy_num_classes" in filtered and filtered["policy_num_classes"] is not None:
             filtered["policy_num_classes"] = int(filtered["policy_num_classes"])
+        if "constraint_representation" in filtered and filtered["constraint_representation"] is not None:
+            value = str(filtered["constraint_representation"]).lower()
+            if value not in {"factorized", "eswc_passive"}:
+                raise ValueError(
+                    "constraint_representation must be 'factorized' or 'eswc_passive'"
+                )
+            filtered["constraint_representation"] = value
 
         if filtered.get("enable_policy_choice") and "policy_num_classes" in filtered:
             if int(filtered["policy_num_classes"]) < 6:
@@ -401,6 +451,7 @@ class TrainingConfig:
     fix_probability_loss: FixProbabilityLossConfig = field(default_factory=FixProbabilityLossConfig)
     factor_loss: FactorLossConfig = field(default_factory=FactorLossConfig)
     chooser: ChooserConfig = field(default_factory=ChooserConfig)
+    direct_safety: DirectSafetyConfig = field(default_factory=DirectSafetyConfig)
     policy_filter_strict: bool = True
 
     @classmethod
@@ -425,6 +476,7 @@ class TrainingConfig:
         fix_loss_update = filtered.pop("fix_probability_loss", None)
         factor_loss_update = filtered.pop("factor_loss", None)
         chooser_update = filtered.pop("chooser", None)
+        direct_safety_update = filtered.pop("direct_safety", None)
         if "policy_filter_strict" in filtered and filtered["policy_filter_strict"] is not None:
             filtered["policy_filter_strict"] = bool(filtered["policy_filter_strict"])
 
@@ -465,6 +517,11 @@ class TrainingConfig:
                 current["chooser"] = chooser_update
             else:
                 current["chooser"] = self.chooser.updated(chooser_update)
+        if direct_safety_update is not None:
+            if isinstance(direct_safety_update, DirectSafetyConfig):
+                current["direct_safety"] = direct_safety_update
+            else:
+                current["direct_safety"] = self.direct_safety.updated(direct_safety_update)
 
         return type(self)(**current)
 
@@ -474,6 +531,7 @@ class TrainingConfig:
         payload["fix_probability_loss"] = self.fix_probability_loss.to_dict()
         payload["factor_loss"] = self.factor_loss.to_dict()
         payload["chooser"] = self.chooser.to_dict()
+        payload["direct_safety"] = self.direct_safety.to_dict()
         payload["policy_filter_strict"] = self.policy_filter_strict
         return payload
 
@@ -486,4 +544,5 @@ __all__ = [
     "FixProbabilityLossConfig",
     "FactorLossConfig",
     "ChooserConfig",
+    "DirectSafetyConfig",
 ]

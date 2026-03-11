@@ -1304,6 +1304,20 @@ class CandidateConstraintEvaluator:
 
         return results
 
+    def evaluate_candidate_metrics(
+        self,
+        row: Any,
+        *,
+        candidates: Sequence[Sequence[int]],
+        primary_factor_index: int | None = None,
+    ) -> List[CandidateMetrics]:
+        details = self.evaluate_candidates(
+            row,
+            candidates=candidates,
+            primary_factor_index=primary_factor_index,
+        )
+        return [_metrics_from_details(detail) for detail in details]
+
 
 def _metrics_from_details(details: Dict[str, Any]) -> CandidateMetrics:
     return CandidateMetrics(

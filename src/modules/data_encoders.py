@@ -190,6 +190,24 @@ def base_dataset_name(dataset: str) -> str:
     return dataset
 
 
+def graph_dataset_filename(
+    split: str,
+    encoding: str,
+    *,
+    constraint_representation: str = "factorized",
+) -> str:
+    """Return the persisted graph filename for the given split/encoding/representation."""
+    representation = str(constraint_representation).lower()
+    if representation == "factorized":
+        return f"{split}_graph-{encoding}.pkl"
+    if representation == "eswc_passive":
+        return f"{split}_graph_repr-eswc_passive-{encoding}.pkl"
+    raise ValueError(
+        "constraint_representation must be 'factorized' or 'eswc_passive', "
+        f"got {constraint_representation!r}"
+    )
+
+
 def discover_min_occurrence(dataset: str) -> int:
     """Auto-detect the lowest *min_occurrence* for the given *dataset*."""
     interim_root = Path("data/interim")

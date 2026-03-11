@@ -30,7 +30,12 @@ def sanitize_fragment(name: str | Path | None, fallback: str = DEFAULT_CONFIG_TA
 
 def config_tag_from_path(path: Path | None) -> str:
     """Derive a config tag from a given path."""
-    return sanitize_fragment(path, fallback=DEFAULT_CONFIG_TAG)
+    if path is None:
+        return DEFAULT_CONFIG_TAG
+    candidate = Path(path)
+    if candidate.name == CONFIG_FILE_NAME and candidate.parent.name:
+        return sanitize_fragment(candidate.parent.name, fallback=DEFAULT_CONFIG_TAG)
+    return sanitize_fragment(candidate, fallback=DEFAULT_CONFIG_TAG)
 
 
 def run_slug(dataset_variant: str, encoding: str, model_name: str, config_tag: str | None = None) -> str:
