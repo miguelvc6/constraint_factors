@@ -124,6 +124,13 @@ PYTHONPATH=src .venv/bin/python src/06_graph.py \
   --constraint-representation factorized
 ```
 
+If monolithic graph writes run out of memory, add:
+
+```bash
+  --shard-size 200000 \
+  --use-torch-save
+```
+
 For `text_embedding`:
 
 ```bash
@@ -135,6 +142,8 @@ PYTHONPATH=src .venv/bin/python src/06_graph.py \
   --constraint-representation factorized
 ```
 
+The training, reranker, config-generation, and evaluation paths ingest these shard artifacts transparently.
+
 **Build passive ESWC-style graphs**
 
 For `node_id`:
@@ -145,6 +154,13 @@ PYTHONPATH=src .venv/bin/python src/06_graph.py \
   --min-occurrence 100 \
   --encoding node_id \
   --constraint-representation eswc_passive
+```
+
+The same optional shard flags may be used here if needed:
+
+```bash
+  --shard-size 200000 \
+  --use-torch-save
 ```
 
 For `text_embedding`:

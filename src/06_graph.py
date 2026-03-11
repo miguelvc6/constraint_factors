@@ -543,9 +543,7 @@ def create_graph(
             else:
                 expected_ids = []
             if expected_ids and expected_ids != factor_ids:
-                raise AssertionError(
-                    "Factor constraint id order mismatch between labeled data and graph builder."
-                )
+                raise AssertionError("Factor constraint id order mismatch between labeled data and graph builder.")
         if not factor_ids:
             factor_ids = [int(graph["constraint_id"])]
     else:
@@ -579,9 +577,7 @@ def create_graph(
 
         factor_ids_from_row = _normalize_factor_list(graph.get("factor_constraint_ids"), "factor_constraint_ids")
         if factor_ids_from_row and [int(cid) for cid in factor_ids_from_row] != factor_ids:
-            raise AssertionError(
-                "Factor constraint id order mismatch between labeled data and graph builder."
-            )
+            raise AssertionError("Factor constraint id order mismatch between labeled data and graph builder.")
 
         factor_checkable_pre_tensor = torch.tensor(
             _normalize_factor_list(graph.get("factor_checkable_pre"), "factor_checkable_pre"),
@@ -1262,8 +1258,7 @@ def _log_free_space_estimate(
     estimated_remaining_bytes = int(avg_shard_bytes * estimated_remaining_shards)
     free_bytes = shutil.disk_usage(processed_path).free
     logging.info(
-        "Disk estimate for %s: remaining_rows=%s estimated_remaining_shards=%s "
-        "estimated_bytes=%.2f GB free=%.2f GB",
+        "Disk estimate for %s: remaining_rows=%s estimated_remaining_shards=%s estimated_bytes=%.2f GB free=%.2f GB",
         split,
         remaining_rows,
         estimated_remaining_shards,

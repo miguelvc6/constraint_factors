@@ -12,6 +12,7 @@ from typing import Any, Iterable, Sequence
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
@@ -21,6 +22,7 @@ from modules.data_encoders import (
     GraphStreamDataset,
     base_dataset_name,
     dataset_variant_name,
+    discover_graph_artifacts,
     graph_dataset_filename,
     infer_node_feature_spec,
 )
@@ -433,6 +435,26 @@ def _aggregate_epoch_metrics(records: list[dict[str, float]]) -> dict[str, float
     return {key: total / len(records) for key, total in totals.items()}
 
 
+def _manifest_graph_count(graph_path: Path) -> int | None:
+    manifest_path = graph_path.with_suffix(graph_path.suffix + ".manifest.json")
+    if not manifest_path.exists():
+        return None
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        logger.exception("Failed to read graph manifest at %s", manifest_path)
+        return None
+    graph_count = payload.get("graph_count")
+    return int(graph_count) if isinstance(graph_count, int) else None
+
+
+def _dataset_graph_count(dataset: Sequence[Data] | GraphStreamDataset, graph_path: Path) -> int | None:
+    if isinstance(dataset, list):
+        return len(dataset)
+    return _manifest_graph_count(graph_path)
+
+
 def _candidate_to_slots(candidate: Sequence[int]) -> tuple[int, int, int, int, int, int]:
     if len(candidate) != NUM_SLOTS:
         raise ValueError("Candidate must have 6 slots.")
@@ -450,7 +472,7 @@ def _predict_reranker_edits(
     *,
     model: CandidateReranker,
     proposal_model: nn.Module,
-    data: Sequence[Data],
+    data: Sequence[Data] | GraphStreamDataset,
     contexts: Sequence[ViolationContext],
     rows: Sequence[Any],
     heuristics: ConstraintRepairHeuristics,
@@ -519,6 +541,7 @@ def _run_epoch(
 
     epoch_loss = 0.0
     epoch_records: list[dict[str, float]] = []
+    batch_steps = 0
 
     for batch in progress_bar(loader, desc="train" if is_train else "val"):
         batch = batch.to(device)
@@ -607,8 +630,9 @@ def _run_epoch(
             optimizer.step()
 
         epoch_loss += float(batch_loss.item())
+        batch_steps += 1
 
-    avg_loss = epoch_loss / max(len(loader), 1)
+    avg_loss = epoch_loss / max(batch_steps, 1)
     metrics = _aggregate_epoch_metrics(epoch_records)
     return avg_loss, metrics
 
@@ -656,14 +680,8 @@ def main() -> None:
 
     train_data = load_graph_dataset(train_path)
     val_data = load_graph_dataset(val_path)
-    if isinstance(train_data, GraphStreamDataset):
-        logger.info("Materializing training stream dataset into memory for reranker training.")
-        train_data = list(train_data)
-    if isinstance(val_data, GraphStreamDataset):
-        logger.info("Materializing validation stream dataset into memory for reranker training.")
-        val_data = list(val_data)
-    if not isinstance(train_data, list) or not isinstance(val_data, list):
-        raise RuntimeError("Reranker training requires in-memory datasets (list[Data]).")
+    train_graph_count = _dataset_graph_count(train_data, train_path)
+    val_graph_count = _dataset_graph_count(val_data, val_path)
 
     encoder = _load_encoder(interim_path)
     placeholder_ids = placeholder_ids_from_encoder(encoder)
@@ -675,18 +693,28 @@ def main() -> None:
 
     train_contexts = load_violation_contexts(interim_path, "train", none_class=NONE_CLASS_INDEX)
     val_contexts = load_violation_contexts(interim_path, "val", none_class=NONE_CLASS_INDEX)
-    if len(train_contexts) != len(train_data) or len(val_contexts) != len(val_data):
-        raise RuntimeError("Mismatch between graph dataset size and violation contexts.")
+    if train_graph_count is not None and len(train_contexts) != train_graph_count:
+        raise RuntimeError("Mismatch between train graph dataset size and violation contexts.")
+    if val_graph_count is not None and len(val_contexts) != val_graph_count:
+        raise RuntimeError("Mismatch between validation graph dataset size and violation contexts.")
 
-    for idx, graph in enumerate(train_data):
-        setattr(graph, "context_index", idx)
-    for idx, graph in enumerate(val_data):
-        setattr(graph, "context_index", idx)
+    if isinstance(train_data, list):
+        for idx, graph in enumerate(train_data):
+            setattr(graph, "context_index", idx)
+    else:
+        logger.info("Using streamed training graphs for reranker training.")
+    if isinstance(val_data, list):
+        for idx, graph in enumerate(val_data):
+            setattr(graph, "context_index", idx)
+    else:
+        logger.info("Using streamed validation graphs for reranker training.")
 
     train_rows = _load_parquet_rows(interim_path, "train")
     val_rows = _load_parquet_rows(interim_path, "val")
-    if len(train_rows) != len(train_data) or len(val_rows) != len(val_data):
-        raise RuntimeError("Mismatch between parquet rows and graph dataset size.")
+    if train_graph_count is not None and len(train_rows) != train_graph_count:
+        raise RuntimeError("Mismatch between parquet rows and train graph dataset size.")
+    if val_graph_count is not None and len(val_rows) != val_graph_count:
+        raise RuntimeError("Mismatch between parquet rows and validation graph dataset size.")
 
     registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
     if not registry_path.exists():
@@ -760,7 +788,7 @@ def main() -> None:
     train_loader = DataLoader(
         train_data,
         batch_size=training_cfg.batch_size,
-        shuffle=True,
+        shuffle=(not isinstance(train_data, IterableDataset)),
         num_workers=training_cfg.num_workers,
         pin_memory=training_cfg.pin_memory,
     )
@@ -876,58 +904,56 @@ def main() -> None:
         model_cfg.encoding,
         constraint_representation=model_cfg.constraint_representation,
     )
-    if test_path.exists():
+    if discover_graph_artifacts(test_path):
         test_data = load_graph_dataset(test_path)
-        if isinstance(test_data, GraphStreamDataset):
-            logger.info("Materializing test stream dataset into memory for reranker predictions.")
-            test_data = list(test_data)
-        if isinstance(test_data, list):
-            test_contexts = load_violation_contexts(interim_path, "test", none_class=NONE_CLASS_INDEX)
-            if len(test_contexts) == len(test_data):
+        test_graph_count = _dataset_graph_count(test_data, test_path)
+        test_contexts = load_violation_contexts(interim_path, "test", none_class=NONE_CLASS_INDEX)
+        if test_graph_count is None or len(test_contexts) == test_graph_count:
+            if isinstance(test_data, list):
                 for idx, graph in enumerate(test_data):
                     setattr(graph, "context_index", idx)
-                test_rows = _load_parquet_rows(interim_path, "test")
-                if len(test_rows) == len(test_data):
-                    checkpoint = torch.load(get_checkpoint_path(run_dir), map_location=device)
-                    state_dict = checkpoint.get("model_state")
-                    if state_dict is not None:
-                        try:
-                            model.load_state_dict(state_dict)
-                        except RuntimeError as exc:
-                            if args.predict_only:
-                                graph_model_cfg = _derive_graph_model_cfg_from_state_dict(
-                                    state_dict,
-                                    model_cfg=model_cfg,
-                                    proposal_cfg=proposal_cfg,
-                                )
-                                model = build_reranker(
-                                    num_input_graph_nodes=num_input_graph_nodes,
-                                    model_cfg=graph_model_cfg,
-                                    reranker_cfg=reranker_cfg,
-                                )
-                                model.load_state_dict(state_dict, strict=False)
-                            else:
-                                raise
-                        model.to(device)
-                    predictions = _predict_reranker_edits(
-                        model=model,
-                        proposal_model=proposal_model,
-                        data=test_data,
-                        contexts=test_contexts,
-                        rows=test_rows,
-                        heuristics=heuristics,
-                        evaluator=evaluator,
-                        device=device,
-                        cfg=training_cfg,
-                    )
-                    pred_path = run_dir / "reranker_predictions.json"
-                    with pred_path.open("w", encoding="utf-8") as fh:
-                        json.dump(predictions, fh, indent=2)
-                    logger.info("Saved reranker predictions to %s", pred_path)
-                else:
-                    logger.warning("Skipping reranker predictions: test rows mismatch.")
+            test_rows = _load_parquet_rows(interim_path, "test")
+            if test_graph_count is None or len(test_rows) == test_graph_count:
+                checkpoint = torch.load(get_checkpoint_path(run_dir), map_location=device)
+                state_dict = checkpoint.get("model_state")
+                if state_dict is not None:
+                    try:
+                        model.load_state_dict(state_dict)
+                    except RuntimeError as exc:
+                        if args.predict_only:
+                            graph_model_cfg = _derive_graph_model_cfg_from_state_dict(
+                                state_dict,
+                                model_cfg=model_cfg,
+                                proposal_cfg=proposal_cfg,
+                            )
+                            model = build_reranker(
+                                num_input_graph_nodes=num_input_graph_nodes,
+                                model_cfg=graph_model_cfg,
+                                reranker_cfg=reranker_cfg,
+                            )
+                            model.load_state_dict(state_dict, strict=False)
+                        else:
+                            raise
+                    model.to(device)
+                predictions = _predict_reranker_edits(
+                    model=model,
+                    proposal_model=proposal_model,
+                    data=test_data,
+                    contexts=test_contexts,
+                    rows=test_rows,
+                    heuristics=heuristics,
+                    evaluator=evaluator,
+                    device=device,
+                    cfg=training_cfg,
+                )
+                pred_path = run_dir / "reranker_predictions.json"
+                with pred_path.open("w", encoding="utf-8") as fh:
+                    json.dump(predictions, fh, indent=2)
+                logger.info("Saved reranker predictions to %s", pred_path)
             else:
-                logger.warning("Skipping reranker predictions: test contexts mismatch.")
+                logger.warning("Skipping reranker predictions: test rows mismatch.")
+        else:
+            logger.warning("Skipping reranker predictions: test contexts mismatch.")
     else:
         logger.warning("Skipping reranker predictions: test split not found at %s", test_path)
 

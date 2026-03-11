@@ -12,6 +12,10 @@ For the paper-facing run, use:
 
 `focus` scope remains supported as a non-paper exploratory option.
 
+When graph materialization runs out of memory, the paper pipeline can use sharded outputs, e.g.
+`--shard-size 200000 --use-torch-save`. The downstream proposal training, reranker training,
+config generators, and evaluation scripts all accept shard-only graph artifacts.
+
 ## Inputs & Outputs
 - **Inputs:** Interim parquet splits from `data/interim/<variant>/` or, when present, `data/interim/<variant>_labeled/` (unless `--use-unlabeled-interim` is passed), `globalintencoder.txt`, the constraint registry (`data/interim/constraint_registry_{dataset}.parquet`), the Wikidata cache (`data/interim/wikidata_text.parquet`), and CLI flags controlling encoding/sharding options.
 - **Outputs:** Graph artifacts in `data/processed/<variant>/` (`{split}_graph-<encoding>.pkl` for factorized runs, `{split}_graph_repr-eswc_passive-<encoding>.pkl` for passive runs, plus sharded `.pt/.pkl` variants), per-split manifests, `target_vocabs.json`, plus optional visualisations like `graph_visualization.png`.

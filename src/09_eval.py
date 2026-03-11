@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Evaluate a trained graph model or run baselines stored under ``models/``.
 
-Trained model evaluations load graphs from ``data/processed/<variant>/test_graph-<encoding>.pkl``
-based on the settings stored alongside the run directory (same structure as ``04_train.py``).
+Trained model evaluations load graphs from ``data/processed/<variant>/`` using either
+the monolithic graph artifact or matching shard files (``-shardNNN.pkl`` / ``-shardNNN.pt``)
+based on the settings stored alongside the run directory.
 Baseline evaluations operate on the lighter parquet splits in ``data/interim/<variant>/`` to
-avoid materialising heavyweight pickle files in memory.
+avoid materialising heavyweight graph artifacts in memory.
 
 Usage
 -----
@@ -36,6 +37,7 @@ from modules.candidates import CandidateConfig, build_candidates, score_candidat
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import (
     GlobalIntEncoder,
+    GraphStreamDataset,
     base_dataset_name,
     dataset_variant_name,
     discover_graph_artifacts,
@@ -53,6 +55,7 @@ from modules.repair_eval import (
     load_violation_contexts,
 )
 from modules.reranker_eval import CandidateConstraintEvaluator
+from modules.training_utils import load_graph_dataset
 from modules.policy import (
     POLICY_NAMES,
     PolicyDecision,
@@ -483,7 +486,7 @@ def _metrics_from_counts(counts: TripleCounts) -> dict[str, float]:
 @torch.no_grad()
 def eval(
     model: BaseGraphModel | None,
-    test_data: list[Data],
+    test_data,
     batch_size: int = 16,
     device: torch.device | str = torch.device("cpu"),
     none_class: int = NONE_CLASS_INDEX,
@@ -499,7 +502,7 @@ def eval(
 
     test_loader = DataLoader(test_data, batch_size=batch_size)
 
-    kinds: list[str] = [(getattr(d, "constraint_type", None) or "UNKNOWN") for d in test_data]
+    kinds: list[str] = []
 
     if precomputed_predictions is None and model is None:
         raise ValueError("Either a model or precomputed_predictions must be provided.")
@@ -516,6 +519,8 @@ def eval(
     predictions, targets = [], []
     output_logged = False
     for data in tqdm(test_loader, desc="Test Batches"):
+        batch_graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
+        kinds.extend((getattr(graph, "constraint_type", None) or "UNKNOWN") for graph in batch_graphs)
         if precomputed_predictions is None:
             data = data.to(device)
             out = model(data)  # raw logits expected
@@ -835,49 +840,14 @@ def load_split(
     split: str,
     *,
     constraint_representation: str = "factorized",
-) -> list[Data]:
+) -> list[Data] | GraphStreamDataset:
     """Load a dataset split saved as a monolithic file or shard collection."""
     path = base_path / graph_dataset_filename(
         split,
         encoding,
         constraint_representation=constraint_representation,
     )
-    artifacts = discover_graph_artifacts(path)
-    if not artifacts:
-        raise FileNotFoundError(f"Missing dataset split at {path} and no matching shards ({path.stem}-shard*).")
-
-    if len(artifacts) > 1 or artifacts[0].format != "stream":
-        graphs: list[Data] = []
-        for artifact in artifacts:
-            if artifact.path.suffix == ".pt":
-                shard_objects = _torch_load_trusted(artifact.path)
-            else:
-                with artifact.path.open("rb") as f:
-                    shard_objects = pickle.load(f)
-            if not isinstance(shard_objects, list):
-                raise TypeError(
-                    f"Unsupported shard payload type {type(shard_objects)!r} in {artifact.path}; expected list[Data]."
-                )
-            graphs.extend(shard_objects)
-        return graphs
-
-    with path.open("rb") as f:
-        first_object = pickle.load(f)
-
-        if isinstance(first_object, list):
-            return first_object
-        if isinstance(first_object, Data):
-            graphs: list[Data] = [first_object]
-            while True:
-                try:
-                    graphs.append(pickle.load(f))
-                except EOFError:
-                    break
-            return graphs
-
-    raise TypeError(
-        "Unsupported dataset format encountered. Expected a list of Data objects or a pickled Data stream."
-    )
+    return load_graph_dataset(path)
 
 
 def _safe_constraint_type(value: object) -> str:
@@ -889,13 +859,44 @@ def _safe_constraint_type(value: object) -> str:
     return str(value)
 
 
-def _data_has_factor_fields(test_data: Sequence[Data]) -> bool:
-    if not test_data:
+def _peek_graph(dataset) -> Data | None:
+    if isinstance(dataset, list):
+        return dataset[0] if dataset else None
+    iterator = iter(dataset)
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
+
+
+def _data_has_factor_fields(test_data) -> bool:
+    sample = _peek_graph(test_data)
+    if sample is None:
         return False
-    sample = test_data[0]
     has_ids = hasattr(sample, "factor_constraint_ids")
     has_labels = hasattr(sample, "factor_satisfied_pre") or hasattr(sample, "factor_checkable_pre")
     return has_ids and has_labels
+
+
+def _dataset_graph_count(dataset, graph_path: Path) -> int | None:
+    try:
+        return len(dataset)
+    except TypeError:
+        manifest_path = graph_path.with_suffix(graph_path.suffix + ".manifest.json")
+        if not manifest_path.exists():
+            return None
+        try:
+            with manifest_path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            logging.exception("Failed to read graph manifest at %s", manifest_path)
+            return None
+        graph_count = payload.get("graph_count")
+        return int(graph_count) if isinstance(graph_count, int) else None
 
 
 def _infer_config_tag_from_run_dir(run_directory: Path) -> str:
@@ -1091,16 +1092,21 @@ def _write_per_constraint_csv(metrics: dict[str, object], output_dir: Path) -> N
 
 def _smoke_check_global_metrics(
     support: GlobalMetricsSupport,
-    test_data: Sequence[Data],
+    test_data,
     *,
     none_class: int,
 ) -> None:
-    sample_count = min(3, len(test_data), len(support.rows))
+    sample_graphs: list[Data] = []
+    for idx, graph in enumerate(test_data):
+        if idx >= 3 or idx >= len(support.rows):
+            break
+        sample_graphs.append(graph)
+    sample_count = len(sample_graphs)
     if sample_count == 0:
         logging.info("Skipping global metrics smoke check (no samples).")
         return
-    preds = torch.cat([test_data[i].y for i in range(sample_count)], dim=0)
-    kinds = [(getattr(test_data[i], "constraint_type", None) or "UNKNOWN") for i in range(sample_count)]
+    preds = torch.cat([graph.y for graph in sample_graphs], dim=0)
+    kinds = [(getattr(graph, "constraint_type", None) or "UNKNOWN") for graph in sample_graphs]
     samples = _repair_samples_from_predictions(preds, preds, kinds, none_class)
     evaluate_global_repair_samples(
         samples=samples,
@@ -1228,7 +1234,7 @@ def evaluate_trained_model(
     run_directory: Path,
     model_cfg: ModelConfig,
     device: torch.device,
-    test_data: list[Data],
+    test_data,
     postprocess: Callable[[torch.Tensor, torch.Tensor, list[str]], None] | None = None,
     postprocess_state: dict[str, object] | None = None,
     precomputed_predictions: torch.Tensor | None = None,
@@ -1482,12 +1488,18 @@ def main():
 
         variant = dataset_variant_name(model_cfg.dataset_variant, model_cfg.min_occurrence)
         base_path = Path("data/processed") / variant
+        test_graph_path = base_path / graph_dataset_filename(
+            "test",
+            model_cfg.encoding,
+            constraint_representation=model_cfg.constraint_representation,
+        )
         test_data = load_split(
             base_path,
             model_cfg.encoding,
             "test",
             constraint_representation=model_cfg.constraint_representation,
         )
+        test_graph_count = _dataset_graph_count(test_data, test_graph_path)
 
         postprocess_fns: list[Callable[[torch.Tensor, torch.Tensor, list[str]], None]] = []
         postprocess_states: list[dict[str, object]] = []
@@ -1525,10 +1537,11 @@ def main():
                 none_class=NONE_CLASS_INDEX,
             )
             contexts = load_violation_contexts(interim_base, "test", none_class=NONE_CLASS_INDEX)
-            if len(contexts) != len(test_data):
+            if test_graph_count is not None and len(contexts) != test_graph_count:
                 raise RuntimeError("Mismatch between test graphs and violation contexts for chooser evaluation.")
-            for idx, graph in enumerate(test_data):
-                setattr(graph, "context_index", idx)
+            if isinstance(test_data, list):
+                for idx, graph in enumerate(test_data):
+                    setattr(graph, "context_index", idx)
             candidate_cfg = CandidateConfig(
                 topk_candidates=training_cfg.chooser.topk_candidates,
                 max_candidates_total=training_cfg.chooser.max_candidates_total,
@@ -1561,11 +1574,12 @@ def main():
                 none_class=NONE_CLASS_INDEX,
             )
             contexts = load_violation_contexts(interim_base, "test", none_class=NONE_CLASS_INDEX)
-            if len(contexts) != len(test_data):
+            if test_graph_count is not None and len(contexts) != test_graph_count:
                 raise RuntimeError("Mismatch between test graphs and violation contexts for direct safety evaluation.")
-            for idx, graph in enumerate(test_data):
-                if not hasattr(graph, "context_index"):
-                    setattr(graph, "context_index", idx)
+            if isinstance(test_data, list):
+                for idx, graph in enumerate(test_data):
+                    if not hasattr(graph, "context_index"):
+                        setattr(graph, "context_index", idx)
             candidate_cfg = CandidateConfig(
                 topk_candidates=training_cfg.direct_safety.topk_candidates,
                 max_candidates_total=training_cfg.direct_safety.max_candidates_total,
@@ -1598,10 +1612,11 @@ def main():
                 none_class=NONE_CLASS_INDEX,
             )
             contexts = load_violation_contexts(interim_base, "test", none_class=NONE_CLASS_INDEX)
-            if len(contexts) != len(test_data):
+            if test_graph_count is not None and len(contexts) != test_graph_count:
                 raise RuntimeError("Mismatch between test graphs and violation contexts for policy choice.")
-            for idx, graph in enumerate(test_data):
-                setattr(graph, "context_index", idx)
+            if isinstance(test_data, list):
+                for idx, graph in enumerate(test_data):
+                    setattr(graph, "context_index", idx)
             candidate_cfg = CandidateConfig(include_gold=False)
             policy_support = PolicySupport(
                 contexts=contexts,
