@@ -1,0 +1,334 @@
+# Training and Evaluation Execution Plan
+
+Date: 2026-03-11
+
+This document defines the recommended execution order for training and evaluating the baselines and learned models in [docs/00_models_and_evaluation_matrix.md](/home/mvazquez/constraint_factors/docs/00_models_and_evaluation_matrix.md).
+
+The plan is optimized for:
+
+- paper-facing reproducibility
+- short hyperparameter search
+- minimal wasted long-running training
+- one consistent dataset/encoding/backbone policy
+
+## 1. Fixed run policy
+
+Before running anything, freeze these decisions for the entire paper run:
+
+- dataset variant: one paper dataset only, typically `full`
+- `min_occurrence`: one value only, typically `100`
+- encoding: one paper encoding only
+- proposal random seed: `42`
+- reranker random seed: `42`
+
+Reproducibility notes:
+
+- `src/07_train.py` currently hardcodes `set_seed(42)`, so all proposal runs are already locked to seed `42`.
+- `src/08_train_reranker.py` accepts `--seed`; use `--seed 42` for all reranker runs.
+- heuristic baselines are deterministic.
+- do not mix encodings or dataset variants inside the same paper table.
+- do not edit configs once training starts; generate configs once, then only make one explicit “locked” hyperparameter update after the short search.
+
+Recommended run ledger:
+
+- record `git rev-parse HEAD`
+- keep the generated config JSONs under `models/`
+- keep scheduler logs under `logs/`
+
+## 2. Overall execution order
+
+Run in this order:
+
+1. Generate the canonical paper configs.
+2. Run heuristic baselines first.
+3. Run a brief `M1C` hyperparameter search only.
+4. Select one winning `M1C` configuration.
+5. Propagate the winning backbone/optimizer settings to `B0`, `A1`, `M1C`, and `M1D`.
+6. Train and evaluate the canonical learned suite in order:
+   - `B0`
+   - `A1`
+   - final `M1C`
+   - `M1D`
+   - `G0`
+7. Freeze tables and figures from those final runs only.
+
+This order avoids spending time on secondary model families before the main model has a stable configuration.
+
+## 3. Step-by-step plan
+
+### Step 0. Generate canonical configs
+
+Use the canonical paper config generator:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/make_experiment_configs.py --models-root models
+```
+
+This emits only:
+
+- `b0_eswc_reproduction`
+- `a1_factorized_imitation`
+- `m1c_safe_factor_chooser`
+- `m1d_safe_factor_direct`
+- `g0_globalfix_reference`
+
+If appendix runs are needed later, generate them separately with `--include-experimental`.
+
+### Step 1. Run heuristic baselines first
+
+Run baselines before any neural training so the paper already has stable reference numbers:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/09_eval.py \
+  --run-baselines \
+  --dataset full \
+  --min-occurrence 100 \
+  --strict-global-metrics \
+  --per-constraint-csv
+```
+
+Outputs are written under:
+
+- `models/baselines/full/parquet/`
+
+This gives the reference results for:
+
+- `DFB`
+- `AMB`
+- `CSM`
+
+If `AMB` is not used in the final main table, keep it as appendix support.
+
+### Step 2. Run a brief `M1C` hyperparameter search
+
+Search only on the paper’s main practical model: `M1C`.
+
+Reason:
+
+- `M1C` is the main paper model.
+- `A1` and `M1D` should inherit its backbone/optimizer settings.
+- `B0` should reuse the same training schedule where possible, but not get its own expensive search.
+- `G0` should not trigger a separate reranker search in phase 1.
+
+Generate the short search set:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/make_hparam_search_configs_m1.py \
+  --processed-root data/processed \
+  --models-root models \
+  --dataset-variant full \
+  --min-occurrence 100 \
+  --encoding <paper_encoding> \
+  --num-configs 5 \
+  --seed 42
+```
+
+Recommended search budget:
+
+- default: `5` configs max
+- if compute is very tight: rerun with `--num-configs 3`
+- one seed only
+- no repeated sweeps
+
+Run the short search with the scheduler:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/10_scheduler.py \
+  --only hp_m1c_ \
+  --paper-suite \
+  --keep-going
+```
+
+Why this is acceptable even if training is long:
+
+- the search is capped at a very small number of configs
+- early stopping is enabled in the generated configs
+- evaluation is automatic and strict
+
+### Step 3. Select one winning `M1C` config
+
+Choose the winner using the evaluation JSONs from the search runs.
+
+Primary selection criteria:
+
+1. primary-fix behavior
+2. lower `SRR`
+3. higher `GFR`
+4. fidelity as a tie-breaker
+5. lower disruption as final tie-breaker
+
+Practical rule:
+
+- use the `model_selection` block in each `evaluations/model.json` as a quick ranking aid
+- do not accept a config that improves fidelity by noticeably worsening `SRR`
+
+Search outputs to inspect:
+
+- `models/hp_m1c_*/evaluations/model.json`
+- `models/hp_m1c_*/evaluations/per_constraint.csv`
+
+### Step 4. Lock the paper hyperparameters
+
+Once one `M1C` run wins, copy these settings into the canonical proposal configs:
+
+- `num_layers`
+- `hidden_channels`
+- `head_hidden`
+- `dropout`
+- `learning_rate`
+- `weight_decay`
+- `batch_size`
+- `scheduler_factor`
+- `scheduler_patience`
+- `early_stopping_rounds`
+
+Apply them to:
+
+- `a1_factorized_imitation`
+- `m1c_safe_factor_chooser`
+- `m1d_safe_factor_direct`
+
+Reuse them for `b0_eswc_reproduction` as well, unless the passive baseline becomes unstable. If that happens, keep the same optimizer schedule and only simplify what the model definition requires.
+
+Do not run a second search on:
+
+- `A1`
+- `M1D`
+- `B0`
+- `G0`
+
+### Step 5. Train and evaluate the final learned suite
+
+Run the canonical learned models after the hyperparameters are locked.
+
+Recommended order:
+
+1. `B0`
+2. `A1`
+3. final `M1C`
+4. `M1D`
+5. `G0`
+
+Reason:
+
+- `B0` establishes the prior-work baseline
+- `A1` establishes the representation-only step
+- `M1C` is the main practical model
+- `M1D` is the direct-loss counterpart
+- `G0` depends on the factorized proposal stack and is the most downstream model
+
+Recommended execution via scheduler:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/10_scheduler.py \
+  --paper-suite \
+  --keep-going
+```
+
+If you want to enforce the order manually, use substring filters:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only b0_eswc_reproduction --paper-suite
+PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only a1_factorized_imitation --paper-suite
+PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only m1c_safe_factor_chooser --paper-suite
+PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only m1d_safe_factor_direct --paper-suite
+PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only g0_globalfix_reference --paper-suite
+```
+
+The scheduler will:
+
+- train the run
+- copy the checkpoint and history back into the config directory
+- evaluate with strict global metrics
+- automatically add `--use-chooser` for chooser runs
+- automatically evaluate reranker runs from `reranker_predictions.json`
+
+## 4. Manual evaluation commands
+
+Use these only if you do not use the scheduler.
+
+### Proposal models
+
+`B0`, `A1`, and `M1D`:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/09_eval.py \
+  --run-directory models/<run_dir> \
+  --strict-global-metrics \
+  --per-constraint-csv
+```
+
+`M1C`:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/09_eval.py \
+  --run-directory models/<run_dir> \
+  --use-chooser \
+  --strict-global-metrics \
+  --per-constraint-csv
+```
+
+### Reranker model
+
+Train with:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/08_train_reranker.py \
+  --experiment-config models/g0_globalfix_reference__<variant>__<encoding>/config.json \
+  --seed 42
+```
+
+Then evaluate with:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/09_eval.py \
+  --run-directory models/<g0_run_dir> \
+  --reranker-predictions models/<g0_run_dir>/reranker_predictions.json \
+  --strict-global-metrics \
+  --per-constraint-csv
+```
+
+## 5. Final reporting set
+
+Only the following runs should feed the paper tables:
+
+- heuristic baselines: `DFB`, `CSM`, optional `AMB`
+- learned models:
+  - `B0`
+  - `A1`
+  - final `M1C`
+  - `M1D`
+  - `G0`
+
+The hyperparameter search runs must not appear in the final paper tables.
+
+## 6. Minimal reproducibility checklist
+
+Before declaring the suite complete, verify:
+
+- the same dataset variant, `min_occurrence`, and encoding were used everywhere
+- all proposal runs used the fixed seed behavior in `src/07_train.py`
+- all reranker runs used `--seed 42`
+- each run directory contains:
+  - `config.json`
+  - `checkpoint.pth`
+  - `training_history.json`
+  - `evaluations/model.json`
+- baselines were written under `models/baselines/full/parquet/`
+- per-constraint CSVs exist for all final paper runs
+
+## 7. Recommended stop rule
+
+Stop after:
+
+- one brief `M1C` sweep
+- one locked final training pass for the canonical suite
+
+Do not expand into:
+
+- per-model searches
+- multi-seed sweeps
+- separate reranker searches
+- appendix-model training
+
+unless the final paper suite fails in a way that blocks the main claims.

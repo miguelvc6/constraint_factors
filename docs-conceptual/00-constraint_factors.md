@@ -28,7 +28,8 @@ That means:
 
 - local executable factor nodes are included in the graph
 - factor metadata is attached to the graph object
-- typed pressure can be enabled in message passing
+- per-type factor executors score local factor state from explicit predicate / subject / object scopes
+- per-type / per-role pressure can be enabled in message passing
 - the symbolic evaluator can assess primary and secondary effects of candidate edits
 
 `B0` is the non-factorized exception and uses `eswc_passive`.
@@ -42,6 +43,13 @@ The proposal model still predicts the six-slot add/delete edit:
 \]
 
 The training signal remains anchored in curator edits via `L_edit`.
+
+For factorized models, the proposal backbone also supports auxiliary neural factor supervision:
+
+- pre-state factor satisfaction prediction from the current local graph state
+- gold-post factor satisfaction prediction conditioned on the historical gold edit
+
+Those auxiliary losses strengthen the factorized backbone, but they do not replace the candidate-level safety objective of `M1D`.
 
 ## Candidate-based direct safety objective
 
@@ -86,16 +94,19 @@ This resolves the earlier repo-level ambiguity where `M1` referred to two differ
 
 ## Current implementation boundary
 
-The current implementation is intentionally modest:
+The current implementation includes:
 
-- factor nodes and typed conditioning exist
+- factor nodes with explicit local role scopes
+- per-type executable factor modules `f_t`
+- per-type / per-role pressure messages `g_{t,r}`
+- direct gold-post neural factor supervision inside the proposal backbone
 - primary and secondary safety terms are candidate-level symbolic quantities
 - safety losses are integrated into proposal training
 
 What is not claimed here:
 
-- true per-type executable neural factor programs `f_t`
-- separate per-type or per-role message executors `g_{t,r}`
-- direct post-edit neural factor supervision inside the proposal backbone
+- neural candidate-level post-edit safety prediction for arbitrary proposed edits
+- learned edit rollout or learned graph rewriting inside the proposal model
+- replacement of the symbolic evaluator as the decision-level source of truth
 
 Those remain later-phase research directions and are documented in `docs/00-message_passing.md`.

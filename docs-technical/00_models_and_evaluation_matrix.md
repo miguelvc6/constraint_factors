@@ -23,17 +23,19 @@ This document defines the canonical paper-facing suite implemented in the reposi
 
 ### A1 Factorized Imitation
 - Uses `constraint_representation="factorized"`.
-- Keeps the factorized graph and typed pressure, but trains only with edit imitation.
+- Keeps the factorized graph, per-type factor executors, and per-role pressure, but trains only with edit imitation plus auxiliary factor supervision.
 - Answers whether factorized local constraint context helps before any safety-aware decision objective.
 
 ### M1C Safe Factor Chooser
 - Builds on `A1`.
 - Uses chooser scoring over the same symbolic candidate set used by reranking.
+- Retains the same per-type factor executor backbone and auxiliary factor supervision as `A1`.
 - Default paper configs should keep a non-zero primary term (`gamma_primary > 0`) so primary-fix preference is explicit.
 
 ### M1D Safe Factor Direct
 - Builds on `A1`.
 - Reuses the same candidate builder and symbolic evaluator contract as `M1C` and `G0`.
+- Retains the same per-type factor executor backbone and auxiliary factor supervision as `A1`.
 - Computes candidate scores directly from proposal slot logits, then optimizes expected primary-failure and secondary-regression penalties.
 
 ### G0 GlobalFix Reference
