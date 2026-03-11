@@ -35,5 +35,5 @@
 - `WikidataUriEmbedder` reads `WIKIDATA_EMBEDDING_MODEL` (default `jinaai/jina-embeddings-v3`) and `WIKIDATA_EMBEDDING_FALLBACK` (default `sentence-transformers/all-MiniLM-L6-v2`) to select the embedding model. If the primary model fails to load, it falls back automatically.
 - The cache distinguishes `kind` (`uri`, `placeholder`, `literal`) so `06_graph.py` can request either an embedding by integer ID (`kind=uri`, `global_id` populated) or by raw string (literals).
 - When encountering multiple integer IDs that decode to the same URI, the script stores only one embedding payload and merely aliases the additional IDs, shrinking the on-disk footprint.
-- Literal texts are deduplicated case-insensitively and trimmed; noisy strings like `"nan"` are ignored to avoid polluting the embedding table.
-- Every embedding is stored as `np.float16` by default. The `--embed-dim` flag controls the model embedding dimensionality (default 256), while `--batch-size` tunes Wikidata label batching (default 512).
+- Literal texts are trimmed, deduplicated by exact string match, and filtered to skip empty strings and `"nan"`.
+- Every embedding is stored as `np.float16` by default. The `--embed-dim` flag controls the model embedding dimensionality (default 256), while `--batch-size` is reused for URI lookup batches and text-embedding batches (default 512).

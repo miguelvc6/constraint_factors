@@ -2,7 +2,7 @@
 
 This document specifies the data artifacts produced by the constraint-factors
 pipeline. It follows the executable pipeline in `src/` and the conceptual model
-in `docs/00-constraint_factors.md`.
+in [docs-conceptual/00-constraint_factors.md](/home/mvazquez/constraint_factors/docs-conceptual/00-constraint_factors.md).
 
 ## 1) Dataset Variants
 Variants are named with:
@@ -95,9 +95,10 @@ re-run.
 **Location:** `data/processed/<variant>/`
 
 **Files**
-- `{split}_graph-<encoding>.pkl` (pickle stream of `torch_geometric.data.Data`)
-- Sharded variants: `{split}_graph-<encoding>-shardNNN.pt` or `.pkl`
-- Per-split manifest: `{split}_graph-<encoding>.pkl.manifest.json`
+- Factorized files: `{split}_graph-<encoding>.pkl`
+- Passive files: `{split}_graph_repr-eswc_passive-<encoding>.pkl`
+- Sharded variants: the same base names with `-shardNNN.pt` or `.pkl`
+- Per-split manifest: `<graph_filename>.manifest.json`
 - `target_vocabs.json` (class-id vocabularies for labels)
 - Optional visuals: `graph_visualization.png`, `graph_visualization-non_flattened.png`
 
@@ -112,11 +113,14 @@ re-run.
 - `focus_triple`: global IDs of the focus triple `(s, p, o)`
 - `shape_id`: the encoded `constraint_id`
 - `constraint_type`: string (e.g., `conflictWith`)
+- `constraint_representation`: `factorized` or `eswc_passive`
 - `factor_constraint_ids`: list of constraint IDs included as factors
+- `factor_node_index`: local node indices of factor nodes
 - `primary_factor_index`: index of the violated constraint in `factor_constraint_ids`
+- `is_factor_node`: boolean mask over local nodes
 - `factor_constraint_types`: list of constraint family labels (debug)
 - `factor_wiring_debug` (optional): wiring diagnostics when `--debug-factor-wiring` is enabled
-- `context_index` (optional): integer index into violation contexts, attached at training time when fix-probability loss is enabled
+- `context_index` (optional): integer index into violation contexts, attached later by training/evaluation code for context-aligned objectives; it is not written by `06_graph.py`
 
 **Persistence profiles**
 - `research_safe` (default): drops debug-only fields `x_names`, `factor_constraint_types`, `factor_wiring_debug`.
@@ -148,3 +152,5 @@ re-run.
 
 The labeler can operate on either `local_constraint_ids` or
 `local_constraint_ids_focus`, controlled by `--constraint-scope`.
+When this directory exists, `06_graph.py` uses it automatically unless
+`--use-unlabeled-interim` is passed.

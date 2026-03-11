@@ -2,7 +2,7 @@
 
 Date: 2026-03-11
 
-This document defines the recommended execution order for training and evaluating the baselines and learned models in [docs/00_models_and_evaluation_matrix.md](/home/mvazquez/constraint_factors/docs/00_models_and_evaluation_matrix.md).
+This document defines the recommended execution order for training and evaluating the baselines and learned models in [docs-technical/00_models_and_evaluation_matrix.md](/home/mvazquez/constraint_factors/docs-technical/00_models_and_evaluation_matrix.md).
 
 The plan is optimized for:
 
@@ -34,6 +34,11 @@ Recommended run ledger:
 - record `git rev-parse HEAD`
 - keep the generated config JSONs under `models/`
 - keep scheduler logs under `logs/`
+
+Strict-metrics precondition:
+
+- proposal and reranker evaluations in `--paper-suite` mode require graph artifacts that already contain factor-label fields
+- in the current pipeline, that means running `05_constraint_labeler.py` before `06_graph.py`; once `data/interim/<variant>_labeled/` exists, `06_graph.py` will use it automatically unless `--use-unlabeled-interim` is passed
 
 ## 2. Overall execution order
 
@@ -83,7 +88,6 @@ PYTHONPATH=src .venv/bin/python src/09_eval.py \
   --run-baselines \
   --dataset full \
   --min-occurrence 100 \
-  --strict-global-metrics \
   --per-constraint-csv
 ```
 
@@ -98,6 +102,11 @@ This gives the reference results for:
 - `CSM`
 
 If `AMB` is not used in the final main table, keep it as appendix support.
+
+Code note:
+
+- `src/09_eval.py --run-baselines` reads `data/interim/<variant>/` directly, not `data/interim/<variant>_labeled/`.
+- Because of that, `--strict-global-metrics` is only safe for baselines if the base interim parquet files themselves already contain the factor-label columns required for global metrics.
 
 ### Step 2. Run a brief `M1C` hyperparameter search
 
@@ -159,13 +168,14 @@ Primary selection criteria:
 
 Practical rule:
 
-- use the `model_selection` block in each `evaluations/model.json` as a quick ranking aid
+- use the `model_selection` block in each copied `eval.json` as a quick ranking aid
 - do not accept a config that improves fidelity by noticeably worsening `SRR`
 
 Search outputs to inspect:
 
-- `models/hp_m1c_*/evaluations/model.json`
-- `models/hp_m1c_*/evaluations/per_constraint.csv`
+- `models/hp_m1c_*/eval.json`
+
+If you need the per-constraint breakdown, inspect the resolved run directory under `models/`; the scheduler does not copy `per_constraint.csv` back into the config directory.
 
 ### Step 4. Lock the paper hyperparameters
 
@@ -225,6 +235,8 @@ PYTHONPATH=src .venv/bin/python src/10_scheduler.py \
   --keep-going
 ```
 
+`--paper-suite` does not enforce the exact `B0 -> A1 -> M1C -> M1D -> G0` order by itself; the scheduler runs proposal configs before rerankers and otherwise follows directory-name ordering. Use the manual `--only` commands below when order matters.
+
 If you want to enforce the order manually, use substring filters:
 
 ```bash
@@ -238,7 +250,7 @@ PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only g0_globalfix_referenc
 The scheduler will:
 
 - train the run
-- copy the checkpoint and history back into the config directory
+- copy `checkpoint.pth`, `training_history.json`, and `eval.json` back into the config directory
 - evaluate with strict global metrics
 - automatically add `--use-chooser` for chooser runs
 - automatically evaluate reranker runs from `reranker_predictions.json`
@@ -309,13 +321,13 @@ Before declaring the suite complete, verify:
 - the same dataset variant, `min_occurrence`, and encoding were used everywhere
 - all proposal runs used the fixed seed behavior in `src/07_train.py`
 - all reranker runs used `--seed 42`
-- each run directory contains:
+- each generated config directory contains:
   - `config.json`
   - `checkpoint.pth`
   - `training_history.json`
-  - `evaluations/model.json`
+  - `eval.json`
 - baselines were written under `models/baselines/full/parquet/`
-- per-constraint CSVs exist for all final paper runs
+- the resolved runtime directories under `models/` contain `evaluations/model.json` and `evaluations/per_constraint.csv` for the final paper runs
 
 ## 7. Recommended stop rule
 

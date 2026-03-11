@@ -2,15 +2,15 @@
 
 ## Objective
 - Train a graph neural network (configured via JSON) on the graphs exported by `06_graph.py`, optimising the six action slots (`add/del × subject/predicate/object`) with per-slot cross-entropy while tracking per-constraint performance.
-- Persist the best checkpoint, the resolved experiment configuration, and the full training history under `models/<dataset>/<encoding>/<model>/<config_tag>/`.
+- Persist the best checkpoint, the resolved experiment configuration, and the full training history under the deterministic run slug `models/<variant>-<encoding>_<MODEL>_<config_tag>/`.
 
 ## Inputs & Outputs
-- **Inputs:** Processed graph files in `data/processed/<variant>/train_graph-<encoding>.pkl` and `val_graph-<encoding>.pkl`, experiment config JSONs (model + training blocks), and the frozen encoder from `data/interim/<variant>/globalintencoder.txt`.
-- **Outputs:** Run directory under `models/<variant>/<encoding>/<model>/<config_tag>/` containing `checkpoint.pth`, copied config, training history JSON/plots, and any logging artifacts.
+- **Inputs:** Processed graph files in `data/processed/<variant>/` (either `train_graph-<encoding>.pkl` / `val_graph-<encoding>.pkl` or the `*_repr-eswc_passive-*` equivalents, plus shards when present), experiment config JSONs (model + training blocks), and the frozen encoder from `data/interim/<variant>/globalintencoder.txt`.
+- **Outputs:** Run directory under `models/<variant>-<encoding>_<MODEL>_<config_tag>/` containing `checkpoint.pth`, `config.json`, `training_history.json`, plots, and evaluation artifacts when evaluated later.
 
 ## Workflow
 1. **Configuration intake** – The script requires `--experiment-config path/to/config.json`. The file contains `model_config` (dataset variant, encoding, architecture name, hyperparameters) and `training_config` (batch size, epochs, scheduler knobs, constraint weighting).
-2. **Run directory setup** – `ensure_run_dir()` creates or reuses a timestamped folder, while `config_copy_path()` determines where the config snapshot will live beside the checkpoint.
+2. **Run directory setup** – `ensure_run_dir()` creates or reuses a deterministic slugged folder based on dataset variant, encoding, model name, and config tag, while `config_copy_path()` determines where the config snapshot will live beside the checkpoint.
 3. **Data loading** – `dataset_variant_name()` selects the processed root (`data/processed/<variant>/`), `load_graph_dataset()` discovers either monolithic files or shard collections (`*-shardNNN.{pkl,pt}`), returning an in-memory list or a lazy `GraphStreamDataset`/sharded stream as appropriate. `infer_node_feature_spec()` inspects samples to decide whether node features are embeddings or categorical IDs (including optional role flags).
 4. **Target vocabularies** – The model predicts six categorical slots. `load_precomputed_target_vocabs()` reuses cached entity/predicate class IDs when available, otherwise `derive_target_class_ids()` scans the loaded graphs. These IDs are passed into the model so entity and predicate heads can be expanded/masked into a shared `num_target_ids` space.
 5. **Factor type setup** – If `model_config.num_factor_types > 0`, training uses that value directly and skips the expensive dataset-wide `derive_factor_type_count()` scan. If it is `0`, the script infers the count from graph data.
@@ -58,7 +58,7 @@ This makes bottlenecks explicit (for example, chooser-heavy runs where `chooser`
 - The script intentionally supports streamed graphs (via `GraphStreamDataset`) so very large runs never exceed RAM even when the serialized graphs are sharded.
 - Per-slot histories are nested under `history["per_slot"][slot_index]`, enabling later analysis of which action (e.g., `del_predicate`) converged slower.
 - GPU monitoring hooks (`log_cuda_memory`) fire at strategic checkpoints (epoch boundaries, first batch) to simplify diagnosing OOMs or fragmentation.
-- Model checkpoints store both the state dict and the resolved configuration, allowing `05_eval.py` to rebuild the architecture without guessing hyperparameters.
+- Model checkpoints store both the state dict and the resolved configuration, allowing `09_eval.py` to rebuild the architecture without guessing hyperparameters.
 - If `training_config.validate_factor_labels` is enabled, training asserts that factor label tensors exist and align with `factor_constraint_ids` (useful for upcoming factor supervision).
 
 ## Dynamic Weighting per constraint type
