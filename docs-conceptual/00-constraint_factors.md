@@ -1,5 +1,7 @@
 # Executable Constraint Factors for Neuro-Symbolic KG Repair
 
+This document is the conceptual research framing for executable constraint factors. Current implementation details, code-level boundaries, and paper-surface model status belong in [docs-technical/00-constraint_factors.md](/home/mvazquez/constraint_factors/docs-technical/00-constraint_factors.md).
+
 ## 1) Research Idea, Main Hypothesis, Scientific Contribution
 
 ### Core idea

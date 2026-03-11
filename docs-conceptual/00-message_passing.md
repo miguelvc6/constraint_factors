@@ -1,6 +1,8 @@
 # Executable Constraint Factors: Message Passing and Constraint Execution
 
-This document specifies the **message-passing equations** and computational semantics of **constraint factors as executable subprograms**, expanding the informal description into a precise, paper-ready formulation.
+This document specifies the **conceptual message-passing equations** and computational semantics of **constraint factors as executable subprograms**, expanding the informal description into a precise, paper-ready formulation.
+
+It is the architecture-specification companion to [docs-conceptual/00-constraint_factors.md](/home/mvazquez/constraint_factors/docs-conceptual/00-constraint_factors.md). Implementation status and code-level boundaries belong in [docs-technical/00-message_passing.md](/home/mvazquez/constraint_factors/docs-technical/00-message_passing.md).
 
 The goal is to make explicit:
 - how constraint semantics are computed,
@@ -258,6 +260,15 @@ This interaction is impossible in:
 ---
 
 ## 9. Summary
+
+Executable constraint factors are intended to turn constraints from passive context into active local operators:
+
+- each factor reads the variables in its scope,
+- computes a type-specific compatibility or violation signal,
+- emits role-conditioned pressure back into those variables,
+- and thereby influences repair decisions from inside the representation-learning process.
+
+This is the conceptual mechanism behind the broader executable-factor repair direction. The research claim is not merely that constraints are present in the graph, but that they are executed as typed local programs whose feedback can shape the repair trajectory.
 
 - Constraints are modeled as **typed neural operators**.
 - Each constraint instance executes a validation subprogram.
