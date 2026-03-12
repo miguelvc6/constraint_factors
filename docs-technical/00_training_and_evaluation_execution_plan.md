@@ -97,7 +97,7 @@ The paper line must materialize the artifact stack before config generation:
 Only needed when the paper encoding is `text_embedding`.
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/04_wikidata_retriever.py \
+uv run src/04_wikidata_retriever.py \
   --dataset full \
   --min-occurrence 100
 ```
@@ -105,7 +105,7 @@ PYTHONPATH=src .venv/bin/python src/04_wikidata_retriever.py \
 **Build labeled interim parquet for the paper scope**
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/05_constraint_labeler.py \
+uv run src/05_constraint_labeler.py \
   --dataset full \
   --min-occurrence 100 \
   --constraint-scope local
@@ -116,7 +116,7 @@ PYTHONPATH=src .venv/bin/python src/05_constraint_labeler.py \
 For `node_id`:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/06_graph.py \
+uv run src/06_graph.py \
   --dataset full \
   --min-occurrence 100 \
   --encoding node_id \
@@ -134,7 +134,7 @@ If monolithic graph writes run out of memory, add:
 For `text_embedding`:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/06_graph.py \
+uv run src/06_graph.py \
   --dataset full \
   --min-occurrence 100 \
   --encoding text_embedding \
@@ -149,7 +149,7 @@ The training, reranker, config-generation, and evaluation paths ingest these sha
 For `node_id`:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/06_graph.py \
+uv run src/06_graph.py \
   --dataset full \
   --min-occurrence 100 \
   --encoding node_id \
@@ -166,7 +166,7 @@ The same optional shard flags may be used here if needed:
 For `text_embedding`:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/06_graph.py \
+uv run src/06_graph.py \
   --dataset full \
   --min-occurrence 100 \
   --encoding text_embedding \
@@ -188,7 +188,7 @@ Paper readiness check:
 Use the canonical paper config generator:
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/make_experiment_configs.py --models-root models
+uv run scripts/make_experiment_configs.py --models-root models
 ```
 
 This emits only:
@@ -206,7 +206,7 @@ If appendix runs are needed later, generate them separately with `--include-expe
 Run baselines before any neural training so the paper already has stable reference numbers:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/09_eval.py \
+uv run src/09_eval.py \
   --run-baselines \
   --dataset full \
   --min-occurrence 100 \
@@ -244,7 +244,7 @@ Reason:
 Generate the short search set:
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/make_hparam_search_configs_m1.py \
+uv run scripts/make_hparam_search_configs_m1.py \
   --processed-root data/processed \
   --models-root models \
   --dataset-variant full \
@@ -264,7 +264,7 @@ Recommended search budget:
 Run the short search with the scheduler:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/10_scheduler.py \
+uv run src/10_scheduler.py \
   --only hp_m1c_ \
   --paper-suite \
   --keep-going
@@ -377,7 +377,7 @@ Reason:
 Recommended execution via scheduler:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/10_scheduler.py \
+uv run src/10_scheduler.py \
   --paper-suite \
   --keep-going
 ```
@@ -387,11 +387,11 @@ PYTHONPATH=src .venv/bin/python src/10_scheduler.py \
 If you want to enforce the order manually, use substring filters:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only b0_eswc_reproduction --paper-suite
-PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only a1_factorized_imitation --paper-suite
-PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only m1c_safe_factor_chooser --paper-suite
-PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only m1d_safe_factor_direct --paper-suite
-PYTHONPATH=src .venv/bin/python src/10_scheduler.py --only g0_globalfix_reference --paper-suite
+uv run src/10_scheduler.py --only b0_eswc_reproduction --paper-suite
+uv run src/10_scheduler.py --only a1_factorized_imitation --paper-suite
+uv run src/10_scheduler.py --only m1c_safe_factor_chooser --paper-suite
+uv run src/10_scheduler.py --only m1d_safe_factor_direct --paper-suite
+uv run src/10_scheduler.py --only g0_globalfix_reference --paper-suite
 ```
 
 The scheduler will:
@@ -411,7 +411,7 @@ Use these only if you do not use the scheduler.
 `B0`, `A1`, and `M1D`:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/09_eval.py \
+uv run src/09_eval.py \
   --run-directory models/<run_dir> \
   --strict-global-metrics \
   --per-constraint-csv
@@ -420,7 +420,7 @@ PYTHONPATH=src .venv/bin/python src/09_eval.py \
 `M1C`:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/09_eval.py \
+uv run src/09_eval.py \
   --run-directory models/<run_dir> \
   --use-chooser \
   --strict-global-metrics \
@@ -432,7 +432,7 @@ PYTHONPATH=src .venv/bin/python src/09_eval.py \
 Train with:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/08_train_reranker.py \
+uv run src/08_train_reranker.py \
   --experiment-config models/g0_globalfix_reference__<variant>__<encoding>/config.json \
   --seed 42
 ```
@@ -440,7 +440,7 @@ PYTHONPATH=src .venv/bin/python src/08_train_reranker.py \
 Then evaluate with:
 
 ```bash
-PYTHONPATH=src .venv/bin/python src/09_eval.py \
+uv run src/09_eval.py \
   --run-directory models/<g0_run_dir> \
   --reranker-predictions models/<g0_run_dir>/reranker_predictions.json \
   --strict-global-metrics \

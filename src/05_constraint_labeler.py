@@ -36,6 +36,7 @@ PARAM_P1696 = "P1696"
 class RegistryEntry:
     constraint_type_raw: str
     constraint_type_item: str
+    constraint_type_index: int
     constraint_family: str
     constraint_label: str
     constraint_family_supported: bool
@@ -48,6 +49,14 @@ def _load_registry(path: Path) -> Dict[str, RegistryEntry]:
     registry_df = pd.read_parquet(path)
     registry_json = registry_df["registry_json"].iloc[0]
     registry = json.loads(registry_json) if isinstance(registry_json, str) else registry_json
+    type_items = sorted(
+        {
+            str(entry.get("constraint_type_item", "")).strip()
+            for entry in registry.values()
+            if str(entry.get("constraint_type_item", "")).strip()
+        }
+    )
+    fallback_type_index = {type_item: idx for idx, type_item in enumerate(type_items)}
     parsed: Dict[str, RegistryEntry] = {}
     for constraint_id, entry in registry.items():
         constraint_family = entry.get("constraint_family")
@@ -56,9 +65,14 @@ def _load_registry(path: Path) -> Dict[str, RegistryEntry]:
         constraint_family_supported = entry.get("constraint_family_supported")
         if constraint_family_supported is None:
             constraint_family_supported = entry.get("constraint_type_supported", False)
+        constraint_type_item = str(entry.get("constraint_type_item", ""))
+        constraint_type_index = entry.get("constraint_type_index")
+        if constraint_type_index is None:
+            constraint_type_index = fallback_type_index.get(constraint_type_item.strip(), -1)
         parsed[constraint_id] = RegistryEntry(
             constraint_type_raw=str(entry.get("constraint_type", "")),
-            constraint_type_item=str(entry.get("constraint_type_item", "")),
+            constraint_type_item=constraint_type_item,
+            constraint_type_index=int(constraint_type_index),
             constraint_family=str(constraint_family or ""),
             constraint_label=str(entry.get("constraint_label", "")),
             constraint_family_supported=bool(constraint_family_supported),
@@ -389,9 +403,8 @@ def _constraint_type_id_from_registry(
     registry_entry: RegistryEntry,
     encoder: GlobalIntEncoder | None,
 ) -> int:
-    if encoder is None:
-        return 0
-    return _resolve_registry_id(registry_entry.constraint_type_item, encoder)
+    del encoder
+    return int(registry_entry.constraint_type_index)
 
 
 def _resolve_default_relations(encoder: GlobalIntEncoder | None) -> List[int]:
@@ -501,7 +514,7 @@ def _process_dataframe(
                 satisfied_pre_row.append(0)
                 checkable_post_row.append(False)
                 satisfied_post_row.append(0)
-                types_row.append(0)
+                types_row.append(-1)
                 continue
 
             cache_key = str(int(constraint_id)) if use_encoded_ids else str(constraint_id)
@@ -531,7 +544,7 @@ def _process_dataframe(
             satisfied_pre_row.append(int(satisfied_pre))
             checkable_post_row.append(bool(checkable_post))
             satisfied_post_row.append(int(satisfied_post))
-            types_row.append(int(constraint_instance.constraint_type_id or 0))
+            types_row.append(int(constraint_instance.constraint_type_id))
 
             ctype = constraint_instance.constraint_type or "unknown"
             coverage[ctype]["total"] += 1

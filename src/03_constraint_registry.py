@@ -118,6 +118,21 @@ def build_registry(
     return registry
 
 
+def assign_constraint_type_indices(registry: dict[str, dict[str, Any]]) -> dict[str, int]:
+    type_items = sorted(
+        {
+            str(entry.get("constraint_type_item") or "").strip()
+            for entry in registry.values()
+            if str(entry.get("constraint_type_item") or "").strip()
+        }
+    )
+    type_index_by_item = {type_item: idx for idx, type_item in enumerate(type_items)}
+    for entry in registry.values():
+        type_item = str(entry.get("constraint_type_item") or "").strip()
+        entry["constraint_type_index"] = int(type_index_by_item.get(type_item, -1))
+    return type_index_by_item
+
+
 def validate_registry(
     registry: dict[str, dict[str, Any]],
     constraints_def: dict[str, dict[str, list[str]]],
@@ -149,6 +164,8 @@ def validate_registry(
             raise TypeError(f"{constraint_id} field constraint_label must be a string.")
         if not isinstance(entry.get("constraint_family_supported"), bool):
             raise TypeError(f"{constraint_id} field constraint_family_supported must be a bool.")
+        if not isinstance(entry.get("constraint_type_index"), int):
+            raise TypeError(f"{constraint_id} field constraint_type_index must be an int.")
         for field in ("param_predicates", "param_objects"):
             values = entry.get(field)
             if not isinstance(values, list):
@@ -185,6 +202,7 @@ def main() -> None:
     catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
 
     registry = build_registry(constraints_def, constraints_by_property, catalog)
+    type_index_by_item = assign_constraint_type_indices(registry)
     validate_registry(registry, constraints_def, constraints_by_property)
 
     registry_json = json.dumps(registry, sort_keys=True)
@@ -204,6 +222,7 @@ def main() -> None:
             supported_counts[family] = supported_counts.get(family, 0) + 1
     supported_total = sum(supported_counts.values())
     unsupported_total = len(registry) - supported_total
+    print(f"Unique constraint_type_item values: {len(type_index_by_item)}")
     unsupported_sorted = sorted(
         ((family, count) for family, count in family_counts.items() if family not in supported_counts),
         key=lambda item: item[1],

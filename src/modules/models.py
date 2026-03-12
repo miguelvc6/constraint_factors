@@ -170,7 +170,6 @@ def _build_factor_scope_runtime(
     num_factors = int(factor_node_index.numel())
     hidden_dim = int(node_emb.size(-1))
 
-    fallback_type_id = max(int(num_factor_types), 0)
     factor_types = getattr(data, "factor_types", None)
     if factor_types is not None:
         raw_factor_types = torch.as_tensor(
@@ -180,22 +179,17 @@ def _build_factor_scope_runtime(
             raise ValueError(
                 f"factor_types length {raw_factor_types.numel()} does not match factor count {num_factors}"
             )
-        if num_factor_types > 0:
-            valid_mask = (raw_factor_types >= 0) & (raw_factor_types < int(num_factor_types))
-            factor_type_ids = torch.where(
-                valid_mask,
-                raw_factor_types,
-                torch.full_like(raw_factor_types, fallback_type_id),
+        if num_factor_types <= 0:
+            raise ValueError("factor_types were provided but num_factor_types is not positive.")
+        invalid_mask = (raw_factor_types < 0) | (raw_factor_types >= int(num_factor_types))
+        if invalid_mask.any():
+            invalid_values = sorted({int(v) for v in raw_factor_types[invalid_mask].tolist()})
+            raise ValueError(
+                f"factor_types contain values outside [0, {num_factor_types}): {invalid_values[:8]}"
             )
-        else:
-            factor_type_ids = torch.full_like(raw_factor_types, fallback_type_id)
+        factor_type_ids = raw_factor_types
     else:
-        factor_type_ids = torch.full(
-            (num_factors,),
-            fallback_type_id,
-            dtype=torch.long,
-            device=node_emb.device,
-        )
+        raise ValueError("Missing factor_types on factorized graph; per-type factor execution requires dense type ids.")
 
     edge_index = getattr(data, "edge_index", None)
     edge_type = getattr(data, "edge_type", None)
@@ -448,8 +442,7 @@ class BaseGraphModel(nn.Module, ABC):
         self._pressure_residual_scale = float(pressure_residual_scale)
         self._factor_state_dim = head_hidden
         self._factor_scope_feature_dim = (hidden_mp * 4) + 3
-        self._factor_fallback_type_id = max(self._num_factor_types, 0)
-        self._num_factor_executor_modules = max(1, self._factor_fallback_type_id + 1)
+        self._num_factor_executor_modules = max(1, self._num_factor_types)
         if self._factor_executor_impl == "legacy_shared":
             if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0:
                 self.factor_type_embeddings = nn.Embedding(
@@ -718,15 +711,16 @@ class BaseGraphModel(nn.Module, ABC):
                     factor_types_tensor = torch.as_tensor(
                         factor_types, dtype=torch.long, device=node_emb.device
                     ).view(-1)
-                    factor_type_emb = factor_type_embeddings(
-                        factor_types_tensor.clamp(min=0, max=self._num_factor_types - 1)
-                    )
+                    invalid_mask = (factor_types_tensor < 0) | (factor_types_tensor >= self._num_factor_types)
+                    if invalid_mask.any():
+                        invalid_values = sorted({int(v) for v in factor_types_tensor[invalid_mask].tolist()})
+                        raise ValueError(
+                            f"factor_types contain values outside [0, {self._num_factor_types}): {invalid_values[:8]}"
+                        )
+                    factor_type_emb = factor_type_embeddings(factor_types_tensor)
                 else:
-                    factor_type_emb = torch.zeros(
-                        factor_hidden.size(0),
-                        self._factor_type_embedding_dim,
-                        device=factor_hidden.device,
-                        dtype=factor_hidden.dtype,
+                    raise ValueError(
+                        "Missing factor_types on factorized graph; factor type conditioning requires dense type ids."
                     )
                 factor_hidden = torch.cat([factor_hidden, factor_type_emb], dim=-1)
             if self.factor_pre_head is None:
@@ -1178,6 +1172,12 @@ class RepairGINFactorPressure(BaseGraphModel):
                     factor_node_index, dtype=torch.long, device=x.device
                 ).view(-1)
                 if factor_types_tensor.numel() == factor_node_index.numel() and factor_node_index.numel() > 0:
+                    invalid_mask = (factor_types_tensor < 0) | (factor_types_tensor >= self._num_factor_types)
+                    if invalid_mask.any():
+                        invalid_values = sorted({int(v) for v in factor_types_tensor[invalid_mask].tolist()})
+                        raise ValueError(
+                            f"factor_types contain values outside [0, {self._num_factor_types}): {invalid_values[:8]}"
+                        )
                     type_ids = torch.full(
                         (x.size(0),),
                         -1,
@@ -1185,9 +1185,9 @@ class RepairGINFactorPressure(BaseGraphModel):
                         dtype=torch.long,
                     )
                     type_ids.index_copy_(0, factor_node_index, factor_types_tensor)
-                    src_type_ids = type_ids.index_select(0, src).clamp(
-                        min=0, max=self._num_factor_types - 1
-                    )
+                    src_type_ids = type_ids.index_select(0, src)
+                    if (src_type_ids < 0).any():
+                        raise ValueError("Missing factor type ids on pressure edges.")
                     type_emb = self.factor_type_embeddings(src_type_ids)
 
         h_c = x.index_select(0, src)

@@ -39,6 +39,7 @@ _EMPTY_MISSING_EDITS = frozenset()
 class RegistryEntry:
     constraint_type_raw: str
     constraint_type_item: str
+    constraint_type_index: int
     constraint_family: str
     constraint_label: str
     constraint_family_supported: bool
@@ -133,6 +134,14 @@ def _load_registry(path: str | None) -> Dict[str, RegistryEntry]:
         registry = json.loads(registry_json)
     else:
         registry = registry_json
+    type_items = sorted(
+        {
+            str(entry.get("constraint_type_item", "")).strip()
+            for entry in registry.values()
+            if str(entry.get("constraint_type_item", "")).strip()
+        }
+    )
+    fallback_type_index = {type_item: idx for idx, type_item in enumerate(type_items)}
     parsed: Dict[str, RegistryEntry] = {}
     for constraint_id, entry in registry.items():
         constraint_family = entry.get("constraint_family")
@@ -141,9 +150,14 @@ def _load_registry(path: str | None) -> Dict[str, RegistryEntry]:
         constraint_family_supported = entry.get("constraint_family_supported")
         if constraint_family_supported is None:
             constraint_family_supported = entry.get("constraint_type_supported", False)
+        constraint_type_item = str(entry.get("constraint_type_item", ""))
+        constraint_type_index = entry.get("constraint_type_index")
+        if constraint_type_index is None:
+            constraint_type_index = fallback_type_index.get(constraint_type_item.strip(), -1)
         parsed[constraint_id] = RegistryEntry(
             constraint_type_raw=str(entry.get("constraint_type", "")),
-            constraint_type_item=str(entry.get("constraint_type_item", "")),
+            constraint_type_item=constraint_type_item,
+            constraint_type_index=int(constraint_type_index),
             constraint_family=str(constraint_family or ""),
             constraint_label=str(entry.get("constraint_label", "")),
             constraint_family_supported=bool(constraint_family_supported),
@@ -613,9 +627,8 @@ def _constraint_type_id_from_registry(
     registry_entry: RegistryEntry,
     encoder: GlobalIntEncoder | None,
 ) -> int:
-    if encoder is None:
-        return 0
-    return _resolve_registry_id(registry_entry.constraint_type_item, encoder)
+    del encoder
+    return int(registry_entry.constraint_type_index)
 
 
 def _build_constraint_instance(

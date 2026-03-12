@@ -233,6 +233,31 @@ def _assert_factor_labels_batch(data: Data) -> None:
         _assert_factor_labels(graph, idx)
 
 
+def _assert_factor_type_ids_supported(data: Data, num_factor_types: int) -> None:
+    if num_factor_types <= 0:
+        return
+    graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
+    for idx, graph in enumerate(graphs):
+        factor_types = getattr(graph, "factor_types", None)
+        if factor_types is None:
+            continue
+        factor_types_tensor = torch.as_tensor(factor_types).view(-1)
+        if factor_types_tensor.numel() == 0:
+            continue
+        invalid_mask = (factor_types_tensor < 0) | (factor_types_tensor >= num_factor_types)
+        if not torch.any(invalid_mask):
+            continue
+        invalid_values = sorted({int(v) for v in factor_types_tensor[invalid_mask].tolist()})
+        preview = ", ".join(str(v) for v in invalid_values[:8])
+        if len(invalid_values) > 8:
+            preview += ", ..."
+        raise AssertionError(
+            f"graph[{idx}] contains factor_types outside [0, {num_factor_types}) "
+            f"(invalid values: {preview}). Rebuild the constraint registry, labeled parquet, and graphs "
+            "so factor_types use dense compact constraint_type_item indices."
+        )
+
+
 def _assert_factor_logit_alignment(
     data: Data,
     factor_logits: torch.Tensor,
@@ -924,6 +949,7 @@ def train(
             phase_t0 = time.perf_counter() if timing_enabled else 0.0
             if not data_on_device:
                 data = data.to(device, non_blocking=True)
+            _assert_factor_type_ids_supported(data, int(getattr(model, "_num_factor_types", 0)))
             if train_cfg.validate_factor_labels:
                 _assert_factor_labels_batch(data)
             targets = data.y.long()
@@ -1717,6 +1743,7 @@ def train(
                 phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 if not data_on_device:
                     data = data.to(device, non_blocking=True)
+                _assert_factor_type_ids_supported(data, int(getattr(model, "_num_factor_types", 0)))
                 if train_cfg.validate_factor_labels:
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
