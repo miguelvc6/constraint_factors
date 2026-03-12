@@ -3,7 +3,6 @@ import argparse
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -11,14 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from modules.model_store import (
-    config_tag_from_path,
-    ensure_run_dir,
-    evaluations_dir,
-    get_checkpoint_path,
-    history_path,
-    sanitize_fragment,
-)
+from modules.model_store import sanitize_fragment
 
 LOG_DIR = Path("logs")
 RAW_LOG_DIR = LOG_DIR / "runs"
@@ -62,13 +54,6 @@ def infer_model_field(config: dict[str, Any], field: str) -> str:
     if isinstance(value, str) and value:
         return value
     raise ValueError(f"Configuration missing required field '{field}'.")
-
-
-def prepare_config_copy(model_dir: Path, config_path: Path) -> Path:
-    tag = model_dir.name
-    prepared = model_dir / f"{tag}.json"
-    shutil.copyfile(config_path, prepared)
-    return prepared
 
 
 def sanitize_run_name(model_dir: Path) -> str:
@@ -115,31 +100,6 @@ def run_command(cmd: List[str], log_path: Path) -> int:
     return return_code
 
 
-def copy_artifacts(source_run_dir: Path, target_dir: Path, logger: logging.Logger) -> None:
-    checkpoint_src = get_checkpoint_path(source_run_dir)
-    checkpoint_dst = target_dir / CHECKPOINT_FILENAME
-    if checkpoint_src.exists():
-        shutil.copyfile(checkpoint_src, checkpoint_dst)
-        logger.info("Copied checkpoint to %s", checkpoint_dst)
-    else:
-        logger.warning("Checkpoint not found at %s", checkpoint_src)
-
-    history_src = history_path(source_run_dir)
-    if history_src.exists():
-        shutil.copyfile(history_src, target_dir / history_src.name)
-        logger.info("Copied training history to %s", target_dir / history_src.name)
-    history_csv = source_run_dir / "history.csv"
-    if history_csv.exists():
-        shutil.copyfile(history_csv, target_dir / history_csv.name)
-        logger.info("Copied training history to %s", target_dir / history_csv.name)
-
-    eval_dir = evaluations_dir(source_run_dir, create=False)
-    eval_json = eval_dir / "model.json"
-    if eval_json.exists():
-        shutil.copyfile(eval_json, target_dir / "eval.json")
-        logger.info("Copied eval metrics to %s", target_dir / "eval.json")
-
-
 def run_evaluation(
     run_directory: Path,
     run_name: str,
@@ -172,7 +132,7 @@ def run_evaluation(
 
 
 def ensure_reranker_predictions(
-    prepared_config: Path,
+    experiment_config: Path,
     resolved_run_dir: Path,
     run_name: str,
     logger: logging.Logger,
@@ -185,7 +145,7 @@ def ensure_reranker_predictions(
         sys.executable,
         "src/08_train_reranker.py",
         "--experiment-config",
-        str(prepared_config),
+        str(experiment_config),
         "--predict-only",
     ]
     logger.info("Generating reranker predictions: %s", " ".join(command))
@@ -206,10 +166,10 @@ def _infer_experiment_kind(config: dict[str, Any]) -> str:
     return "proposal"
 
 
-def _build_train_command(kind: str, prepared_config: Path) -> List[str]:
+def _build_train_command(kind: str, experiment_config: Path) -> List[str]:
     if kind == "reranker":
-        return [sys.executable, "src/08_train_reranker.py", "--experiment-config", str(prepared_config)]
-    return [sys.executable, "src/07_train.py", "--experiment-config", str(prepared_config)]
+        return [sys.executable, "src/08_train_reranker.py", "--experiment-config", str(experiment_config)]
+    return [sys.executable, "src/07_train.py", "--experiment-config", str(experiment_config)]
 
 
 def parse_args() -> argparse.Namespace:
@@ -318,9 +278,7 @@ def main() -> int:
                         logger.error("Skipping eval for %s: %s", model_dir, exc)
                         write_history(record)
                         continue
-                    prepared_config = prepare_config_copy(model_dir, config_path)
-                    config_tag = config_tag_from_path(prepared_config)
-                    resolved_run_dir = ensure_run_dir(dataset_variant, encoding, "RERANKER", config_tag)
+                    resolved_run_dir = model_dir
                     run_name = sanitize_run_name(model_dir)
                     run_prefix = f"{sanitize_fragment(dataset_variant)}-{sanitize_fragment(encoding)}_RERANKER"
                     if model_dir.name.startswith(run_prefix):
@@ -333,7 +291,7 @@ def main() -> int:
                         eval_flags.append("--per-constraint-csv")
                     if args.paper_suite and "--strict-global-metrics" not in eval_flags:
                         eval_flags.append("--strict-global-metrics")
-                    if ensure_reranker_predictions(prepared_config, resolved_run_dir, run_name, logger):
+                    if ensure_reranker_predictions(config_path, resolved_run_dir, run_name, logger):
                         reranker_predictions = resolved_run_dir / "reranker_predictions.json"
                         evaluation = run_evaluation(
                             resolved_run_dir,
@@ -414,22 +372,19 @@ def main() -> int:
                 )
                 continue
 
-        prepared_config = prepare_config_copy(model_dir, config_path)
-        config_tag = config_tag_from_path(prepared_config)
-        resolved_run_dir = ensure_run_dir(dataset_variant, encoding, model_name, config_tag)
+        resolved_run_dir = model_dir
 
         run_name = sanitize_run_name(model_dir)
         raw_log_path = RAW_LOG_DIR / f"{run_name}.log"
-        command = _build_train_command(kind, prepared_config)
+        command = _build_train_command(kind, config_path)
 
         logger.info(
-            "Launching training | experiment=%s kind=%s model=%s dataset=%s encoding=%s config_tag=%s",
+            "Launching training | experiment=%s kind=%s model=%s dataset=%s encoding=%s",
             model_dir.name,
             kind,
             model_name,
             dataset_variant,
             encoding,
-            config_tag,
         )
         logger.info("Run dir: %s", resolved_run_dir)
         logger.info("Train command: %s", " ".join(command))
@@ -441,7 +396,6 @@ def main() -> int:
         record: dict[str, Any] = {
             "model_dir": str(model_dir),
             "config": str(config_path),
-            "prepared_config": str(prepared_config),
             "command": command,
             "log_file": str(raw_log_path),
             "started_at": start_ts.isoformat() + "Z",
@@ -450,7 +404,6 @@ def main() -> int:
 
         if return_code == 0:
             logger.info("Training completed for %s", model_dir.name)
-            copy_artifacts(resolved_run_dir, model_dir, logger)
             record.update(
                 {
                     "status": "completed",
@@ -489,7 +442,7 @@ def main() -> int:
                     logger.error("Stopping scheduler after eval failure (use --keep-going to continue).")
                     return 1
             else:
-                if ensure_reranker_predictions(prepared_config, resolved_run_dir, run_name, logger):
+                if ensure_reranker_predictions(config_path, resolved_run_dir, run_name, logger):
                     reranker_predictions = resolved_run_dir / "reranker_predictions.json"
                     eval_command = [
                         sys.executable,

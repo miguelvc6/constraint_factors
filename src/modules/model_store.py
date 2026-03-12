@@ -1,5 +1,6 @@
 """Utilities for organizing model artifacts under the unified ``models/`` directory."""
 
+import json
 import re
 from pathlib import Path
 from typing import Iterable
@@ -62,6 +63,21 @@ def ensure_run_dir(dataset_variant: str, encoding: str, model_name: str, config_
     return directory
 
 
+def run_dir_from_config_path(config_path: Path) -> Path:
+    """Return the artifact directory associated with an experiment config path."""
+    candidate = Path(config_path)
+    if candidate.suffix.lower() == ".json":
+        return candidate.parent
+    return candidate
+
+
+def ensure_run_dir_for_config(config_path: Path) -> Path:
+    """Create the artifact directory for ``config_path`` if needed and return it."""
+    directory = run_dir_from_config_path(config_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def get_checkpoint_path(run_directory: Path) -> Path:
     """Return the checkpoint file location within ``run_directory``."""
     return run_directory / DEFAULT_CHECKPOINT_NAME
@@ -97,14 +113,17 @@ def list_run_dirs(dataset_variant: str, encoding: str, model_name: str) -> list[
     """List all stored run directories matching the given identifiers."""
     slug_with_placeholder = run_slug(dataset_variant, encoding, model_name, config_tag="placeholder")
     prefix = slug_with_placeholder.rsplit("_", 1)[0] + "_"
-    candidates: list[Path] = []
+    candidates: set[Path] = set()
     if not MODELS_ROOT.exists():
-        return candidates
+        return []
     for entry in MODELS_ROOT.iterdir():
         if not entry.is_dir():
             continue
         if entry.name.startswith(prefix):
-            candidates.append(entry)
+            candidates.add(entry)
+            continue
+        if _run_directory_matches(entry, dataset_variant, encoding, model_name):
+            candidates.add(entry)
     return sorted(candidates)
 
 
@@ -116,13 +135,18 @@ def resolve_run_dir(
 ) -> Path:
     """Resolve a unique run directory, optionally constrained by ``config_tag``."""
     if config_tag:
-        candidate = run_dir(dataset_variant, encoding, model_name, config_tag)
-        if not candidate.exists():
-            raise FileNotFoundError(
-                f"Model run directory not found for dataset={dataset_variant}, encoding={encoding}, "
-                f"model={model_name}, config_tag={config_tag}. Expected at {candidate}"
-            )
-        return candidate
+        direct_candidate = MODELS_ROOT / sanitize_fragment(config_tag, fallback=DEFAULT_CONFIG_TAG)
+        if direct_candidate.exists() and _run_directory_matches(direct_candidate, dataset_variant, encoding, model_name):
+            return direct_candidate
+
+        legacy_candidate = run_dir(dataset_variant, encoding, model_name, config_tag)
+        if legacy_candidate.exists():
+            return legacy_candidate
+
+        raise FileNotFoundError(
+            f"Model run directory not found for dataset={dataset_variant}, encoding={encoding}, "
+            f"model={model_name}, config_tag={config_tag}. Tried {direct_candidate} and {legacy_candidate}"
+        )
 
     candidates = list_run_dirs(dataset_variant, encoding, model_name)
     if not candidates:
@@ -139,11 +163,13 @@ def available_config_tags(dataset_variant: str, encoding: str, model_name: str) 
     """Return the discovered config tags for the given model runs."""
     prefix = run_slug(dataset_variant, encoding, model_name, config_tag="placeholder")
     prefix = prefix.rsplit("_", 1)[0] + "_"
-    tags: list[str] = []
+    tags: set[str] = set()
     for directory in list_run_dirs(dataset_variant, encoding, model_name):
         if directory.name.startswith(prefix):
-            tags.append(directory.name[len(prefix) :])
-    return tags
+            tags.add(directory.name[len(prefix) :])
+        else:
+            tags.add(sanitize_fragment(directory.name, fallback=DEFAULT_CONFIG_TAG))
+    return sorted(tags)
 
 
 def iter_eval_files(dataset_variant: str, encoding: str, model_name: str) -> Iterable[Path]:
@@ -153,3 +179,32 @@ def iter_eval_files(dataset_variant: str, encoding: str, model_name: str) -> Ite
         if not eval_dir.exists():
             continue
         yield from sorted(eval_dir.glob("*.json"))
+
+
+def _run_directory_matches(run_directory: Path, dataset_variant: str, encoding: str, model_name: str) -> bool:
+    config_path = run_directory / CONFIG_FILE_NAME
+    if not config_path.exists():
+        return False
+    try:
+        with config_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+    model_cfg = payload.get("model_config")
+    if not isinstance(model_cfg, dict):
+        return False
+
+    candidate_dataset = model_cfg.get("dataset_variant")
+    candidate_encoding = model_cfg.get("encoding")
+    candidate_model = model_cfg.get("model")
+    if not all(isinstance(value, str) for value in (candidate_dataset, candidate_encoding, candidate_model)):
+        return False
+
+    return (
+        candidate_dataset == dataset_variant
+        and candidate_encoding == encoding
+        and str(candidate_model).upper() == str(model_name).upper()
+    )

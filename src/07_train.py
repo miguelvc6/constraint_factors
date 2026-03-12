@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import shutil
 import sys
 import time
 from datetime import datetime
@@ -29,9 +28,7 @@ from modules.data_encoders import (
     infer_node_feature_spec,
 )
 from modules.model_store import (
-    config_copy_path,
-    config_tag_from_path,
-    ensure_run_dir,
+    ensure_run_dir_for_config,
     get_checkpoint_path,
     history_path,
 )
@@ -2616,6 +2613,21 @@ def parse_args():
     return args
 
 
+def _write_effective_experiment_config(
+    config_path: Path,
+    original_payload: dict[str, Any],
+    *,
+    model_cfg: ModelConfig,
+    training_cfg: TrainingConfig,
+) -> None:
+    payload = dict(original_payload)
+    payload["model_config"] = model_cfg.to_dict()
+    payload["training_config"] = training_cfg.to_dict()
+    with config_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
 def main():
     set_seed(42)
     args = parse_args()
@@ -2628,8 +2640,7 @@ def main():
     training_cfg = TrainingConfig.from_mapping(experiment_config["training_config"])
 
     # Prepare run directory
-    config_tag = config_tag_from_path(config_path)
-    run_directory = ensure_run_dir(model_cfg.dataset_variant, model_cfg.encoding, model_cfg.model, config_tag)
+    run_directory = ensure_run_dir_for_config(config_path)
     logger.info("Artifacts will be stored in %s", run_directory)
 
     logger.info(
@@ -2711,6 +2722,14 @@ def main():
         if num_factor_types > 0:
             model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
             logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
+
+    _write_effective_experiment_config(
+        config_path,
+        experiment_config,
+        model_cfg=model_cfg,
+        training_cfg=training_cfg,
+    )
+    logger.info("Updated resolved experiment config at %s", config_path)
 
     # Load and freeze int encoder
     encoder = GlobalIntEncoder()
@@ -3076,11 +3095,6 @@ def main():
         model_path,
     )
     logger.info("Saved model checkpoint to %s", model_path)
-
-    # Persist a copy of the configuration alongside the run
-    config_destination = config_copy_path(run_directory)
-    if config_destination.resolve(strict=False) != config_path.resolve(strict=False):
-        shutil.copyfile(config_path, config_destination)
 
     # Save training history
     history_file = history_path(run_directory)

@@ -4,7 +4,6 @@
 import argparse
 import json
 import logging
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -27,10 +26,8 @@ from modules.data_encoders import (
     infer_node_feature_spec,
 )
 from modules.model_store import (
-    config_copy_path,
-    config_tag_from_path,
     available_config_tags,
-    ensure_run_dir,
+    ensure_run_dir_for_config,
     get_checkpoint_path,
     history_path,
     resolve_run_dir,
@@ -174,6 +171,25 @@ def _load_experiment_config(path: Path) -> tuple[ModelConfig, RerankerConfig, Re
     training_cfg = RerankerTrainingConfig.from_mapping(payload.get("training_config", {}))
     proposal_cfg = dict(payload.get("proposal_config", {}))
     return model_cfg, reranker_cfg, training_cfg, proposal_cfg
+
+
+def _write_effective_experiment_config(
+    config_path: Path,
+    original_payload: dict[str, Any],
+    *,
+    model_cfg: ModelConfig,
+    reranker_cfg: RerankerConfig,
+    training_cfg: RerankerTrainingConfig,
+    proposal_cfg: dict[str, Any],
+) -> None:
+    payload = dict(original_payload)
+    payload["model_config"] = model_cfg.to_dict()
+    payload["reranker_config"] = reranker_cfg.to_dict()
+    payload["training_config"] = training_cfg.to_dict()
+    payload["proposal_config"] = dict(proposal_cfg)
+    with config_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
 
 
 def _load_encoder(interim_path: Path) -> GlobalIntEncoder:
@@ -661,6 +677,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     set_seed(args.seed)
 
+    with args.experiment_config.open("r", encoding="utf-8") as fh:
+        experiment_payload = json.load(fh)
     model_cfg, reranker_cfg, training_cfg, proposal_cfg = _load_experiment_config(args.experiment_config)
 
     dataset_variant = dataset_variant_name(model_cfg.dataset_variant, model_cfg.min_occurrence)
@@ -809,9 +827,16 @@ def main() -> None:
         patience=training_cfg.scheduler_patience,
     )
 
-    run_dir = ensure_run_dir(
-        model_cfg.dataset_variant, model_cfg.encoding, "RERANKER", config_tag_from_path(args.experiment_config)
+    run_dir = ensure_run_dir_for_config(args.experiment_config)
+    _write_effective_experiment_config(
+        args.experiment_config,
+        experiment_payload,
+        model_cfg=model_cfg,
+        reranker_cfg=reranker_cfg,
+        training_cfg=training_cfg,
+        proposal_cfg=proposal_cfg,
     )
+    logger.info("Updated resolved experiment config at %s", args.experiment_config)
     if args.predict_only:
         checkpoint_path = get_checkpoint_path(run_dir)
         if not checkpoint_path.exists():
@@ -889,10 +914,6 @@ def main() -> None:
             if epoch - best_epoch >= training_cfg.early_stopping_rounds:
                 logger.info("Early stopping at epoch %s", epoch + 1)
                 break
-
-    config_destination = config_copy_path(run_dir)
-    if config_destination.resolve(strict=False) != args.experiment_config.resolve(strict=False):
-        shutil.copyfile(args.experiment_config, config_destination)
 
     history_file = history_path(run_dir)
     with history_file.open("w", encoding="utf-8") as fh:

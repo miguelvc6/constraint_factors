@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 
@@ -6,9 +7,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import modules.model_store as model_store
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import graph_dataset_filename
-from modules.model_store import config_tag_from_path
+from modules.model_store import config_tag_from_path, ensure_run_dir_for_config
 
 
 def test_graph_dataset_filename_by_representation() -> None:
@@ -22,6 +24,44 @@ def test_graph_dataset_filename_by_representation() -> None:
 def test_config_tag_uses_parent_directory_for_config_json() -> None:
     config_path = Path("models/m1d_safe_factor_direct__full_minocc100__node_id/config.json")
     assert config_tag_from_path(config_path) == "m1d_safe_factor_direct__full_minocc100__node_id"
+
+
+def test_run_dir_for_config_uses_config_parent(tmp_path) -> None:
+    config_path = tmp_path / "models" / "hp_m1c_c1__full_minocc100__node_id" / "config.json"
+    run_dir = ensure_run_dir_for_config(config_path)
+    assert run_dir == config_path.parent
+    assert run_dir.exists()
+
+
+def test_resolve_run_dir_accepts_config_directory_layout(tmp_path) -> None:
+    models_root = tmp_path / "models"
+    model_dir = models_root / "hp_m1c_c1__full_minocc100__node_id"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_config": {
+            "dataset_variant": "full_minocc100",
+            "encoding": "node_id",
+            "model": "GIN_PRESSURE",
+        },
+        "training_config": {},
+    }
+    (model_dir / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    original_root = model_store.MODELS_ROOT
+    model_store.MODELS_ROOT = models_root
+    try:
+        resolved = model_store.resolve_run_dir(
+            "full_minocc100",
+            "node_id",
+            "GIN_PRESSURE",
+            "hp_m1c_c1__full_minocc100__node_id",
+        )
+        assert resolved == model_dir
+        assert model_store.available_config_tags("full_minocc100", "node_id", "GIN_PRESSURE") == [
+            "hp_m1c_c1__full_minocc100__node_id"
+        ]
+    finally:
+        model_store.MODELS_ROOT = original_root
 
 
 def test_paper_surface_configs_accept_new_fields() -> None:
