@@ -644,8 +644,8 @@ class BaseGraphModel(nn.Module, ABC):
             if not mask.any():
                 continue
             state, logit = self._factor_executors[int(type_id)](inputs[mask])
-            states[mask] = state
-            logits[mask] = logit
+            states[mask] = state.to(dtype=states.dtype)
+            logits[mask] = logit.to(dtype=logits.dtype)
         return states, logits
 
     def _run_per_type_post_heads(
@@ -661,7 +661,9 @@ class BaseGraphModel(nn.Module, ABC):
             mask = factor_type_ids == int(type_id)
             if not mask.any():
                 continue
-            logits[mask] = self._factor_post_heads[int(type_id)](factor_states[mask], edit_repr[mask])
+            logits[mask] = self._factor_post_heads[int(type_id)](
+                factor_states[mask], edit_repr[mask]
+            ).to(dtype=logits.dtype)
         return logits
 
     def _gold_edit_representation(
