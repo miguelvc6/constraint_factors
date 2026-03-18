@@ -3,7 +3,7 @@ name = "kg-constraint-repair"
 version = "0.1.0"
 description = "Executable constraint factors for KG repair"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 
 dependencies = [
     "datasets>=4.5.0",
@@ -24,9 +24,22 @@ dependencies = [
     "tqdm>=4.67.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+]
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["modules*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
