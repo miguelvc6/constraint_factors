@@ -626,24 +626,46 @@ def train(
 
     train_is_iterable = isinstance(train_data, IterableDataset)
 
-    loader_kwargs: dict[str, Any] = {
-        "batch_size": batch_size,
-        "pin_memory": pin_memory,
-        "num_workers": train_cfg.num_workers,
-    }
-    if train_cfg.num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
+    def _loader_kwargs_for_split(split: str, dataset: list[Data] | GraphStreamDataset) -> dict[str, Any]:
+        dataset_is_iterable = isinstance(dataset, IterableDataset)
+        effective_pin_memory = pin_memory
+        if dataset_is_iterable and effective_pin_memory and device.type == "cuda":
+            logger.warning(
+                "Disabling pin_memory for %s loader because streamed graph datasets with worker queues "
+                "can exhaust host/shared memory on CUDA.",
+                split,
+            )
+            effective_pin_memory = False
+
+        kwargs: dict[str, Any] = {
+            "batch_size": batch_size,
+            "pin_memory": effective_pin_memory,
+            "num_workers": train_cfg.num_workers,
+        }
+        if train_cfg.num_workers > 0:
+            kwargs["persistent_workers"] = split == "train" and not dataset_is_iterable
+            kwargs["prefetch_factor"] = 1 if dataset_is_iterable else 2
+
+        logger.info(
+            "%s loader settings | batch_size=%s num_workers=%s pin_memory=%s persistent_workers=%s prefetch_factor=%s",
+            split.capitalize(),
+            kwargs["batch_size"],
+            kwargs["num_workers"],
+            kwargs["pin_memory"],
+            kwargs.get("persistent_workers", False),
+            kwargs.get("prefetch_factor", "n/a"),
+        )
+        return kwargs
 
     train_loader = DataLoader(
         cast(Any, train_data),
         shuffle=(not train_is_iterable),
-        **loader_kwargs,
+        **_loader_kwargs_for_split("train", train_data),
     )
     val_loader = DataLoader(
         cast(Any, val_data),
         shuffle=False,
-        **loader_kwargs,
+        **_loader_kwargs_for_split("val", val_data),
     )
 
     # Optimiser / scheduler / loss boilerplate.

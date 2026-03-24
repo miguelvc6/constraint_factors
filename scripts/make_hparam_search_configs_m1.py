@@ -28,6 +28,9 @@ import torch
 
 from modules.data_encoders import dataset_variant_name, discover_graph_artifacts, graph_dataset_filename
 
+SAFE_STREAMING_NUM_WORKERS = 2
+SAFE_STREAMING_PIN_MEMORY = False
+
 
 def _torch_load_trusted(path: Path) -> Any:
     """Load trusted local torch payloads (PyTorch 2.6+ compatible)."""
@@ -185,8 +188,8 @@ def main() -> None:
                 "weight_decay": hp.wd,
                 "scheduler_factor": 0.5,
                 "scheduler_patience": 2,
-                "num_workers": 4,
-                "pin_memory": True,
+                "num_workers": SAFE_STREAMING_NUM_WORKERS,
+                "pin_memory": SAFE_STREAMING_PIN_MEMORY,
                 "validate_factor_labels": True,
                 "fix_probability_loss": {"enabled": False},
                 "factor_loss": {

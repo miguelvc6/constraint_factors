@@ -61,6 +61,14 @@ Core optimization fields:
 - `pin_memory`
 - `validate_factor_labels`
 
+Generator defaults for the paper-facing proposal configs:
+
+- `batch_size: 256`
+- `num_workers: 2`
+- `pin_memory: false`
+
+These defaults are intentionally conservative for the large streamed graph artifacts under `data/processed/`.
+
 Nested blocks:
 
 - `constraint_loss.dynamic_reweighting`

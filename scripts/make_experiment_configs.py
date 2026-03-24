@@ -29,6 +29,8 @@ FACTORIZED_RE = re.compile(r"^train_graph-(?P<encoding>.+)\.pkl$")
 FACTORIZED_SHARD_RE = re.compile(r"^train_graph-(?P<encoding>.+)-shard\d+\.(?:pkl|pt)$")
 PASSIVE_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)\.pkl$")
 PASSIVE_SHARD_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)-shard\d+\.(?:pkl|pt)$")
+SAFE_STREAMING_NUM_WORKERS = 2
+SAFE_STREAMING_PIN_MEMORY = False
 
 
 def _parse_min_occurrence(variant: str) -> int:
@@ -168,8 +170,8 @@ def _proposal_config_payload(
             "weight_decay": 1e-4,
             "scheduler_factor": 0.5,
             "scheduler_patience": 2,
-            "num_workers": 4,
-            "pin_memory": True,
+            "num_workers": SAFE_STREAMING_NUM_WORKERS,
+            "pin_memory": SAFE_STREAMING_PIN_MEMORY,
             "validate_factor_labels": exp.validate_factor_labels,
             "constraint_loss": {
                 "dynamic_reweighting": {

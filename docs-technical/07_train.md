@@ -16,7 +16,7 @@
 5. **Factor type setup** – If `model_config.num_factor_types > 0`, training uses that value directly and skips the expensive dataset-wide `derive_factor_type_count()` scan. If it is `0`, the script infers the count from graph data.
 6. **Encoder + model build** – The frozen `GlobalIntEncoder` from `data/interim/<variant>/globalintencoder.txt` defines `num_graph_nodes`. `build_model()` instantiates the chosen architecture (e.g., message-passing network with dual branches). Device selection is automatic (CUDA if available) with memory logging hooks for debugging.
 7. **Training loop (`train()`):**
-   - Wrap datasets in `DataLoader`s, shuffling the in-memory split while leaving streaming datasets ordered.
+   - Wrap datasets in split-specific `DataLoader`s, shuffling the in-memory train split while leaving streaming datasets ordered. For streamed datasets the trainer disables `pin_memory`, reduces `prefetch_factor` to `1`, and keeps `persistent_workers=False` so train/validation worker pools do not overlap and exhaust shared memory at epoch boundaries.
    - Forward pass returns logits of shape `(batch, 6, num_target_ids)` where entity/predicate slots are masked to the per-split vocabularies. Each slot is compared against the gold IDs via `CrossEntropyLoss(reduction="none")`, producing a `(batch, 6)` loss matrix.
    - Per-graph loss is computed as the mean over the six slots (`graph_loss = loss_matrix.mean(dim=1)`), then optionally:
      - `FixProbabilityScheduler` adds a repair-aware penalty when violation contexts are available.
@@ -35,7 +35,8 @@
 - The `model_config.dataset_variant` and `model_config.encoding` must match the graphs on disk; mismatches surface as missing-file errors or shape mismatches deep in PyG.
 - When using `GraphStreamDataset`, `len(dataset)` is undefined, so progress bars may look odd—this is expected and doesn’t mean data is missing.
 - Early stopping patience is enforced even if validation batches fail intermittently; run with a stable validation split and monitor logs before trusting the saved checkpoint.
-- If CUDA is available but `num_workers` is high, pin-memory defaults to `True`; on systems with constrained RAM this can lead to OS-level swapping—tune `pin_memory` in the config if needed.
+- Generated paper/hparam configs now default to `num_workers=2` and `pin_memory=false` because the large streamed graph artifacts can exhaust shared memory with deeper worker queues.
+- If CUDA is available but `num_workers` is high, pin-memory can still amplify host-memory pressure on in-memory datasets; tune `pin_memory` in the config if throughput does not justify the footprint.
 - Fix-probability loss requires in-memory datasets (lists) so the script can attach `context_index` and look up contexts; streamed datasets will disable that term automatically.
 - Chooser training supports streamed datasets via per-graph `context_index` assignment; contexts/parquet sidecars must align with graph ordering/counts.
 - CUDA batch prefetch (`TRAIN_CUDA_PREFETCH`) is available and enabled by default; on some hardware/data combinations it may not improve throughput, so treat it as a tunable runtime flag.
