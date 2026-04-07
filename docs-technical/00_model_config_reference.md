@@ -69,6 +69,8 @@ Generator defaults for the paper-facing proposal configs:
 
 These defaults are intentionally conservative for the large streamed graph artifacts under `data/processed/`.
 
+For `num_factor_types`, the paper-facing generators prefer the compact factor-type count derived from the constraint registry rather than inferring from a single graph sample.
+
 Nested blocks:
 
 - `constraint_loss.dynamic_reweighting`

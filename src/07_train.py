@@ -143,6 +143,48 @@ def derive_factor_type_count(
     return max_type + 1 if max_type >= 0 else 0
 
 
+def _registry_factor_type_count(dataset_variant: str) -> int:
+    import pandas as pd
+
+    candidates = [
+        Path("data") / "interim" / f"constraint_registry_{dataset_variant}.parquet",
+        Path("data") / "interim" / f"constraint_registry_{base_dataset_name(dataset_variant)}.parquet",
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_parquet(path)
+        except Exception:
+            logger.exception("Failed to read constraint registry at %s", path)
+            continue
+
+        if "registry_json" in df.columns and len(df) > 0:
+            try:
+                payload = json.loads(df.iloc[0]["registry_json"])
+            except Exception:
+                logger.exception("Failed to parse registry_json from %s", path)
+                continue
+            indices = [
+                int(item["constraint_type_index"])
+                for item in payload.values()
+                if isinstance(item, dict) and item.get("constraint_type_index") is not None
+            ]
+            if indices:
+                return max(indices) + 1
+
+        for column in ("constraint_type_index", "constraint_type_id"):
+            if column not in df.columns:
+                continue
+            series = df[column].dropna()
+            if len(series) == 0:
+                continue
+            return int(series.max()) + 1
+
+    return 0
+
+
 def _load_encoder(interim_path: Path) -> GlobalIntEncoder:
     encoder = GlobalIntEncoder()
     encoder.load(interim_path / "globalintencoder.txt")
@@ -2735,15 +2777,30 @@ def main():
         num_role_types=role_spec.num_types if role_spec.enabled else 0,
         num_embedding_size=feature_dim if not use_node_embeddings else model_cfg.num_embedding_size,
     )
+    registry_factor_types = _registry_factor_type_count(model_cfg.dataset_variant)
+
     # Avoid scanning all graphs when num_factor_types is already explicit in config.
     if model_cfg.num_factor_types > 0:
         num_factor_types = int(model_cfg.num_factor_types)
+        if registry_factor_types > num_factor_types:
+            logger.warning(
+                "Config num_factor_types=%s is below registry-derived count=%s; using registry value instead.",
+                num_factor_types,
+                registry_factor_types,
+            )
+            num_factor_types = registry_factor_types
+            model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
         logger.info("Using preconfigured num_factor_types=%s (skipping dataset scan).", num_factor_types)
     else:
-        num_factor_types = derive_factor_type_count(train_data, val_data)
+        num_factor_types = registry_factor_types
         if num_factor_types > 0:
             model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
-            logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
+            logger.info("Inferred num_factor_types=%s from constraint registry.", num_factor_types)
+        else:
+            num_factor_types = derive_factor_type_count(train_data, val_data)
+            if num_factor_types > 0:
+                model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
+                logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
 
     _write_effective_experiment_config(
         config_path,

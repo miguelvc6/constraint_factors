@@ -24,9 +24,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import torch
 
-from modules.data_encoders import dataset_variant_name, discover_graph_artifacts, graph_dataset_filename
+from modules.data_encoders import (
+    base_dataset_name,
+    dataset_variant_name,
+    discover_graph_artifacts,
+    graph_dataset_filename,
+)
 
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
@@ -68,6 +74,30 @@ def _infer_num_factor_types(sample_data: Any) -> int:
             except Exception:
                 pass
 
+    return 0
+
+
+def _infer_num_factor_types_from_registry(dataset_variant: str, interim_root: Path = Path("data/interim")) -> int:
+    candidates = [
+        interim_root / f"constraint_registry_{dataset_variant}.parquet",
+        interim_root / f"constraint_registry_{base_dataset_name(dataset_variant)}.parquet",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        df = pd.read_parquet(path)
+        if "registry_json" in df.columns and len(df) > 0:
+            payload = json.loads(df.iloc[0]["registry_json"])
+            indices = [
+                int(item["constraint_type_index"])
+                for item in payload.values()
+                if isinstance(item, dict) and item.get("constraint_type_index") is not None
+            ]
+            if indices:
+                return max(indices) + 1
+        for column in ("constraint_type_index", "constraint_type_id"):
+            if column in df.columns and len(df[column].dropna()) > 0:
+                return int(df[column].max()) + 1
     return 0
 
 
@@ -126,8 +156,10 @@ def main() -> None:
             f"Expected monolithic file or shards matching: {train_graph.parent}/{train_graph.stem}-shard*"
         )
 
-    sample = _load_first_data_obj(artifacts[0].path)
-    num_factor_types = _infer_num_factor_types(sample)
+    num_factor_types = _infer_num_factor_types_from_registry(variant)
+    if num_factor_types <= 0:
+        sample = _load_first_data_obj(artifacts[0].path)
+        num_factor_types = _infer_num_factor_types(sample)
 
     # ---- Focused shortlist (5 configs) ----
     # These are the selected candidates for constrained-budget model selection.

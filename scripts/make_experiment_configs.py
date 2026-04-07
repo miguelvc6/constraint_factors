@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import torch
+import pandas as pd
 
-from modules.data_encoders import graph_dataset_filename
+from modules.data_encoders import base_dataset_name, graph_dataset_filename
 
 VARIANT_MINOCC_RE = re.compile(r"minocc(\d+)", re.IGNORECASE)
 FACTORIZED_RE = re.compile(r"^train_graph-(?P<encoding>.+)\.pkl$")
@@ -79,6 +80,30 @@ def _infer_num_factor_types(sample_data: Any) -> int:
                 return int(value.max().item()) + 1
             except Exception:
                 pass
+    return 0
+
+
+def _infer_num_factor_types_from_registry(dataset_variant: str, interim_root: Path = Path("data/interim")) -> int:
+    candidates = [
+        interim_root / f"constraint_registry_{dataset_variant}.parquet",
+        interim_root / f"constraint_registry_{base_dataset_name(dataset_variant)}.parquet",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        df = pd.read_parquet(path)
+        if "registry_json" in df.columns and len(df) > 0:
+            payload = json.loads(df.iloc[0]["registry_json"])
+            indices = [
+                int(item["constraint_type_index"])
+                for item in payload.values()
+                if isinstance(item, dict) and item.get("constraint_type_index") is not None
+            ]
+            if indices:
+                return max(indices) + 1
+        for column in ("constraint_type_index", "constraint_type_id"):
+            if column in df.columns and len(df[column].dropna()) > 0:
+                return int(df[column].max()) + 1
     return 0
 
 
@@ -361,8 +386,10 @@ def main() -> None:
             encoding,
             constraint_representation="eswc_passive",
         )
-        sample = _load_first_data_obj(factorized_path) or _load_first_data_obj(passive_path)
-        num_factor_types = _infer_num_factor_types(sample)
+        num_factor_types = _infer_num_factor_types_from_registry(variant)
+        if num_factor_types <= 0:
+            sample = _load_first_data_obj(factorized_path) or _load_first_data_obj(passive_path)
+            num_factor_types = _infer_num_factor_types(sample)
 
         proposal_experiments = list(canonical_proposals)
         reranker_experiments = list(canonical_rerankers)
