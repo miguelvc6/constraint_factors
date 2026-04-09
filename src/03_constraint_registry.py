@@ -35,6 +35,16 @@ def _load_dataframe_builder() -> Any:
     return module
 
 
+def _load_catalog_builder() -> Any:
+    module_path = REPO_ROOT / "scripts" / "build_constraint_type_catalog.py"
+    spec = importlib.util.spec_from_file_location("build_constraint_type_catalog", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _normalize_entity_id(value: str) -> str:
     raw = value.strip().strip("<>").strip()
     if raw.startswith("http://www.wikidata.org/entity/"):
@@ -195,10 +205,23 @@ def main() -> None:
     constraints_def, constraints_by_property = builder.load_constraint_data()
 
     if not CATALOG_PATH.exists():
-        raise FileNotFoundError(
-            f"Constraint type catalog not found at {CATALOG_PATH}. "
-            "Run scripts/build_constraint_type_catalog.py to generate it."
+        catalog_builder = _load_catalog_builder()
+        print(
+            "Constraint type catalog missing at "
+            f"{CATALOG_PATH}. Bootstrapping it from data/raw/{args.dataset}/constraints.tsv via Wikidata."
         )
+        try:
+            catalog_builder.write_catalog(dataset=args.dataset, output=CATALOG_PATH)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Constraint type catalog not found at {CATALOG_PATH}, and automatic bootstrap failed: {exc}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                "Constraint type catalog bootstrap failed. "
+                f"Try `uv run scripts/build_constraint_type_catalog.py --dataset {args.dataset}`. "
+                "This step requires outbound network access to Wikidata."
+            ) from exc
     catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
 
     registry = build_registry(constraints_def, constraints_by_property, catalog)

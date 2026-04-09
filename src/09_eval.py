@@ -127,7 +127,8 @@ class GlobalMetricsSupport:
         state: dict[str, object] = {}
 
         pre_vectors: list[dict[str, object]] | None = None
-        if test_data:
+        # Streamed datasets intentionally do not implement truthiness via __len__.
+        if test_data is not None:
             vectors: list[dict[str, object]] = []
             any_vectors = False
             for data in test_data:

@@ -60,7 +60,8 @@ constraint checks are marked **not checkable** (conservative).
 ## Constraint Types Implemented (v1)
 Per-type checkability and satisfaction are implemented in `src/modules/constraint_checkers.py`.
 Canonical constraint-family names come from the registry (`constraint_family`), generated via the
-static catalog in `data/static/constraint_type_catalog.json`.
+static catalog in `data/static/constraint_type_catalog.json`. On a fresh clone,
+`03_constraint_registry.py` bootstraps that catalog automatically if it is missing.
 - `conflictWith`
 - `inverse`
 - `itemRequiresStatement`

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a constraint type catalog with labels from Wikidata (one-time script)."""
+"""Build a constraint type catalog with labels from Wikidata."""
 
 import argparse
 import csv
@@ -47,25 +47,10 @@ def _to_family(label: str) -> str:
     return parts[0] + "".join(word.capitalize() for word in parts[1:])
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build constraint type catalog from Wikidata.")
-    parser.add_argument(
-        "--dataset",
-        choices=["sample", "full"],
-        default="full",
-        help="Dataset to scan for constraints.tsv (default: full).",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data/static/constraint_type_catalog.json"),
-        help="Output path for the catalog JSON.",
-    )
-    args = parser.parse_args()
-
-    constraints_path = Path("data/raw") / args.dataset / "constraints.tsv"
+def collect_constraint_type_qids(dataset: str) -> list[str]:
+    constraints_path = Path("data/raw") / dataset / "constraints.tsv"
     if not constraints_path.exists():
-        raise SystemExit(f"constraints.tsv not found at {constraints_path}")
+        raise FileNotFoundError(f"constraints.tsv not found at {constraints_path}")
 
     qids: set[str] = set()
     with constraints_path.open(newline="") as fh:
@@ -77,8 +62,12 @@ def main() -> None:
                 qids.add(qid)
 
     if not qids:
-        raise SystemExit("No constraint_type_item values found.")
+        raise ValueError("No constraint_type_item values found.")
 
+    return sorted(qids)
+
+
+def build_catalog_for_qids(qids: list[str]) -> dict[str, dict[str, str]]:
     session = requests.Session()
     headers = {
         "User-Agent": "ConstraintFactorBot/1.0 (https://github.com/your-repo; miguel.vazquez@wu.ac.at) Python-Requests/2.31",
@@ -87,9 +76,7 @@ def main() -> None:
 
     labels: dict[str, str] = {}
     counts = Counter()
-    qids_sorted = sorted(qids)
-
-    for chunk in _chunk(qids_sorted, 200):
+    for chunk in _chunk(qids, 200):
         values_clause = " ".join(f"wd:{qid}" for qid in chunk)
         query = f"""
             SELECT ?entity ?entityLabel WHERE {{
@@ -106,16 +93,45 @@ def main() -> None:
         counts["chunks"] += 1
 
     catalog: dict[str, dict[str, str]] = {}
-    for qid in qids_sorted:
+    for qid in qids:
         label = labels.get(qid, qid)
         family = _to_family(label)
         catalog[qid] = {
             "family": family,
             "label": label,
         }
+    return catalog
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(catalog, indent=2, sort_keys=True), encoding="utf-8")
+
+def write_catalog(*, dataset: str, output: Path) -> dict[str, dict[str, str]]:
+    qids = collect_constraint_type_qids(dataset)
+    catalog = build_catalog_for_qids(qids)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(catalog, indent=2, sort_keys=True), encoding="utf-8")
+    return catalog
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build constraint type catalog from Wikidata.")
+    parser.add_argument(
+        "--dataset",
+        choices=["sample", "full"],
+        default="full",
+        help="Dataset to scan for constraints.tsv (default: full).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/static/constraint_type_catalog.json"),
+        help="Output path for the catalog JSON.",
+    )
+    args = parser.parse_args()
+
+    try:
+        catalog = write_catalog(dataset=args.dataset, output=args.output)
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
     print(f"Wrote catalog with {len(catalog)} entries to {args.output}")
 
 

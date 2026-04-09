@@ -38,6 +38,7 @@ Notes:
 - The `sample` dataset is appropriate for debugging and smoke tests.
 - The `full` dataset is the paper-facing run surface and is substantially larger.
 - `text_embedding` runs require outbound network access for Wikidata lookup and model downloads.
+- The first `src/03_constraint_registry.py` run may also use outbound network access to bootstrap `data/static/constraint_type_catalog.json` on a fresh clone.
 
 ### Environment Installation
 
@@ -76,6 +77,9 @@ uv run src/02_dataframe_builder.py \
 uv run src/03_constraint_registry.py --dataset sample
 ```
 
+On a fresh clone, this step bootstraps `data/static/constraint_type_catalog.json`
+from the selected dataset's `constraints.tsv` if the catalog is missing.
+
 ### 4. Label local constraint factors
 
 ```bash
@@ -89,13 +93,11 @@ uv run src/05_constraint_labeler.py \
 ### 5. Materialize factorized graphs
 
 ```bash
-uv run src/06_graph.py \
+uv run src/05_constraint_labeler.py \
   --dataset sample \
   --min-occurrence 100 \
-  --encoding node_id \
   --constraint-scope local \
-  --constraint-representation factorized \
-  --max-instances 300
+  --max-rows 300
 ```
 
 ### 6. Run baseline evaluation

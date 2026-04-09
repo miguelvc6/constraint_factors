@@ -6,26 +6,27 @@
 - Persist the registry at `data/interim/constraint_registry_<dataset>.parquet`.
 
 ## Inputs & Outputs
-- **Inputs:** `data/raw/<dataset>/constraints.tsv`, `data/static/constraint_type_catalog.json`, and the `--dataset` CLI flag.
+- **Inputs:** `data/raw/<dataset>/constraints.tsv`, the `--dataset` CLI flag, and optionally `data/static/constraint_type_catalog.json`.
 - **Outputs:** `data/interim/constraint_registry_<dataset>.parquet` containing a single JSON-serialized registry map.
 
 ## Workflow
 1. Parse the `--dataset` CLI argument and locate `data/raw/<dataset>/constraints.tsv`.
 2. Load `constraints.tsv` using the shared `load_constraint_data()` logic from `02_dataframe_builder.py`.
-3. For each constraint id, extract:
+3. If `data/static/constraint_type_catalog.json` is missing, bootstrap it by querying Wikidata for the constraint-type QIDs found in the current dataset's `constraints.tsv`.
+4. For each constraint id, extract:
    - `constraint_type` (raw object from `P2302`),
    - `constraint_type_item` (normalized QID),
    - `constraint_family` + `constraint_family_supported` (via `canonicalize_constraint_type()` and `modules.constraint_checkers`),
    - `constraint_label` (from the static catalog, when available),
    - `constrained_property`,
    - parameter predicates and parameter objects.
-4. Normalize registry tokens to match the encoder’s canonical strings (preserving `^` prefixes and angle brackets, while normalizing `prop/direct/` to `entity/`).
-5. Validate:
+5. Normalize registry tokens to match the encoder’s canonical strings (preserving `^` prefixes and angle brackets, while normalizing `prop/direct/` to `entity/`).
+6. Validate:
    - every constraint id appears exactly once,
    - each constraint has exactly one constrained property,
    - parameters are non-null strings,
    - entry count matches the parsed constraints.
-6. Serialize the registry with sorted keys into a single parquet row (`registry_json`).
+7. Serialize the registry with sorted keys into a single parquet row (`registry_json`).
 
 ## Output Schema
 The registry maps each constraint id to:
@@ -40,4 +41,5 @@ The registry maps each constraint id to:
 
 ## Common Pitfalls / Gotchas
 - The script expects `constraints.tsv` under `data/raw/<dataset>/`; verify the dataset name matches the directory.
+- Automatic catalog bootstrap requires outbound network access to Wikidata on the first run in a fresh clone.
 - `constraint_registry_<dataset>.parquet` is required by `04_wikidata_retriever.py`; run this script first when building a fresh pipeline.
