@@ -79,19 +79,21 @@ Each instance includes:
    - These become binary labels `s_c^-` and `s_c^+`.
 
 ### Locally applicable constraint set `C_local`
-Two viable definitions (start with the conservative one):
+Two viable definitions:
 
 **(A) Predicate-scope constraints:**  
 Include constraint instances attached to the properties appearing in the focus/conflicting triples.
+This is the narrowest option and matches a repair view in which only the focus/conflict predicates are considered actionable.
 
 **(B) Local closure (broader):**  
 Include constraint instances attached to any property within 1-hop of the shared entities involved in the violation.
+This broader option is motivated by the fact that repairs are not always limited to deleting the focus/conflict triple: some constraint families repair a violation by adding or deleting a different statement on one of the same local entities (for example type-, inverse-, or required-statement-style repairs). Local closure therefore aims to capture constraints that may be affected by such local but off-predicate edits.
 
 ### Repository instantiation for the current paper line
 
-In the current repository, the paper-facing pipeline instantiates the conservative `C_local` choice through the technical setting `constraint_scope=local` in `05_constraint_labeler.py` and `06_graph.py`.
+In the current repository, the paper-facing pipeline uses the bounded local-closure version through the technical setting `constraint_scope=local` in `05_constraint_labeler.py` and `06_graph.py`.
 
-This should be read as the bounded local-closure version used by the current pipeline, not as an unbounded neighborhood expansion.
+The narrower predicate/focus-scoped alternative is exposed separately through the technical `focus` scope. Accordingly, `local` should be read as bounded local closure, not as the conservative predicate-only definition and not as an unbounded neighborhood expansion.
 
 ---
 
