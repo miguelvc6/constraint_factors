@@ -24,7 +24,7 @@ Conceptual-to-technical mapping for this paper line:
 
 Before running anything, freeze these decisions for the entire paper run:
 
-- dataset variant: one paper dataset only, typically `full`
+- dataset variant: one paper dataset only, `full_strat1m_minocc100`
 - `min_occurrence`: one value only, typically `100`
 - encoding: one paper encoding only
 - proposal random seed: `42`
@@ -88,9 +88,24 @@ The policy-choice model is intentionally out of scope for this paper line and is
 The paper line must materialize the artifact stack before config generation:
 
 1. optional text cache for `text_embedding`
-2. labeled interim parquet with `constraint-scope=local`
-3. factorized processed graphs
-4. passive processed graphs
+2. stratified benchmark parquet (`full_strat1m_minocc100`)
+3. labeled interim parquet with `constraint-scope=local`
+4. factorized processed graphs
+5. passive processed graphs
+
+**Build the stratified paper benchmark**
+
+Run this after `02_dataframe_builder.py` has produced `data/interim/full_minocc100/`:
+
+```bash
+uv run src/02b_stratified_benchmark_sampler.py \
+  --source-dataset full \
+  --output-dataset full_strat1m \
+  --min-occurrence 100 \
+  --sample-fraction 0.5 \
+  --seed 42 \
+  --scope local
+```
 
 **Optional: build the text cache**
 
@@ -98,17 +113,19 @@ Only needed when the paper encoding is `text_embedding`.
 
 ```bash
 uv run src/04_wikidata_retriever.py \
-  --dataset full \
-  --min-occurrence 100
+  --dataset full_strat1m \
+  --min-occurrence 100 \
+  --registry-dataset full
 ```
 
 **Build labeled interim parquet for the paper scope**
 
 ```bash
 uv run src/05_constraint_labeler.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
-  --constraint-scope local
+  --constraint-scope local \
+  --registry-dataset full
 ```
 
 **Build factorized executable-factor graphs**
@@ -117,11 +134,12 @@ For `node_id`:
 
 ```bash
 uv run src/06_graph.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
   --encoding node_id \
   --constraint-scope local \
-  --constraint-representation factorized
+  --constraint-representation factorized \
+  --registry-dataset full
 ```
 
 If monolithic graph writes run out of memory, add:
@@ -135,11 +153,12 @@ For `text_embedding`:
 
 ```bash
 uv run src/06_graph.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
   --encoding text_embedding \
   --constraint-scope local \
-  --constraint-representation factorized
+  --constraint-representation factorized \
+  --registry-dataset full
 ```
 
 The training, reranker, config-generation, and evaluation paths ingest these shard artifacts transparently.
@@ -150,10 +169,11 @@ For `node_id`:
 
 ```bash
 uv run src/06_graph.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
   --encoding node_id \
-  --constraint-representation eswc_passive
+  --constraint-representation eswc_passive \
+  --registry-dataset full
 ```
 
 The same optional shard flags may be used here if needed:
@@ -167,17 +187,19 @@ For `text_embedding`:
 
 ```bash
 uv run src/06_graph.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
   --encoding text_embedding \
-  --constraint-representation eswc_passive
+  --constraint-representation eswc_passive \
+  --registry-dataset full
 ```
 
 Paper readiness check:
 
-- factorized train/test artifacts exist under `data/processed/full_minocc100/`
-- passive train/test artifacts exist under `data/processed/full_minocc100/`
-- labeled parquet exists under `data/interim/full_minocc100_labeled/`
+- stratified parquet exists under `data/interim/full_strat1m_minocc100/`
+- factorized train/test artifacts exist under `data/processed/full_strat1m_minocc100/`
+- passive train/test artifacts exist under `data/processed/full_strat1m_minocc100/`
+- labeled parquet exists under `data/interim/full_strat1m_minocc100_labeled/`
 - coverage reports exist:
   - `coverage_local.csv`
   - `coverage_local.md`
@@ -208,14 +230,15 @@ Run baselines before any neural training so the paper already has stable referen
 ```bash
 uv run src/09_eval.py \
   --run-baselines \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
+  --registry-dataset full \
   --per-constraint-csv
 ```
 
 Outputs are written under:
 
-- `models/baselines/full/parquet/`
+- `models/baselines/full_strat1m/parquet/`
 
 This gives the reference results for:
 
@@ -247,16 +270,16 @@ Generate the short search set:
 uv run scripts/make_hparam_search_configs_m1.py \
   --processed-root data/processed \
   --models-root models \
-  --dataset-variant full \
+  --dataset-variant full_strat1m \
   --min-occurrence 100 \
   --encoding <paper_encoding> \
-  --num-configs 5 \
+  --num-configs 4 \
   --seed 42
 ```
 
 Recommended search budget:
 
-- default: `5` configs max
+- default: `4` configs max
 - if compute is very tight: rerun with `--num-configs 3`
 - one seed only
 - no repeated sweeps
@@ -482,7 +505,7 @@ Before declaring the suite complete, verify:
   - `checkpoint.pth`
   - `training_history.json`
   - `eval.json`
-- baselines were written under `models/baselines/full/parquet/`
+- baselines were written under `models/baselines/full_strat1m/parquet/`
 - the resolved runtime directories under `models/` contain `evaluations/model.json` and `evaluations/per_constraint.csv` for the final paper runs
 
 ## 7. Recommended stop rule
