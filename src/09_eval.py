@@ -1229,6 +1229,15 @@ def load_placeholder_ids(encoder_path: Path) -> dict[str, int]:
     return placeholders
 
 
+def _checkpoint_has_chooser_state(state_dict: dict[str, object]) -> bool:
+    return any(key.startswith(("_candidate_id_embeddings.", "_chooser_head.")) for key in state_dict)
+
+
+def _enable_checkpoint_optional_heads(model: BaseGraphModel, state_dict: dict[str, object]) -> None:
+    if _checkpoint_has_chooser_state(state_dict) and not model.chooser_enabled:
+        model.enable_chooser()
+
+
 # Load and run a trained torch model
 def evaluate_trained_model(
     *,
@@ -1280,7 +1289,8 @@ def evaluate_trained_model(
                 int(num_graph_nodes),
                 effective_model_cfg,
             )
-            if chooser_support is not None:
+            _enable_checkpoint_optional_heads(model, state_dict)
+            if chooser_support is not None and not model.chooser_enabled:
                 model.enable_chooser()
             model.load_state_dict(state_dict)
             model.to(device)

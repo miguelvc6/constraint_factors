@@ -137,8 +137,59 @@ def test_global_metrics_postprocess_accepts_streaming_test_data() -> None:
     assert len(captured["pre_vectors"]) == 2
 
 
+def test_eval_loads_chooser_checkpoint_without_chooser_mode() -> None:
+    eval_module = _load_module(ROOT / "src" / "09_eval.py", "eval_09_chooser_checkpoint_test")
+
+    model_cfg = eval_module.ModelConfig(
+        model="GIN_PRESSURE",
+        num_embedding_size=8,
+        hidden_channels=8,
+        head_hidden=8,
+        num_layers=2,
+        dropout=0.0,
+        entity_class_ids=[0, 1, 2],
+        predicate_class_ids=[0, 1, 2],
+        num_factor_types=1,
+    )
+    model = eval_module.build_model("GIN_PRESSURE", 3, model_cfg)
+    model.enable_chooser()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_dir = Path(tmpdir)
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "num_graph_nodes": 3,
+                "model_name": "GIN_PRESSURE",
+                "model_cfg": model_cfg.to_dict(),
+            },
+            run_dir / "checkpoint.pth",
+        )
+
+        captured: dict[str, object] = {}
+
+        def fake_run_and_save(**kwargs):
+            captured["model"] = kwargs["model"]
+
+        original = eval_module._run_and_save
+        eval_module._run_and_save = fake_run_and_save
+        try:
+            eval_module.evaluate_trained_model(
+                run_directory=run_dir,
+                model_cfg=model_cfg,
+                device=torch.device("cpu"),
+                test_data=[],
+            )
+        finally:
+            eval_module._run_and_save = original
+
+    loaded = captured["model"]
+    assert loaded.chooser_enabled
+
+
 if __name__ == "__main__":
     test_load_graph_dataset_streams_torch_shards()
     test_eval_accepts_sharded_test_split_without_monolith()
     test_global_metrics_postprocess_accepts_streaming_test_data()
+    test_eval_loads_chooser_checkpoint_without_chooser_mode()
     print("sharded graph ingestion tests passed")
