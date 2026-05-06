@@ -76,6 +76,25 @@ NONE_CLASS_INDEX = 0
 logger = logging.getLogger(__name__)
 
 
+class ValidationSubsetStream(IterableDataset):
+    """Yield the first ``limit`` graphs from a streamed validation dataset."""
+
+    def __init__(self, dataset: IterableDataset, limit: int) -> None:
+        if limit <= 0:
+            raise ValueError("Validation subset limit must be positive.")
+        self.dataset = dataset
+        self.limit = int(limit)
+
+    def __iter__(self):
+        for idx, graph in enumerate(self.dataset):
+            if idx >= self.limit:
+                break
+            yield graph
+
+    def __len__(self) -> int:
+        return self.limit
+
+
 @dataclass
 class RerankerTrainingConfig:
     batch_size: int = 32
@@ -88,6 +107,7 @@ class RerankerTrainingConfig:
     scheduler_patience: int = 2
     num_workers: int = 0
     pin_memory: bool = False
+    validation_subset_size: int | None = None
     objective: str = "main"  # main | global_fix
     regression_weight: float = 0.5
     topk_candidates: int = 20
@@ -110,6 +130,11 @@ class RerankerTrainingConfig:
         constraint_scope = str(payload.get("constraint_scope", cls.constraint_scope)).lower()
         if constraint_scope not in {"local", "focus"}:
             raise ValueError("training_config.constraint_scope must be 'local' or 'focus'")
+        validation_subset_size = payload.get("validation_subset_size", cls.validation_subset_size)
+        if validation_subset_size is not None:
+            validation_subset_size = int(validation_subset_size)
+            if validation_subset_size <= 0:
+                raise ValueError("training_config.validation_subset_size must be positive when set")
         return cls(
             batch_size=int(payload.get("batch_size", cls.batch_size)),
             num_epochs=int(payload.get("num_epochs", cls.num_epochs)),
@@ -121,6 +146,7 @@ class RerankerTrainingConfig:
             scheduler_patience=int(payload.get("scheduler_patience", cls.scheduler_patience)),
             num_workers=int(payload.get("num_workers", cls.num_workers)),
             pin_memory=bool(payload.get("pin_memory", cls.pin_memory)),
+            validation_subset_size=validation_subset_size,
             objective=objective,
             regression_weight=float(payload.get("regression_weight", cls.regression_weight)),
             topk_candidates=int(payload.get("topk_candidates", cls.topk_candidates)),
@@ -147,6 +173,7 @@ class RerankerTrainingConfig:
             "scheduler_patience": self.scheduler_patience,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
+            "validation_subset_size": self.validation_subset_size,
             "objective": self.objective,
             "regression_weight": self.regression_weight,
             "topk_candidates": self.topk_candidates,
@@ -786,6 +813,30 @@ def main() -> None:
         )
         training_cfg.batch_size = 8
 
+    validation_subset_size = training_cfg.validation_subset_size
+    val_loader_data: list[Data] | IterableDataset
+    val_num_workers = training_cfg.num_workers
+    if validation_subset_size is None:
+        val_loader_data = val_data
+    elif isinstance(val_data, list):
+        val_loader_data = val_data[:validation_subset_size]
+        logger.info(
+            "Reranker validation subset enabled | using first %s/%s in-memory graphs per epoch",
+            len(val_loader_data),
+            len(val_data),
+        )
+    else:
+        val_loader_data = ValidationSubsetStream(val_data, validation_subset_size)
+        if val_num_workers > 0:
+            logger.info(
+                "Reranker validation subset uses num_workers=0 so streamed validation emits one global prefix only."
+            )
+            val_num_workers = 0
+        logger.info(
+            "Reranker validation subset enabled | using first %s streamed graphs per epoch",
+            validation_subset_size,
+        )
+
     graph_model_cfg = model_cfg
     if str(model_cfg.model).upper() == "RERANKER":
         model_payload = model_cfg.to_dict()
@@ -811,10 +862,10 @@ def main() -> None:
         pin_memory=training_cfg.pin_memory,
     )
     val_loader = DataLoader(
-        val_data,
+        val_loader_data,
         batch_size=training_cfg.batch_size,
         shuffle=False,
-        num_workers=training_cfg.num_workers,
+        num_workers=val_num_workers,
         pin_memory=training_cfg.pin_memory,
     )
 

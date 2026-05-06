@@ -458,6 +458,7 @@ class TrainingConfig:
     num_workers: int = 0  # Worker processes used by DataLoader.
     pin_memory: bool | None = None  # Override DataLoader pin_memory behaviour (None keeps the default).
     validate_factor_labels: bool = False  # Enable strict factor label assertions per batch.
+    validation_subset_size: int | None = None  # Optional cap on validation graphs per epoch.
     constraint_loss: ConstraintLossConfig = field(default_factory=ConstraintLossConfig)
     fix_probability_loss: FixProbabilityLossConfig = field(default_factory=FixProbabilityLossConfig)
     factor_loss: FactorLossConfig = field(default_factory=FactorLossConfig)
@@ -490,6 +491,11 @@ class TrainingConfig:
         direct_safety_update = filtered.pop("direct_safety", None)
         if "policy_filter_strict" in filtered and filtered["policy_filter_strict"] is not None:
             filtered["policy_filter_strict"] = bool(filtered["policy_filter_strict"])
+        if "validation_subset_size" in filtered and filtered["validation_subset_size"] is not None:
+            subset_size = int(filtered["validation_subset_size"])
+            if subset_size <= 0:
+                raise ValueError("TrainingConfig.validation_subset_size must be positive when set")
+            filtered["validation_subset_size"] = subset_size
 
         if dynamic_fallback is not None:
             if constraint_update is None:

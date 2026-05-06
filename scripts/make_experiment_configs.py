@@ -32,6 +32,12 @@ PASSIVE_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)\.pkl$"
 PASSIVE_SHARD_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)-shard\d+\.(?:pkl|pt)$")
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
+VALIDATION_SUBSET_SIZE = 25_000
+CHEAPER_NUM_EPOCHS = 20
+CHEAPER_EARLY_STOPPING_ROUNDS = 5
+CHEAPER_LEARNING_RATE = 3e-4
+CHEAPER_SCHEDULER_FACTOR = 0.5
+CHEAPER_SCHEDULER_PATIENCE = 1
 
 
 def _parse_min_occurrence(variant: str) -> int:
@@ -189,15 +195,16 @@ def _proposal_config_payload(
         },
         "training_config": {
             "batch_size": 256,
-            "num_epochs": 30,
-            "early_stopping_rounds": 6,
-            "learning_rate": 3e-4,
+            "num_epochs": CHEAPER_NUM_EPOCHS,
+            "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
+            "learning_rate": CHEAPER_LEARNING_RATE,
             "weight_decay": 1e-4,
-            "scheduler_factor": 0.5,
-            "scheduler_patience": 2,
+            "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
+            "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
             "num_workers": SAFE_STREAMING_NUM_WORKERS,
             "pin_memory": SAFE_STREAMING_PIN_MEMORY,
             "validate_factor_labels": exp.validate_factor_labels,
+            "validation_subset_size": VALIDATION_SUBSET_SIZE,
             "constraint_loss": {
                 "dynamic_reweighting": {
                     "enabled": dynamic_reweighting,
@@ -253,12 +260,13 @@ def _reranker_config_payload(
         "reranker_config": {},
         "training_config": {
             "batch_size": 64,
-            "num_epochs": 20,
-            "early_stopping_rounds": 4,
-            "learning_rate": 1e-4,
+            "num_epochs": CHEAPER_NUM_EPOCHS,
+            "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
+            "learning_rate": CHEAPER_LEARNING_RATE,
             "weight_decay": 1e-4,
-            "scheduler_factor": 0.5,
-            "scheduler_patience": 2,
+            "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
+            "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
+            "validation_subset_size": VALIDATION_SUBSET_SIZE,
             "objective": exp.objective,
             "regression_weight": 0.5,
             "topk_candidates": 20,

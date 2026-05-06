@@ -60,14 +60,24 @@ Core optimization fields:
 - `num_workers`
 - `pin_memory`
 - `validate_factor_labels`
+- `validation_subset_size`
 
 Generator defaults for the paper-facing proposal configs:
 
 - `batch_size: 256`
+- `num_epochs: 20`
+- `early_stopping_rounds: 5`
+- `learning_rate: 3e-4`
+- `scheduler_factor: 0.5`
+- `scheduler_patience: 1`
 - `num_workers: 2`
 - `pin_memory: false`
 
 These defaults are intentionally conservative for the large streamed graph artifacts under `data/processed/`.
+
+The paper-facing reranker generator uses the same cheaper schedule (`num_epochs: 20`, `early_stopping_rounds: 5`, `learning_rate: 3e-4`, `scheduler_patience: 1`) with its own reranker batch size.
+
+Set `validation_subset_size` to a positive integer for development runs that should validate on only the first N validation graphs each epoch. Leave it unset or `null` for full validation. For streamed graph artifacts, subset validation uses a single validation worker so the stream produces one global prefix rather than one prefix per worker.
 
 For `num_factor_types`, the paper-facing generators prefer the compact factor-type count derived from the constraint registry rather than inferring from a single graph sample.
 
@@ -117,6 +127,7 @@ Reranker configs use the schema in `src/08_train_reranker.py`.
 
 Paper-relevant fields:
 
+- `validation_subset_size`
 - `objective`
   - `main`
   - `global_fix`

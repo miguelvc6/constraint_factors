@@ -62,6 +62,25 @@ ENTITY_SLOT_INDICES: tuple[int, ...] = (0, 2, 3, 5)
 PREDICATE_SLOT_INDICES: tuple[int, ...] = (1, 4)
 
 
+class ValidationSubsetStream(IterableDataset):
+    """Yield the first ``limit`` graphs from a streamed validation dataset."""
+
+    def __init__(self, dataset: IterableDataset, limit: int) -> None:
+        if limit <= 0:
+            raise ValueError("Validation subset limit must be positive.")
+        self.dataset = dataset
+        self.limit = int(limit)
+
+    def __iter__(self) -> Iterator[Data]:
+        for idx, graph in enumerate(self.dataset):
+            if idx >= self.limit:
+                break
+            yield graph
+
+    def __len__(self) -> int:
+        return self.limit
+
+
 # Implementation checklist (factor supervision):
 # - In train() and validation loops, insert factor-level losses after graph_loss is computed
 #   and before dynamic reweighting (and before weighted_loss is averaged).
@@ -653,6 +672,24 @@ def train(
     # Dataset bookkeeping / loader construction.
     train_dataset_info = "streaming" if isinstance(train_data, IterableDataset) else "in-memory"
     val_dataset_info = "streaming" if isinstance(val_data, IterableDataset) else "in-memory"
+    validation_subset_size = train_cfg.validation_subset_size
+
+    val_loader_data: list[Data] | IterableDataset
+    if validation_subset_size is None:
+        val_loader_data = val_data
+    elif isinstance(val_data, list):
+        val_loader_data = val_data[:validation_subset_size]
+        logger.info(
+            "Validation subset enabled | using first %s/%s in-memory graphs per epoch",
+            len(val_loader_data),
+            len(val_data),
+        )
+    else:
+        val_loader_data = ValidationSubsetStream(cast(IterableDataset, val_data), validation_subset_size)
+        logger.info(
+            "Validation subset enabled | using first %s streamed graphs per epoch",
+            validation_subset_size,
+        )
 
     try:
         train_size = len(train_data)
@@ -668,8 +705,14 @@ def train(
 
     train_is_iterable = isinstance(train_data, IterableDataset)
 
-    def _loader_kwargs_for_split(split: str, dataset: list[Data] | GraphStreamDataset) -> dict[str, Any]:
+    def _loader_kwargs_for_split(split: str, dataset: list[Data] | IterableDataset) -> dict[str, Any]:
         dataset_is_iterable = isinstance(dataset, IterableDataset)
+        num_workers = train_cfg.num_workers
+        if split == "val" and validation_subset_size is not None and dataset_is_iterable and num_workers > 0:
+            logger.info(
+                "Validation subset uses num_workers=0 so streamed validation emits one global prefix only."
+            )
+            num_workers = 0
         effective_pin_memory = pin_memory
         if dataset_is_iterable and effective_pin_memory and device.type == "cuda":
             logger.warning(
@@ -682,9 +725,9 @@ def train(
         kwargs: dict[str, Any] = {
             "batch_size": batch_size,
             "pin_memory": effective_pin_memory,
-            "num_workers": train_cfg.num_workers,
+            "num_workers": num_workers,
         }
-        if train_cfg.num_workers > 0:
+        if num_workers > 0:
             kwargs["persistent_workers"] = split == "train" and not dataset_is_iterable
             kwargs["prefetch_factor"] = 1 if dataset_is_iterable else 2
 
@@ -705,9 +748,9 @@ def train(
         **_loader_kwargs_for_split("train", train_data),
     )
     val_loader = DataLoader(
-        cast(Any, val_data),
+        cast(Any, val_loader_data),
         shuffle=False,
-        **_loader_kwargs_for_split("val", val_data),
+        **_loader_kwargs_for_split("val", val_loader_data),
     )
 
     # Optimiser / scheduler / loss boilerplate.
@@ -3091,10 +3134,15 @@ def main():
             estimated_train_batches = max(1, math.ceil(train_graph_count / max(training_cfg.batch_size, 1)))
 
     if isinstance(val_data, list):
-        estimated_val_batches = max(1, math.ceil(len(val_data) / max(training_cfg.batch_size, 1)))
+        val_graph_count = len(val_data)
+        if training_cfg.validation_subset_size is not None:
+            val_graph_count = min(val_graph_count, training_cfg.validation_subset_size)
+        estimated_val_batches = max(1, math.ceil(val_graph_count / max(training_cfg.batch_size, 1)))
     else:
         val_graph_count = _manifest_graph_count(val_data_path)
         if val_graph_count is not None and val_graph_count > 0:
+            if training_cfg.validation_subset_size is not None:
+                val_graph_count = min(val_graph_count, training_cfg.validation_subset_size)
             estimated_val_batches = max(1, math.ceil(val_graph_count / max(training_cfg.batch_size, 1)))
 
     # Select device

@@ -260,6 +260,7 @@ Recommended search budget:
 - if compute is very tight: rerun with `--num-configs 3`
 - one seed only
 - no repeated sweeps
+- for development-speed searches, set `training_config.validation_subset_size: 25000` in the generated configs so each epoch validates on the first 25k validation graphs; remove it or set it to `null` before final paper-facing training
 
 Run the short search with the scheduler:
 

@@ -28,13 +28,14 @@
      - `fix1`-style chooser losses use `evaluate_candidates_loss_terms()` to compute only the required terms (no full diagnostic payload),
      - top-k candidate extraction can be restricted to valid entity/predicate class IDs per slot.
    - `torch.optim.Adam` drives the updates, `ReduceLROnPlateau` reduces LR when validation loss stalls, gradient clipping is optional, and early stopping is triggered after `training_config.early_stopping_rounds` epochs without improvement.
-8. **Validation** – Mirrors the training pass sans gradient steps, feeding results into the same metric accumulators for apples-to-apples comparisons.
+8. **Validation** – Mirrors the training pass sans gradient steps, feeding results into the same metric accumulators for apples-to-apples comparisons. If `training_config.validation_subset_size` is set, each epoch validates on only the first N validation graphs. Streamed validation subsets force the validation loader to `num_workers=0` so the subset is one global prefix, not one prefix per worker.
 9. **Artifacts** – Once training finishes (or early stopping fires), the best-performing weights are saved via `torch.save()` alongside the effective `model_cfg`/`training_cfg`. `history_path()` stores the scalar curves, and `plot_training_history()` renders PNG charts for quick inspection.
 
 ## Common Pitfalls / Gotchas
 - The `model_config.dataset_variant` and `model_config.encoding` must match the graphs on disk; mismatches surface as missing-file errors or shape mismatches deep in PyG.
 - When using `GraphStreamDataset`, `len(dataset)` is undefined, so progress bars may look odd—this is expected and doesn’t mean data is missing.
 - Early stopping patience is enforced even if validation batches fail intermittently; run with a stable validation split and monitor logs before trusting the saved checkpoint.
+- Subset validation changes model selection because scheduler and early stopping use the subset loss. Use full validation for final paper-facing runs.
 - Generated paper/hparam configs now default to `num_workers=2` and `pin_memory=false` because the large streamed graph artifacts can exhaust shared memory with deeper worker queues.
 - If CUDA is available but `num_workers` is high, pin-memory can still amplify host-memory pressure on in-memory datasets; tune `pin_memory` in the config if throughput does not justify the footprint.
 - Fix-probability loss requires in-memory datasets (lists) so the script can attach `context_index` and look up contexts; streamed datasets will disable that term automatically.

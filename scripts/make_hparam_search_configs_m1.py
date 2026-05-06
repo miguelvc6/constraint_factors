@@ -36,6 +36,11 @@ from modules.data_encoders import (
 
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
+VALIDATION_SUBSET_SIZE = 25_000
+CHEAPER_NUM_EPOCHS = 20
+CHEAPER_EARLY_STOPPING_ROUNDS = 5
+CHEAPER_SCHEDULER_FACTOR = 0.5
+CHEAPER_SCHEDULER_PATIENCE = 1
 
 
 def _torch_load_trusted(path: Path) -> Any:
@@ -214,15 +219,16 @@ def main() -> None:
             },
             "training_config": {
                 "batch_size": hp.batch_size,
-                "num_epochs": 30,
-                "early_stopping_rounds": 6,
+                "num_epochs": CHEAPER_NUM_EPOCHS,
+                "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
                 "learning_rate": hp.lr,
                 "weight_decay": hp.wd,
-                "scheduler_factor": 0.5,
-                "scheduler_patience": 2,
+                "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
+                "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
                 "num_workers": SAFE_STREAMING_NUM_WORKERS,
                 "pin_memory": SAFE_STREAMING_PIN_MEMORY,
                 "validate_factor_labels": True,
+                "validation_subset_size": VALIDATION_SUBSET_SIZE,
                 "fix_probability_loss": {"enabled": False},
                 "factor_loss": {
                     "enabled": True,

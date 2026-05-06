@@ -16,6 +16,9 @@ import json
 from pathlib import Path
 
 
+VALIDATION_SUBSET_SIZE = 25_000
+
+
 def _base_config() -> dict:
     return {
         "training_config": {
@@ -28,6 +31,7 @@ def _base_config() -> dict:
             "scheduler_patience": 1,
             "num_workers": 0,
             "pin_memory": False,
+            "validation_subset_size": VALIDATION_SUBSET_SIZE,
             "constraint_loss": {
                 "dynamic_reweighting": {
                     "enabled": False,
