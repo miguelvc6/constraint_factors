@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import pickle
 import sys
 import tempfile
 from pathlib import Path
@@ -96,7 +97,48 @@ def test_eval_accepts_sharded_test_split_without_monolith() -> None:
     assert metrics["support_per_constraint_type"] == {"single": 2, "conflictWith": 1}
 
 
+def test_global_metrics_postprocess_accepts_streaming_test_data() -> None:
+    eval_module = _load_module(ROOT / "src" / "09_eval.py", "eval_09_stream_global_test")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        stream_path = Path(tmpdir) / "test_graph-node_id.pkl"
+        graphs = [_make_graph(1, "single"), _make_graph(2, "conflictWith")]
+        for idx, graph in enumerate(graphs):
+            graph.factor_constraint_ids = torch.tensor([idx + 10], dtype=torch.long)
+            graph.factor_checkable_pre = torch.tensor([True])
+            graph.factor_satisfied_pre = torch.tensor([idx % 2], dtype=torch.long)
+            graph.primary_factor_index = 0
+        with stream_path.open("wb") as handle:
+            for graph in graphs:
+                pickle.dump(graph, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        captured: dict[str, object] = {}
+
+        def fake_evaluate_global_repair_samples(**kwargs):
+            captured["pre_vectors"] = kwargs["pre_vectors"]
+            return {"overall": {}, "per_constraint_type": {}}
+
+        original = eval_module.evaluate_global_repair_samples
+        eval_module.evaluate_global_repair_samples = fake_evaluate_global_repair_samples
+        try:
+            support = eval_module.GlobalMetricsSupport(
+                rows=[object(), object()],
+                evaluator=object(),
+            )
+            postprocess, state = support.build_postprocess(GraphStreamDataset(stream_path))
+            predictions = torch.cat([graph.y for graph in graphs], dim=0)
+            kinds = [graph.constraint_type for graph in graphs]
+            postprocess(predictions, predictions, kinds)
+        finally:
+            eval_module.evaluate_global_repair_samples = original
+
+    assert "global_metrics" in state
+    assert captured["pre_vectors"] is not None
+    assert len(captured["pre_vectors"]) == 2
+
+
 if __name__ == "__main__":
     test_load_graph_dataset_streams_torch_shards()
     test_eval_accepts_sharded_test_split_without_monolith()
+    test_global_metrics_postprocess_accepts_streaming_test_data()
     print("sharded graph ingestion tests passed")

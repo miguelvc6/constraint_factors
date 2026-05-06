@@ -122,7 +122,7 @@ class GlobalMetricsSupport:
 
     def build_postprocess(
         self,
-        test_data: Sequence[Data] | None = None,
+        test_data: Sequence[Data] | GraphStreamDataset | None = None,
     ) -> tuple[Callable[[torch.Tensor, torch.Tensor, list[str]], None], dict[str, object]]:
         state: dict[str, object] = {}
 
