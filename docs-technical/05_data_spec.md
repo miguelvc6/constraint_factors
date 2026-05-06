@@ -78,6 +78,29 @@ mapping each constraint id to:
 - `param_predicates`
 - `param_objects`
 
+## 4b) Stratified Benchmark Variant (`02b_stratified_benchmark_sampler.py`)
+**Location:** `data/interim/<derived_variant>/`
+
+The paper-facing derived benchmark is `full_strat1m_minocc100`, produced from
+`full_minocc100` by deterministic stratified sampling.
+
+**Artifacts**
+- `df_train.parquet`, `df_val.parquet`, `df_test.parquet`
+- `globalintencoder.txt` copied unchanged from the source variant
+- `sampling_report.csv`, `sampling_report.md`, `sampling_metadata.json`
+- `hist_local_constraint_ids.csv`
+- `hist_local_constraint_ids_by_split.csv`
+
+Sampling strata are `(split, constraint_type, attached_constraint_bin)`, where:
+```python
+num_attached_constraints = len(local_constraint_ids)
+```
+
+Default bins are `1-32`, `33-64`, `65-83`, `84-107`, `108`,
+`109-160`, `161-267`, and `268+`. The default paper slice samples 50%
+from each non-empty stratum with seed `42`, keeping at least one row per
+non-empty stratum.
+
 ## 5) Wikidata Text Cache (`04_wikidata_retriever.py`)
 **Location:** `data/interim/wikidata_text.parquet`
 
@@ -154,3 +177,29 @@ The labeler can operate on either `local_constraint_ids` or
 `local_constraint_ids_focus`, controlled by `--constraint-scope`.
 When this directory exists, `06_graph.py` uses it automatically unless
 `--use-unlabeled-interim` is passed.
+
+## 8) Attached Constraint Histogram (`scripts/hist_attached_constraints.py`)
+The attached-constraint count for a row is:
+```python
+num_attached_constraints = len(local_constraint_ids)
+```
+
+Use the streaming histogram script to summarize this count without loading the
+full parquet dataset into RAM:
+```bash
+uv run scripts/hist_attached_constraints.py \
+  --dataset full \
+  --min-occurrence 100
+```
+
+By default it scans `df_train.parquet`, `df_val.parquet`, and
+`df_test.parquet` under `data/interim/<variant>/`, reading only
+`local_constraint_ids` in Arrow batches. It writes:
+- `data/interim/<variant>/hist_local_constraint_ids.csv`
+- `data/interim/<variant>/hist_local_constraint_ids.png`
+
+Useful flags:
+- `--scope focus` histograms `local_constraint_ids_focus`.
+- `--by-split` also writes per-split counts.
+- `--batch-size` controls streamed parquet batch size.
+- `--no-plot` skips PNG generation.

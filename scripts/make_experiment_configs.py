@@ -301,9 +301,10 @@ def main() -> None:
             "No graph artifacts found under "
             f"{args.processed_root}.\n"
             "Build the paper graph artifacts first, for example:\n"
-            "  PYTHONPATH=src .venv/bin/python src/05_constraint_labeler.py --dataset full --min-occurrence 100 --constraint-scope local\n"
-            "  PYTHONPATH=src .venv/bin/python src/06_graph.py --dataset full --min-occurrence 100 --encoding node_id --constraint-scope local --constraint-representation factorized\n"
-            "  PYTHONPATH=src .venv/bin/python src/06_graph.py --dataset full --min-occurrence 100 --encoding node_id --constraint-representation eswc_passive"
+            "  PYTHONPATH=src .venv/bin/python src/02b_stratified_benchmark_sampler.py --source-dataset full --output-dataset full_strat1m --min-occurrence 100\n"
+            "  PYTHONPATH=src .venv/bin/python src/05_constraint_labeler.py --dataset full_strat1m --min-occurrence 100 --constraint-scope local --registry-dataset full\n"
+            "  PYTHONPATH=src .venv/bin/python src/06_graph.py --dataset full_strat1m --min-occurrence 100 --encoding node_id --constraint-scope local --constraint-representation factorized --registry-dataset full\n"
+            "  PYTHONPATH=src .venv/bin/python src/06_graph.py --dataset full_strat1m --min-occurrence 100 --encoding node_id --constraint-representation eswc_passive --registry-dataset full"
         )
 
     canonical_proposals: list[ProposalExperiment] = [

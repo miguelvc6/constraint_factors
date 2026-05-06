@@ -153,9 +153,10 @@ def test_make_experiment_configs_empty_processed_root_message() -> None:
             sys.argv = argv_backup
 
     assert "No graph artifacts found under" in message
-    assert "src/05_constraint_labeler.py --dataset full --min-occurrence 100 --constraint-scope local" in message
-    assert "src/06_graph.py --dataset full --min-occurrence 100 --encoding node_id --constraint-scope local --constraint-representation factorized" in message
-    assert "src/06_graph.py --dataset full --min-occurrence 100 --encoding node_id --constraint-representation eswc_passive" in message
+    assert "src/02b_stratified_benchmark_sampler.py --source-dataset full --output-dataset full_strat1m --min-occurrence 100" in message
+    assert "src/05_constraint_labeler.py --dataset full_strat1m --min-occurrence 100 --constraint-scope local --registry-dataset full" in message
+    assert "src/06_graph.py --dataset full_strat1m --min-occurrence 100 --encoding node_id --constraint-scope local --constraint-representation factorized --registry-dataset full" in message
+    assert "src/06_graph.py --dataset full_strat1m --min-occurrence 100 --encoding node_id --constraint-representation eswc_passive --registry-dataset full" in message
 
 
 if __name__ == "__main__":

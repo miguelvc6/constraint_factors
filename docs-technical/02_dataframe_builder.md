@@ -23,6 +23,7 @@
 6. **Frequency filtering** – `_compute_token_frequency()` inspects only the training split to decide which IDs survive the `MIN_OCCURRENCE` threshold. `_apply_frequency_filter_inplace()` replaces infrequent IDs with `UNKNOWN_TOKEN_ID`, `_prune_encoder()` and `_reindex_encoder()` compress the vocabulary, and `_remap_dataset_inplace()` updates every split accordingly. Constraint factor tokens are treated as reserved so they survive pruning despite having zero frequency.
    - Registry-derived tokens are reserved before pruning: all constrained property IDs, constraint parameter predicates, and constraint parameter objects from `constraints.tsv` are encoded into the vocabulary and added to the reserved set so factor definitions remain representable even if their corpus frequency is below `MIN_OCCURRENCE`.
 7. **Persistence** – Each final dictionary becomes a pandas dataframe that is written as `df_train.parquet`, `df_val.parquet`, `df_test.parquet`, and the encoder is saved as `globalintencoder.txt`.
+8. **Optional derived benchmark sampling** – `02b_stratified_benchmark_sampler.py` can be run after this stage to create the paper-facing `full_strat1m_minocc100` variant from `full_minocc100`, before constraint labeling and graph construction.
 
 ## Common Pitfalls / Gotchas
 - Memory spikes happen while concatenating large constraint targets; for the full dataset keep 20–30 GB of RAM free or use `--max-rows` for debugging subsets.

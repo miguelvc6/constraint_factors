@@ -9,14 +9,14 @@
 - **Outputs:** `data/interim/wikidata_text.parquet` (or a custom `--output` path) containing keys, texts, and float16 embeddings for URIs, placeholders, and literals.
 
 ## Workflow
-1. Parse CLI arguments (`--dataset`, `--min-occurrence`, `--embed-dim`, `--batch-size`, `--output`). If the frequency threshold is omitted, `discover_min_occurrence()` inspects `data/interim/` to reuse the smallest available variant.
+1. Parse CLI arguments (`--dataset`, `--registry-dataset`, `--min-occurrence`, `--embed-dim`, `--batch-size`, `--output`). If the frequency threshold is omitted, `discover_min_occurrence()` inspects `data/interim/` to reuse the smallest available variant.
 2. Load the frozen `GlobalIntEncoder` that was saved by `02_dataframe_builder.py` and determine which parquet directory to scan via `dataset_variant_name()`.
 3. `_prepare_identifier_sets()` walks `df_train/val/test.parquet`:
    - Collects every non-zero integer from the scalar columns listed in `SCALAR_FEATURES`.
    - Traverses ragged columns listed in `SEQUENCE_FEATURES`.
    - Gathers all strings from `*_text` columns.
    - Ensures placeholder tokens like `subject`, `predicate`, or `LITERAL_OBJECT` are always included so embeddings exist for synthetic nodes as well.
-4. `_load_constraint_registry()` reads `constraint_registry_{dataset}.parquet` and `_collect_registry_ids()` resolves constrained properties and parameter predicate/object IDs via the frozen encoder, then unions them into the retrieval set. If no registry identifiers resolve, the script aborts to prevent silent drift.
+4. `_load_constraint_registry()` reads `constraint_registry_{registry_dataset}.parquet` and `_collect_registry_ids()` resolves constrained properties and parameter predicate/object IDs via the frozen encoder, then unions them into the retrieval set. For derived variants such as `full_strat1m`, pass `--registry-dataset full`. If no registry identifiers resolve, the script aborts to prevent silent drift.
 5. `_load_existing_cache()` (if present) keeps previously embedded rows in memory, keyed by `(kind, key, global_id)`. This lets repeated runs skip already resolved URIs/literals.
 6. `_materialise_entries()` handles the heavy lifting:
    - URIs are resolved via `WikidataUriEmbedder.embed_uris()`, which fetches labels (with HTTP batching and caching handled inside `modules.wikidata_utils`).

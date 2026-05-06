@@ -141,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stream parquet splits and histogram len(local_constraint_ids)."
     )
-    parser.add_argument("--dataset", choices=["sample", "full"], default="full")
+    parser.add_argument("--dataset", default="full", help="Dataset variant to scan, e.g. full or full_strat1m.")
     parser.add_argument(
         "--min-occurrence",
         type=int,

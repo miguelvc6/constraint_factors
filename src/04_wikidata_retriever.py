@@ -30,6 +30,7 @@ from modules.data_encoders import (
     SCALAR_FEATURES,
     SEQUENCE_FEATURES,
     GlobalIntEncoder,
+    base_dataset_name,
     dataset_variant_name,
     discover_min_occurrence,
 )
@@ -182,6 +183,20 @@ def _load_constraint_registry(dataset: str) -> dict[str, dict[str, Any]]:
     if "registry_json" not in registry_df.columns or registry_df.empty:
         raise ValueError(f"Constraint registry is missing 'registry_json' in {registry_path}")
     return json.loads(str(registry_df.loc[0, "registry_json"]))
+
+
+def _resolve_registry_dataset(dataset: str, explicit: str | None) -> str:
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend([dataset, base_dataset_name(dataset)])
+    base_name = base_dataset_name(dataset)
+    if "_strat" in base_name:
+        candidates.append(base_name.split("_strat", 1)[0])
+    for candidate in dict.fromkeys(candidates):
+        if (Path("data/interim") / f"constraint_registry_{candidate}.parquet").exists():
+            return candidate
+    raise FileNotFoundError(f"No constraint registry found for candidates: {', '.join(dict.fromkeys(candidates))}")
 
 
 def _collect_registry_ids(
@@ -381,9 +396,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Materialise Wikidata lookups for 06_graph.py")
     parser.add_argument(
         "--dataset",
-        choices=["sample", "full"],
         required=True,
-        help="Dataset split to scan (same as other pipeline stages).",
+        help="Dataset variant to scan, e.g. full or full_strat1m.",
+    )
+    parser.add_argument(
+        "--registry-dataset",
+        default=None,
+        help="Raw dataset name for constraint_registry_<dataset>.parquet. Defaults to --dataset.",
     )
     parser.add_argument(
         "--min-occurrence",
@@ -449,7 +468,7 @@ def main() -> None:
     unique_ids, literal_texts = _prepare_identifier_sets(encoder, interim_root)
 
     # Merge constraint-registry identifiers needed for factor nodes.
-    registry = _load_constraint_registry(args.dataset)
+    registry = _load_constraint_registry(_resolve_registry_dataset(args.dataset, args.registry_dataset))
     registry_ids, missing_registry_ids = _collect_registry_ids(encoder, registry)
     pre_merge_count = len(unique_ids)
     unique_ids.update(registry_ids)

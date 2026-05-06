@@ -67,6 +67,24 @@ Each instance includes:
 - a local neighborhood context around involved entities,
 - the ground-truth historical repair edit `Δ*` as add/delete operations.
 
+### Paper benchmark slice
+The preprocessing pipeline can produce roughly 1.91M local repair instances for
+the full min-occurrence-100 corpus. For the paper experiments, the benchmark is
+defined as a fixed stratified slice of this produced corpus rather than as the
+entire produced corpus.
+
+The paper slice keeps about half of each stratum, yielding an approximately
+1M-instance benchmark. Strata combine:
+- the train/validation/test split,
+- the primary constraint family,
+- and the number of executable constraints attached to the local subgraph.
+
+This design keeps the benchmark computationally tractable while preserving the
+factor most directly tied to the paper's hypothesis: local constraint density.
+The benchmark should therefore be described as a deterministic stratified
+benchmark slice sampled from the full produced corpus, not as the full produced
+corpus itself.
+
 ### Extensions needed for this work
 1. **Constraint retrieval** (schema-level):
    - Query Wikidata (or cached constraint registry) for constraint instances associated with:

@@ -93,5 +93,6 @@ python src/05_constraint_labeler.py \
 Key flags:
 - `--constraint-scope {local,focus}` selects `local_constraint_ids` vs `local_constraint_ids_focus`.
   The paper default is `local`.
+- `--registry-dataset` selects the raw dataset registry to use for derived variants such as `full_strat1m`; use `--registry-dataset full` for the paper benchmark.
 - `--assume-complete-entity-facts/--no-assume-complete-entity-facts` toggles completeness assumptions.
 - `--max-rows` caps rows per parquet for debugging.

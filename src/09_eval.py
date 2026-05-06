@@ -357,6 +357,7 @@ def _maybe_prepare_global_support(
     none_class: int,
     constraint_scope: str = "local",
     strict: bool = False,
+    registry_dataset: str | None = None,
 ) -> GlobalMetricsSupport | None:
     variant_dir = dataset_variant
     suffix = f"_minocc{min_occurrence}"
@@ -365,15 +366,24 @@ def _maybe_prepare_global_support(
 
     interim_base = Path("data/interim") / variant_dir
     encoder_path = interim_base / "globalintencoder.txt"
-    registry_path = Path("data/interim") / f"constraint_registry_{dataset_variant}.parquet"
-    if not registry_path.exists():
-        fallback_name = base_dataset_name(dataset_variant)
-        fallback_path = Path("data/interim") / f"constraint_registry_{fallback_name}.parquet"
-        if fallback_path.exists():
-            registry_path = fallback_path
+    registry_candidates = []
+    if registry_dataset:
+        registry_candidates.append(registry_dataset)
+    registry_candidates.append(dataset_variant)
+    fallback_name = base_dataset_name(dataset_variant)
+    registry_candidates.append(fallback_name)
+    if "_strat" in fallback_name:
+        registry_candidates.append(fallback_name.split("_strat", 1)[0])
 
-    if not registry_path.exists():
-        message = f"Constraint registry not found at {registry_path}."
+    registry_path = None
+    for candidate in dict.fromkeys(registry_candidates):
+        candidate_path = Path("data/interim") / f"constraint_registry_{candidate}.parquet"
+        if candidate_path.exists():
+            registry_path = candidate_path
+            break
+
+    if registry_path is None:
+        message = f"Constraint registry not found for candidates: {', '.join(dict.fromkeys(registry_candidates))}."
         if strict:
             raise RuntimeError(
                 message + " Strict global metrics require the registry; rebuild interim data or disable strict mode."
@@ -1334,8 +1344,12 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        choices=["sample", "full"],
-        help="Dataset variant (baselines mode).",
+        help="Dataset variant (baselines mode), e.g. full or full_strat1m.",
+    )
+    parser.add_argument(
+        "--registry-dataset",
+        default=None,
+        help="Raw dataset name for constraint_registry_<dataset>.parquet. Defaults to automatic fallback.",
     )
     parser.add_argument(
         "--min-occurrence",
@@ -1654,6 +1668,7 @@ def main():
                 split="test",
                 none_class=NONE_CLASS_INDEX,
                 strict=strict_global,
+                registry_dataset=args.registry_dataset,
             )
         if global_support:
             global_postprocess, global_state = global_support.build_postprocess(test_data)
@@ -1744,6 +1759,7 @@ def main():
                 split="test",
                 none_class=NONE_CLASS_INDEX,
                 strict=strict_global,
+                registry_dataset=args.registry_dataset,
             )
             if not global_support:
                 if strict_global:

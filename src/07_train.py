@@ -165,10 +165,7 @@ def derive_factor_type_count(
 def _registry_factor_type_count(dataset_variant: str) -> int:
     import pandas as pd
 
-    candidates = [
-        Path("data") / "interim" / f"constraint_registry_{dataset_variant}.parquet",
-        Path("data") / "interim" / f"constraint_registry_{base_dataset_name(dataset_variant)}.parquet",
-    ]
+    candidates = _constraint_registry_candidate_paths(dataset_variant)
 
     for path in candidates:
         if not path.exists():
@@ -202,6 +199,30 @@ def _registry_factor_type_count(dataset_variant: str) -> int:
             return int(series.max()) + 1
 
     return 0
+
+
+def _constraint_registry_candidate_paths(dataset_variant: str) -> list[Path]:
+    names = [dataset_variant, base_dataset_name(dataset_variant)]
+    base_name = base_dataset_name(dataset_variant)
+    if "_strat" in base_name:
+        names.append(base_name.split("_strat", 1)[0])
+    return [
+        Path("data") / "interim" / f"constraint_registry_{name}.parquet"
+        for name in dict.fromkeys(names)
+    ]
+
+
+def _resolve_constraint_registry_path(dataset_variant: str) -> Path:
+    candidates = _constraint_registry_candidate_paths(dataset_variant)
+    for path in candidates:
+        if path.exists():
+            if path.name != f"constraint_registry_{dataset_variant}.parquet":
+                logger.info("Using constraint registry %s for dataset variant %s", path, dataset_variant)
+            return path
+    raise FileNotFoundError(
+        "Constraint registry not found for dataset variant "
+        f"{dataset_variant}; checked {', '.join(str(path) for path in candidates)}"
+    )
 
 
 def _load_encoder(interim_path: Path) -> GlobalIntEncoder:
@@ -2963,21 +2984,7 @@ def main():
                     f"chooser contexts={len(val_contexts)}."
                 )
             logger.info("Chooser training will use streamed datasets with on-the-fly context_index assignment.")
-        registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
-        if not registry_path.exists():
-            fallback_name = base_dataset_name(model_cfg.dataset_variant)
-            fallback_path = Path("data") / "interim" / f"constraint_registry_{fallback_name}.parquet"
-            if fallback_path.exists():
-                logger.info(
-                    "Using constraint registry %s for dataset variant %s",
-                    fallback_path,
-                    model_cfg.dataset_variant,
-                )
-                registry_path = fallback_path
-            else:
-                raise FileNotFoundError(
-                    f"Constraint registry not found at {registry_path} or {fallback_path}"
-                )
+        registry_path = _resolve_constraint_registry_path(model_cfg.dataset_variant)
         evaluator = CandidateConstraintEvaluator(
             str(registry_path),
             encoder=encoder,
@@ -3048,21 +3055,7 @@ def main():
                     f"direct safety contexts={len(val_contexts)}."
                 )
             logger.info("Direct safety training will use streamed datasets with on-the-fly context_index assignment.")
-        registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
-        if not registry_path.exists():
-            fallback_name = base_dataset_name(model_cfg.dataset_variant)
-            fallback_path = Path("data") / "interim" / f"constraint_registry_{fallback_name}.parquet"
-            if fallback_path.exists():
-                logger.info(
-                    "Using constraint registry %s for dataset variant %s",
-                    fallback_path,
-                    model_cfg.dataset_variant,
-                )
-                registry_path = fallback_path
-            else:
-                raise FileNotFoundError(
-                    f"Constraint registry not found at {registry_path} or {fallback_path}"
-                )
+        registry_path = _resolve_constraint_registry_path(model_cfg.dataset_variant)
         evaluator = CandidateConstraintEvaluator(
             str(registry_path),
             encoder=encoder,

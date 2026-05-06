@@ -498,6 +498,26 @@ def _dataset_graph_count(dataset: Sequence[Data] | GraphStreamDataset, graph_pat
     return _manifest_graph_count(graph_path)
 
 
+def _resolve_constraint_registry_path(dataset_variant: str) -> Path:
+    names = [dataset_variant, base_dataset_name(dataset_variant)]
+    base_name = base_dataset_name(dataset_variant)
+    if "_strat" in base_name:
+        names.append(base_name.split("_strat", 1)[0])
+    candidates = [
+        Path("data") / "interim" / f"constraint_registry_{name}.parquet"
+        for name in dict.fromkeys(names)
+    ]
+    for path in candidates:
+        if path.exists():
+            if path.name != f"constraint_registry_{dataset_variant}.parquet":
+                logger.info("Using constraint registry %s for dataset variant %s", path, dataset_variant)
+            return path
+    raise FileNotFoundError(
+        "Constraint registry not found for dataset variant "
+        f"{dataset_variant}; checked {', '.join(str(path) for path in candidates)}"
+    )
+
+
 def _candidate_to_slots(candidate: Sequence[int]) -> tuple[int, int, int, int, int, int]:
     if len(candidate) != NUM_SLOTS:
         raise ValueError("Candidate must have 6 slots.")
@@ -761,17 +781,7 @@ def main() -> None:
     if val_graph_count is not None and len(val_rows) != val_graph_count:
         raise RuntimeError("Mismatch between parquet rows and validation graph dataset size.")
 
-    registry_path = Path("data") / "interim" / f"constraint_registry_{model_cfg.dataset_variant}.parquet"
-    if not registry_path.exists():
-        fallback_name = base_dataset_name(model_cfg.dataset_variant)
-        fallback_path = Path("data") / "interim" / f"constraint_registry_{fallback_name}.parquet"
-        if fallback_path.exists():
-            logger.info("Using constraint registry %s for dataset variant %s", fallback_path, model_cfg.dataset_variant)
-            registry_path = fallback_path
-        else:
-            raise FileNotFoundError(
-                f"Constraint registry not found at {registry_path} or {fallback_path}"
-            )
+    registry_path = _resolve_constraint_registry_path(model_cfg.dataset_variant)
 
     use_encoded_ids = True
     try:

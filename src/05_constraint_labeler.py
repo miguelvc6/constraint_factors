@@ -726,9 +726,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Label constraint satisfaction for local factors.")
     parser.add_argument(
         "--dataset",
-        choices=["sample", "full"],
         required=True,
-        help="Which dataset to label.",
+        help="Dataset variant to label, e.g. full or full_strat1m.",
+    )
+    parser.add_argument(
+        "--registry-dataset",
+        default=None,
+        help="Raw dataset name for constraint_registry_<dataset>.parquet. Defaults to --dataset.",
     )
     parser.add_argument(
         "--min-occurrence",
@@ -758,12 +762,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from modules.data_encoders import dataset_variant_name
+    from modules.data_encoders import base_dataset_name, dataset_variant_name
 
     dataset_variant = dataset_variant_name(args.dataset, args.min_occurrence)
     input_dir = Path("data") / "interim" / dataset_variant
     output_root = Path("data") / "interim" / f"{dataset_variant}_labeled"
-    registry_path = Path("data") / "interim" / f"constraint_registry_{args.dataset}.parquet"
+    registry_candidates = []
+    if args.registry_dataset:
+        registry_candidates.append(args.registry_dataset)
+    registry_candidates.extend([args.dataset, base_dataset_name(args.dataset)])
+    if "_strat" in base_dataset_name(args.dataset):
+        registry_candidates.append(base_dataset_name(args.dataset).split("_strat", 1)[0])
+    registry_path = None
+    for candidate in dict.fromkeys(registry_candidates):
+        candidate_path = Path("data") / "interim" / f"constraint_registry_{candidate}.parquet"
+        if candidate_path.exists():
+            registry_path = candidate_path
+            break
+    if registry_path is None:
+        raise FileNotFoundError(f"No constraint registry found for candidates: {', '.join(dict.fromkeys(registry_candidates))}")
     encoder_path = input_dir / "globalintencoder.txt"
 
     registry_raw = _load_registry(registry_path)

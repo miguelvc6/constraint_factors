@@ -63,6 +63,7 @@ from modules.data_encoders import (
     GlobalIntEncoder,
     GlobalToLocalNodeMap,
     PrecomputedWikidataCache,
+    base_dataset_name,
     dataset_variant_name,
     discover_graph_artifacts,
     graph_dataset_filename,
@@ -1670,9 +1671,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build PyG graphs from interim dataframes")
     parser.add_argument(
         "--dataset",
-        choices=["sample", "full"],
         required=True,
-        help="Which dataset to fetch.",
+        help="Dataset variant to graph, e.g. full or full_strat1m.",
+    )
+    parser.add_argument(
+        "--registry-dataset",
+        default=None,
+        help="Raw dataset name for constraint_registry_<dataset>.parquet. Defaults to --dataset.",
     )
     parser.add_argument(
         "--encoding",
@@ -1832,7 +1837,20 @@ if __name__ == "__main__":
     encoder.load(base_interim_path / "globalintencoder.txt")
     encoder.freeze()
 
-    registry_path = Path("data/interim") / f"constraint_registry_{DATASET}.parquet"
+    registry_candidates = []
+    if args.registry_dataset:
+        registry_candidates.append(args.registry_dataset)
+    registry_candidates.extend([DATASET, base_dataset_name(DATASET)])
+    if "_strat" in base_dataset_name(DATASET):
+        registry_candidates.append(base_dataset_name(DATASET).split("_strat", 1)[0])
+    registry_path = None
+    for candidate in dict.fromkeys(registry_candidates):
+        candidate_path = Path("data/interim") / f"constraint_registry_{candidate}.parquet"
+        if candidate_path.exists():
+            registry_path = candidate_path
+            break
+    if registry_path is None:
+        raise FileNotFoundError(f"No constraint registry found for candidates: {', '.join(dict.fromkeys(registry_candidates))}")
     registry_df = pd.read_parquet(registry_path)
     if "registry_json" not in registry_df.columns:
         raise KeyError(f"Missing registry_json column in {registry_path}")
