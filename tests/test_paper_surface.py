@@ -8,6 +8,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import modules.model_store as model_store
+from modules.constraint_checkers import ConstraintInstance, EvidenceState, evaluate_constraint
+from modules.constraint_type_map import canonicalize_constraint_type
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import graph_dataset_filename
 from modules.model_store import config_tag_from_path, ensure_run_dir_for_config
@@ -84,8 +86,59 @@ def test_paper_surface_configs_accept_new_fields() -> None:
     assert training_cfg.direct_safety.beta_secondary == 0.25
 
 
+def test_symmetric_constraint_type_is_supported() -> None:
+    family, supported = canonicalize_constraint_type("Q21510862")
+    assert family == "symmetric"
+    assert supported is True
+
+
+def test_symmetric_reuses_inverse_checker_semantics() -> None:
+    state = EvidenceState(
+        facts_by_entity={1: {10: {2}}, 2: {10: {1}}},
+        predicates_present={1: {10}, 2: {10}},
+        assume_complete=True,
+        missing_edits=set(),
+        focus_subject=1,
+        focus_predicate=10,
+        focus_object=2,
+        other_subject=0,
+        other_predicate=0,
+        other_object=0,
+    )
+    constraint = ConstraintInstance(
+        constraint_id=99,
+        constraint_type="symmetric",
+        constraint_type_id=4,
+        constrained_property=10,
+        required_properties=set(),
+        allowed_items=set(),
+        allowed_classes=set(),
+        relation_predicates=[],
+        inverse_properties=[],
+        conflict_properties=set(),
+    )
+
+    assert evaluate_constraint(state, constraint, {10}) == (True, True)
+
+    broken_state = EvidenceState(
+        facts_by_entity={1: {10: {2}}, 2: {}},
+        predicates_present={1: {10}, 2: {10}},
+        assume_complete=True,
+        missing_edits=set(),
+        focus_subject=1,
+        focus_predicate=10,
+        focus_object=2,
+        other_subject=0,
+        other_predicate=0,
+        other_object=0,
+    )
+    assert evaluate_constraint(broken_state, constraint, {10}) == (True, False)
+
+
 if __name__ == "__main__":
     test_graph_dataset_filename_by_representation()
     test_config_tag_uses_parent_directory_for_config_json()
     test_paper_surface_configs_accept_new_fields()
+    test_symmetric_constraint_type_is_supported()
+    test_symmetric_reuses_inverse_checker_semantics()
     print("paper surface tests passed")

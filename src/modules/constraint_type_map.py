@@ -10,6 +10,7 @@ TYPE_ITEM_QID_TO_FAMILY: Dict[str, str] = {
     "Q21502838": "conflictWith",
     "Q21502410": "distinct",
     "Q21510855": "inverse",
+    "Q21510862": "symmetric",
     "Q21503247": "itemRequiresStatement",
     "Q21510864": "valueRequiresStatement",
     "Q21510859": "oneOf",

@@ -424,10 +424,12 @@ def _process_dataframe(
     assume_complete: bool,
     use_encoded_ids: bool,
     constraint_scope: str,
-) -> Tuple[pd.DataFrame, Dict[str, Counter[str]]]:
+    factor_family_policy: str,
+) -> Tuple[pd.DataFrame, Dict[str, Counter[str]], Counter[str]]:
     default_relation_predicates = _resolve_default_relations(encoder)
     constraint_cache: Dict[str, ConstraintInstance] = {}
     coverage: Dict[str, Counter[str]] = defaultdict(Counter)
+    filter_stats: Counter[str] = Counter()
 
     factor_checkable_pre: List[List[bool]] = []
     factor_satisfied_pre: List[List[int]] = []
@@ -500,7 +502,8 @@ def _process_dataframe(
         else:
             constraint_ids_raw = getattr(row, "local_constraint_ids", None)
         local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=use_encoded_ids)
-        factor_constraint_ids.append([int(cid) for cid in local_constraint_ids])
+        primary_constraint_id = _coerce_value(getattr(row, "constraint_id", 0), cast_int=use_encoded_ids)
+        retained_constraint_ids: List[int] = []
         checkable_pre_row: List[bool] = []
         satisfied_pre_row: List[int] = []
         checkable_post_row: List[bool] = []
@@ -509,12 +512,21 @@ def _process_dataframe(
 
         for constraint_id in local_constraint_ids:
             entry = _lookup_registry_entry(constraint_id, registry_by_id, use_encoded_ids=use_encoded_ids)
+            is_primary = constraint_id == primary_constraint_id
             if entry is None:
+                filter_stats["missing_registry_total"] += 1
+                if factor_family_policy == "supported_only" and not is_primary:
+                    filter_stats["missing_registry_filtered"] += 1
+                    continue
+                if is_primary:
+                    filter_stats["missing_registry_primary_retained"] += 1
+                retained_constraint_ids.append(int(constraint_id))
                 checkable_pre_row.append(False)
                 satisfied_pre_row.append(0)
                 checkable_post_row.append(False)
                 satisfied_post_row.append(0)
                 types_row.append(-1)
+                coverage["missing_registry"]["total"] += 1
                 continue
 
             cache_key = str(int(constraint_id)) if use_encoded_ids else str(constraint_id)
@@ -532,14 +544,24 @@ def _process_dataframe(
 
             constraint_instance = constraint_cache[cache_key]
             if not entry.constraint_family_supported:
+                filter_stats["unsupported_total"] += 1
+                filter_stats[f"unsupported_family::{constraint_instance.constraint_type}"] += 1
+                if factor_family_policy == "supported_only" and not is_primary:
+                    filter_stats["unsupported_filtered"] += 1
+                    filter_stats[f"unsupported_family_filtered::{constraint_instance.constraint_type}"] += 1
+                    continue
+                if is_primary:
+                    filter_stats["unsupported_primary_retained"] += 1
                 checkable_pre = False
                 satisfied_pre = 0
                 checkable_post = False
                 satisfied_post = 0
             else:
+                filter_stats["supported_retained"] += 1
                 checkable_pre, satisfied_pre = evaluate_constraint(pre_state, constraint_instance, p_local)
                 checkable_post, satisfied_post = evaluate_constraint(post_state, constraint_instance, p_local)
 
+            retained_constraint_ids.append(int(constraint_id))
             checkable_pre_row.append(bool(checkable_pre))
             satisfied_pre_row.append(int(satisfied_pre))
             checkable_post_row.append(bool(checkable_post))
@@ -553,13 +575,16 @@ def _process_dataframe(
             coverage[ctype]["satisfied_pre"] += int(satisfied_pre) if checkable_pre else 0
             coverage[ctype]["satisfied_post"] += int(satisfied_post) if checkable_post else 0
 
+        filter_stats["raw_factor_total"] += len(local_constraint_ids)
+        filter_stats["retained_factor_total"] += len(retained_constraint_ids)
         factor_checkable_pre.append(checkable_pre_row)
         factor_satisfied_pre.append(satisfied_pre_row)
         factor_checkable_post.append(checkable_post_row)
         factor_satisfied_post.append(satisfied_post_row)
         factor_types.append(types_row)
+        factor_constraint_ids.append(retained_constraint_ids)
 
-        total = len(local_constraint_ids)
+        total = len(retained_constraint_ids)
         num_checkable = sum(1 for flag in checkable_pre_row if flag)
         num_checkable_post_row = sum(1 for flag in checkable_post_row if flag)
         num_checkable_pre.append(num_checkable)
@@ -579,7 +604,7 @@ def _process_dataframe(
     df["num_checkable_factors_post_gold"] = num_checkable_post
     df["coverage_post_gold"] = coverage_post
 
-    return df, coverage
+    return df, coverage, filter_stats
 
 
 def _print_coverage(coverage: Dict[str, Counter[str]]) -> None:
@@ -684,6 +709,116 @@ def _write_coverage_report(
     md_path.write_text(df.to_markdown(index=False), encoding="utf-8")
 
 
+def _filtered_factor_rows(filter_stats: Counter[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    raw_total = int(filter_stats.get("raw_factor_total", 0))
+    retained_total = int(filter_stats.get("retained_factor_total", 0))
+    filtered_total = raw_total - retained_total
+    rows.append(
+        {
+            "metric": "raw_factor_total",
+            "count": raw_total,
+            "rate": 1.0 if raw_total else 0.0,
+        }
+    )
+    rows.append(
+        {
+            "metric": "retained_factor_total",
+            "count": retained_total,
+            "rate": retained_total / raw_total if raw_total else 0.0,
+        }
+    )
+    rows.append(
+        {
+            "metric": "filtered_factor_total",
+            "count": filtered_total,
+            "rate": filtered_total / raw_total if raw_total else 0.0,
+        }
+    )
+    for key in sorted(filter_stats):
+        if key.startswith("unsupported_family::") or key.startswith("unsupported_family_filtered::"):
+            continue
+        if key in {"raw_factor_total", "retained_factor_total"}:
+            continue
+        rows.append(
+            {
+                "metric": key,
+                "count": int(filter_stats[key]),
+                "rate": int(filter_stats[key]) / raw_total if raw_total else 0.0,
+            }
+        )
+    return rows
+
+
+def _filtered_family_rows(filter_stats: Counter[str]) -> List[Dict[str, Any]]:
+    families = sorted(
+        {
+            key.split("::", 1)[1]
+            for key in filter_stats
+            if key.startswith("unsupported_family::")
+        }
+    )
+    rows: List[Dict[str, Any]] = []
+    raw_total = int(filter_stats.get("raw_factor_total", 0))
+    for family in families:
+        total = int(filter_stats.get(f"unsupported_family::{family}", 0))
+        filtered = int(filter_stats.get(f"unsupported_family_filtered::{family}", 0))
+        rows.append(
+            {
+                "constraint_family": family,
+                "unsupported_occurrences": total,
+                "filtered_occurrences": filtered,
+                "retained_occurrences": total - filtered,
+                "occurrence_rate": total / raw_total if raw_total else 0.0,
+            }
+        )
+    return rows
+
+
+def _write_filtered_factor_report(
+    filter_stats: Counter[str],
+    output_root: Path,
+    constraint_scope: str,
+    factor_family_policy: str,
+) -> None:
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary_rows = _filtered_factor_rows(filter_stats)
+    family_rows = _filtered_family_rows(filter_stats)
+    summary_df = pd.DataFrame(summary_rows)
+    family_df = pd.DataFrame(family_rows)
+    if not family_df.empty:
+        family_df = family_df.sort_values(["filtered_occurrences", "constraint_family"], ascending=[False, True])
+
+    summary_csv = output_root / f"filtered_factors_{constraint_scope}.csv"
+    family_csv = output_root / f"filtered_factor_families_{constraint_scope}.csv"
+    md_path = output_root / f"filtered_factors_{constraint_scope}.md"
+    summary_df.to_csv(summary_csv, index=False)
+    family_df.to_csv(family_csv, index=False)
+
+    raw_total = int(filter_stats.get("raw_factor_total", 0))
+    retained_total = int(filter_stats.get("retained_factor_total", 0))
+    filtered_total = raw_total - retained_total
+    lines = [
+        "# Filtered Factor Report",
+        "",
+        f"- factor_family_policy: `{factor_family_policy}`",
+        f"- raw_factor_total: {raw_total:,}",
+        f"- retained_factor_total: {retained_total:,}",
+        f"- filtered_factor_total: {filtered_total:,}",
+        f"- filtered_factor_rate: {(filtered_total / raw_total if raw_total else 0.0):.2%}",
+        f"- unsupported_primary_retained: {int(filter_stats.get('unsupported_primary_retained', 0)):,}",
+        f"- missing_registry_primary_retained: {int(filter_stats.get('missing_registry_primary_retained', 0)):,}",
+        "",
+        "## Unsupported Families",
+        "",
+    ]
+    if family_df.empty:
+        lines.append("No unsupported families were encountered.")
+    else:
+        lines.append(family_df.to_markdown(index=False))
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _resolve_registry_mapping(
     registry: Dict[str, RegistryEntry],
     *,
@@ -760,6 +895,16 @@ def main() -> None:
         default="local",
         help="Which constraint neighborhood to label: local (default) or focus predicate scope.",
     )
+    parser.add_argument(
+        "--factor-family-policy",
+        choices=["supported_only", "all"],
+        default="supported_only",
+        help=(
+            "Which attached constraints to write as supervised factors. "
+            "supported_only drops unsupported secondary factors but retains unsupported primary factors; "
+            "all preserves every local/focus constraint id."
+        ),
+    )
     args = parser.parse_args()
 
     from modules.data_encoders import base_dataset_name, dataset_variant_name
@@ -795,6 +940,7 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     combined_coverage: Dict[str, Counter[str]] = defaultdict(Counter)
+    combined_filter_stats: Counter[str] = Counter()
 
     for parquet_path in parquet_paths:
         df = pd.read_parquet(parquet_path)
@@ -803,16 +949,18 @@ def main() -> None:
         if args.max_rows is not None and args.max_rows > 0:
             df = df.iloc[: args.max_rows].copy()
 
-        labeled_df, coverage = _process_dataframe(
+        labeled_df, coverage, filter_stats = _process_dataframe(
             df,
             registry_by_id,
             encoder=encoder,
             assume_complete=args.assume_complete_entity_facts,
             use_encoded_ids=use_encoded_ids,
             constraint_scope=args.constraint_scope,
+            factor_family_policy=args.factor_family_policy,
         )
         for ctype, stats in coverage.items():
             combined_coverage[ctype].update(stats)
+        combined_filter_stats.update(filter_stats)
 
         output_path = output_root / parquet_path.name
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -822,6 +970,12 @@ def main() -> None:
     _print_coverage(combined_coverage)
     _print_coverage_table(combined_coverage)
     _write_coverage_report(combined_coverage, output_root, args.constraint_scope)
+    _write_filtered_factor_report(
+        combined_filter_stats,
+        output_root,
+        args.constraint_scope,
+        args.factor_family_policy,
+    )
 
 
 if __name__ == "__main__":

@@ -164,6 +164,8 @@ re-run.
 **Files**
 - `df_train.parquet`, `df_val.parquet`, `df_test.parquet` (with extra columns)
 - `coverage_<scope>.csv`, `coverage_<scope>.md`
+- `filtered_factors_<scope>.csv`, `filtered_factors_<scope>.md`
+- `filtered_factor_families_<scope>.csv`
 
 **Additional parquet columns**
 - `factor_checkable_pre`, `factor_satisfied_pre`
@@ -175,6 +177,10 @@ re-run.
 
 The labeler can operate on either `local_constraint_ids` or
 `local_constraint_ids_focus`, controlled by `--constraint-scope`.
+By default, `--factor-family-policy supported_only` keeps raw local-closure
+columns unchanged but writes only supported executable secondary constraints to
+`factor_constraint_ids` and aligned label arrays. Unsupported primary
+constraints, if any, are retained and marked not checkable.
 When this directory exists, `06_graph.py` uses it automatically unless
 `--use-unlabeled-interim` is passed.
 
@@ -203,3 +209,35 @@ Useful flags:
 - `--by-split` also writes per-split counts.
 - `--batch-size` controls streamed parquet batch size.
 - `--no-plot` skips PNG generation.
+
+## 9) Unsupported Constraint Diagnostics (`scripts/diagnose_unsupported_constraints.py`)
+The labeler coverage table reports unsupported constraint families at
+factor-occurrence level. Use the diagnostics script to separate row-level
+prevalence from factor-level graph pressure:
+```bash
+uv run scripts/diagnose_unsupported_constraints.py \
+  --dataset full_strat1m \
+  --min-occurrence 100 \
+  --registry-dataset full \
+  --scope local
+```
+
+The script streams `constraint_type`, `constraint_id`, and the selected attached
+constraint ID column from `data/interim/<variant>/df_*.parquet`, resolves IDs
+through `globalintencoder.txt` and `constraint_registry_<registry>.parquet`, and
+writes:
+- `unsupported_constraint_diagnostics.md`
+- `unsupported_constraint_diagnostics_by_split.csv`
+- `unsupported_constraint_families.csv`
+- `supported_constraint_families.csv`
+- `primary_constraint_support.csv`
+- `primary_constraint_registry_families.csv`
+- `unsupported_constraints_per_row.csv`
+- `supported_constraints_per_row.csv`
+- `attached_constraints_per_row.csv`
+- `missing_registry_constraint_ids.csv`
+
+The main summary includes rows with unsupported attached factors, supported vs
+unsupported attached factor occurrences, primary unsupported rows, primary
+constraint-family mismatches, and the estimated factor-node reduction from a
+supported-only factor policy.

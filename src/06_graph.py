@@ -124,6 +124,35 @@ def _normalize_id_sequence(value: Any) -> list[Any]:
     return [value]
 
 
+def _factor_ids_for_graph(graph: dict[str, Any], constraint_scope: str) -> list[int]:
+    """Return the factor IDs to instantiate, preferring labeler-filtered IDs."""
+    constraint_ids_raw = graph.get("factor_constraint_ids")
+    if constraint_ids_raw is None:
+        if constraint_scope == "focus":
+            constraint_ids_raw = graph.get("local_constraint_ids_focus")
+            if constraint_ids_raw is None:
+                constraint_ids_raw = graph.get("local_constraint_ids")
+        else:
+            constraint_ids_raw = graph.get("local_constraint_ids")
+
+    if isinstance(constraint_ids_raw, Iterable) and not isinstance(constraint_ids_raw, (str, bytes)):
+        factor_ids = [int(cid) for cid in constraint_ids_raw if cid is not None]
+    else:
+        factor_ids = []
+    if not factor_ids:
+        factor_ids = [int(graph["constraint_id"])]
+    return factor_ids
+
+
+def _constraint_family_from_registry_entry(registry_entry: dict[str, Any]) -> str:
+    """Return canonical factor family used for graph wiring and debug metadata."""
+    return str(
+        registry_entry.get("constraint_family")
+        or registry_entry.get("constraint_type_name")
+        or registry_entry.get("constraint_type", "")
+    )
+
+
 def _is_literal_node(graph: dict[str, Any], key: str) -> bool:
     text_value = graph.get(f"{key}_text")
     if isinstance(text_value, str) and text_value != "":
@@ -527,26 +556,7 @@ def create_graph(
 
     # add constraint factor branches
     if factorized_representation:
-        if constraint_scope == "focus":
-            constraint_ids_raw = graph.get("local_constraint_ids_focus")
-            if constraint_ids_raw is None:
-                constraint_ids_raw = graph.get("local_constraint_ids")
-        else:
-            constraint_ids_raw = graph.get("local_constraint_ids")
-        if isinstance(constraint_ids_raw, Iterable) and not isinstance(constraint_ids_raw, (str, bytes)):
-            factor_ids = [int(cid) for cid in constraint_ids_raw if cid is not None]
-        else:
-            factor_ids = []
-        if "factor_constraint_ids" in graph:
-            expected_ids_raw = graph.get("factor_constraint_ids") or []
-            if isinstance(expected_ids_raw, Iterable) and not isinstance(expected_ids_raw, (str, bytes)):
-                expected_ids = [int(cid) for cid in expected_ids_raw if cid is not None]
-            else:
-                expected_ids = []
-            if expected_ids and expected_ids != factor_ids:
-                raise AssertionError("Factor constraint id order mismatch between labeled data and graph builder.")
-        if not factor_ids:
-            factor_ids = [int(graph["constraint_id"])]
+        factor_ids = _factor_ids_for_graph(graph, constraint_scope)
     else:
         factor_ids = [int(graph["constraint_id"])]
 
@@ -627,7 +637,7 @@ def create_graph(
 
         factor_constraint_ids.append(constraint_id)
         factor_local_ids.append(factor_local_id)
-        constraint_type = str(registry_entry.get("constraint_type", ""))
+        constraint_type = _constraint_family_from_registry_entry(registry_entry)
         factor_constraint_types.append(constraint_type)
         if constraint_id == int(graph["constraint_id"]):
             primary_factor_index = idx
@@ -684,7 +694,7 @@ def create_graph(
                 other_predicate_gid = int(graph.get("other_predicate") or 0)
                 if other_predicate_gid:
                     _add_observed(other_predicate_gid)
-            elif constraint_type == "inverse":
+            elif constraint_type in {"inverse", "symmetric"}:
                 inverse_gids = _collect_param_object_gids(param_inverse_gid)
                 if not inverse_gids and constrained_gid is not None:
                     inverse_gids = [constrained_gid]

@@ -507,6 +507,7 @@ def is_satisfied_distinct(
 CHECKERS = {
     "conflictWith": (is_checkable_conflict_with, is_satisfied_conflict_with),
     "inverse": (is_checkable_inverse, is_satisfied_inverse),
+    "symmetric": (is_checkable_inverse, is_satisfied_inverse),
     "itemRequiresStatement": (is_checkable_item_requires_statement, is_satisfied_item_requires_statement),
     "valueRequiresStatement": (is_checkable_value_requires_statement, is_satisfied_value_requires_statement),
     "oneOf": (is_checkable_one_of, is_satisfied_one_of),

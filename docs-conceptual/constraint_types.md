@@ -32,6 +32,10 @@ For each **target value** used with a property, that **value item itself** must 
 If item **A** uses property **P** to point to item **B**, then **B** should have the **inverse** property **P′** pointing back to **A**.
 *Example:* `parent (P40)` on child implies `child (P40)` (or `has child`) on the parent item, depending on modeling.
 
+### `symmetric`
+
+If item **A** uses property **P** to point to item **B**, then **B** should also use the same property **P** to point back to **A**. This is evaluated as inverse-style evidence where the inverse property is the constrained property itself.
+
 ---
 
 ## Value domain / enumeration
@@ -63,4 +67,3 @@ All values of the property must be **globally unique across items** (no two item
 
 Two properties (or specific value patterns) **should not co-occur** on the same item; if one is present, the other must be absent.
 *Example:* `date of birth (P569)` conflicting with `year of birth missing (Q...)`-style markers, or mutually exclusive status flags.
-

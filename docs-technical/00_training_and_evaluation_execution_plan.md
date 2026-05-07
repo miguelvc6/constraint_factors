@@ -125,7 +125,8 @@ uv run src/05_constraint_labeler.py \
   --dataset full_strat1m \
   --min-occurrence 100 \
   --constraint-scope local \
-  --registry-dataset full
+  --registry-dataset full \
+  --factor-family-policy supported_only
 ```
 
 **Build factorized executable-factor graphs**

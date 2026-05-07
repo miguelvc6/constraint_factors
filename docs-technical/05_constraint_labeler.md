@@ -24,6 +24,17 @@ For the paper-facing run, `--constraint-scope local` is the canonical setting. `
 - Coverage reports in the same output folder:
   - `coverage_<scope>.csv`
   - `coverage_<scope>.md`
+- Filtered factor reports in the same output folder:
+  - `filtered_factors_<scope>.csv`
+  - `filtered_factors_<scope>.md`
+  - `filtered_factor_families_<scope>.csv`
+
+By default, `--factor-family-policy supported_only` writes only executable
+supported constraints into `factor_constraint_ids` and aligned label arrays.
+Unsupported secondary constraints remain in `local_constraint_ids` for
+auditability but are not emitted as supervised factor nodes. If an unsupported
+primary constraint is encountered, it is retained and marked not checkable so
+graph construction can still identify the primary factor.
 
 ## Evidence Model
 The labeler builds a normalized evidence structure per row:
@@ -64,6 +75,7 @@ static catalog in `data/static/constraint_type_catalog.json`. On a fresh clone,
 `03_constraint_registry.py` bootstraps that catalog automatically if it is missing.
 - `conflictWith`
 - `inverse`
+- `symmetric`
 - `itemRequiresStatement`
 - `valueRequiresStatement`
 - `oneOf`
@@ -87,12 +99,16 @@ Example usage:
 python src/05_constraint_labeler.py \
   --dataset sample \
   --min-occurrence 100 \
-  --constraint-scope local
+  --constraint-scope local \
+  --factor-family-policy supported_only
 ```
 
 Key flags:
 - `--constraint-scope {local,focus}` selects `local_constraint_ids` vs `local_constraint_ids_focus`.
   The paper default is `local`.
+- `--factor-family-policy {supported_only,all}` controls factor supervision.
+  The paper default is `supported_only`; use `all` only to reproduce the older
+  all-attached-factor behavior.
 - `--registry-dataset` selects the raw dataset registry to use for derived variants such as `full_strat1m`; use `--registry-dataset full` for the paper benchmark.
 - `--assume-complete-entity-facts/--no-assume-complete-entity-facts` toggles completeness assumptions.
 - `--max-rows` caps rows per parquet for debugging.
