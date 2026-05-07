@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate a focused 4-config hyperparameter sweep for the appendix-only chooser model:
+Generate a focused 5-config hyperparameter sweep for the appendix-only chooser model:
 - ``M1C`` proposal + chooser(Fix-1) + typed pressure
 - Full dataset defaults: dataset_variant="full", min_occurrence=100
   (resolved to "full_minocc100")
@@ -14,7 +14,7 @@ Run:
     --processed-root data/processed \
     --models-root models \
     --encoding node_id \
-    --num-configs 4
+    --num-configs 5
 """
 
 import argparse
@@ -83,9 +83,13 @@ def _infer_num_factor_types(sample_data: Any) -> int:
 
 
 def _infer_num_factor_types_from_registry(dataset_variant: str, interim_root: Path = Path("data/interim")) -> int:
+    candidate_names = [dataset_variant, base_dataset_name(dataset_variant)]
+    base_name = base_dataset_name(dataset_variant)
+    if "_strat" in base_name:
+        candidate_names.append(base_name.split("_strat", 1)[0])
     candidates = [
-        interim_root / f"constraint_registry_{dataset_variant}.parquet",
-        interim_root / f"constraint_registry_{base_dataset_name(dataset_variant)}.parquet",
+        interim_root / f"constraint_registry_{candidate}.parquet"
+        for candidate in dict.fromkeys(candidate_names)
     ]
     for path in candidates:
         if not path.exists():
@@ -140,7 +144,7 @@ def main() -> None:
     ap.add_argument("--processed-root", type=Path, default=Path("data/processed"))
     ap.add_argument("--models-root", type=Path, default=Path("models"))
     ap.add_argument("--encoding", type=str, default="node_id")
-    ap.add_argument("--num-configs", type=int, default=4)
+    ap.add_argument("--num-configs", type=int, default=5)
     ap.add_argument("--min-occurrence", type=int, default=100)
     ap.add_argument("--dataset-variant", type=str, default="full")
     ap.add_argument(
@@ -166,11 +170,12 @@ def main() -> None:
         sample = _load_first_data_obj(artifacts[0].path)
         num_factor_types = _infer_num_factor_types(sample)
 
-    # ---- Focused shortlist (4 configs) ----
+    # ---- Focused shortlist (5 configs) ----
     # These are the selected candidates for constrained-budget model selection.
     grid = [
         # Beta sweep on concat pressure
         HP("c1", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 0.5, 20, 80, 0.10, "concat"),
+        HP("c2", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
         HP("c3", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
         # Pressure-mode ablation
         HP("g0", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "gate"),
