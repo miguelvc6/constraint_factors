@@ -81,6 +81,51 @@ class ValidationSubsetStream(IterableDataset):
         return self.limit
 
 
+def _max_abs_value(tensor: torch.Tensor | None) -> float:
+    if tensor is None or tensor.numel() == 0:
+        return 0.0
+    return float(torch.nan_to_num(tensor.detach(), nan=0.0, posinf=float("inf"), neginf=float("-inf")).abs().max().item())
+
+
+def _scalar_float(value: float | torch.Tensor) -> float:
+    if torch.is_tensor(value):
+        return float(value.detach().cpu().item())
+    return float(value)
+
+
+def _assert_finite_scalar(name: str, value: float | torch.Tensor, *, epoch: int, batch_idx: int | None = None) -> float:
+    numeric_value = _scalar_float(value)
+    if not math.isfinite(numeric_value):
+        location = f"epoch={epoch}"
+        if batch_idx is not None:
+            location += f" batch={batch_idx}"
+        raise FloatingPointError(f"Non-finite {name} detected at {location}: {numeric_value}")
+    return numeric_value
+
+
+def _grad_norm(parameters: Any, norm_type: float = 2.0) -> torch.Tensor:
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+    device = grads[0].device
+    norms = torch.stack([torch.linalg.vector_norm(g, ord=norm_type).to(device) for g in grads])
+    return torch.linalg.vector_norm(norms, ord=norm_type)
+
+
+def _parameter_norm_stats(model: torch.nn.Module) -> tuple[float, float]:
+    total_sq = 0.0
+    max_abs = 0.0
+    for parameter in model.parameters():
+        if parameter.numel() == 0:
+            continue
+        detached = parameter.detach()
+        param_norm = float(torch.linalg.vector_norm(detached.float(), ord=2).item())
+        param_abs = _max_abs_value(detached)
+        total_sq += param_norm * param_norm
+        max_abs = max(max_abs, param_abs)
+    return math.sqrt(total_sq), max_abs
+
+
 # Implementation checklist (factor supervision):
 # - In train() and validation loops, insert factor-level losses after graph_loss is computed
 #   and before dynamic reweighting (and before weighted_loss is averaged).
@@ -986,6 +1031,17 @@ def train(
         "val_acc_all6": [],
         "train_acc_slot": [],
         "val_acc_slot": [],
+        "learning_rate": [],
+        "train_grad_norm_mean": [],
+        "train_grad_norm_max": [],
+        "train_param_norm": [],
+        "train_param_abs_max": [],
+        "train_edit_logit_abs_max": [],
+        "val_edit_logit_abs_max": [],
+        "train_factor_logit_abs_max": [],
+        "val_factor_logit_abs_max": [],
+        "train_chooser_score_abs_max": [],
+        "val_chooser_score_abs_max": [],
     }
 
     chooser_loss_mode = chooser_cfg.loss_mode
@@ -1062,6 +1118,12 @@ def train(
         train_policy_loss_sum = 0.0
         train_policy_count = 0
         train_policy_correct = 0
+        train_grad_norm_sum = 0.0
+        train_grad_norm_count = 0
+        train_grad_norm_max = 0.0
+        train_edit_logit_abs_max = 0.0
+        train_factor_logit_abs_max = 0.0
+        train_chooser_score_abs_max = 0.0
 
         train_constraint_metrics = ConstraintMetricsAccumulator()
         train_last_logged_percent = 0
@@ -1111,6 +1173,7 @@ def train(
             assert out.dim() == 3 and out.size(1) == NUM_SLOTS and out.size(2) == model.num_target_ids, (
                 f"Expected out (batch_size,{NUM_SLOTS},{model.num_target_ids}), got {tuple(out.shape)}"
             )
+            train_edit_logit_abs_max = max(train_edit_logit_abs_max, _max_abs_value(out))
 
             out_flat = out.reshape(-1, out.size(-1))
             targets_flat = targets.reshape(-1)
@@ -1210,6 +1273,7 @@ def train(
                     ).view(-1)
                 assert factor_logits is not None, "Model output missing factor_logits_pre."
                 factor_logits = torch.as_tensor(factor_logits, device=graph_loss.device).view(-1)
+                train_factor_logit_abs_max = max(train_factor_logit_abs_max, _max_abs_value(factor_logits))
                 assert factor_logits.numel() == factor_targets.numel(), (
                     "factor_logits_pre length must match factor_satisfied_pre length."
                 )
@@ -1281,6 +1345,10 @@ def train(
                     factor_logits_post_gold = torch.as_tensor(
                         factor_logits_post_gold, device=graph_loss.device
                     ).view(-1)
+                    train_factor_logit_abs_max = max(
+                        train_factor_logit_abs_max,
+                        _max_abs_value(factor_logits_post_gold),
+                    )
                     if factor_logits_post_gold.numel() != post_targets.numel():
                         raise AssertionError(
                             "factor_logits_post_gold length must match factor_satisfied_post_gold length."
@@ -1434,6 +1502,7 @@ def train(
                 packed_scores = model.score_candidates_packed(
                     graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                 )
+                train_chooser_score_abs_max = max(train_chooser_score_abs_max, _max_abs_value(packed_scores))
                 chooser_packed_score_s = (time.perf_counter() - chooser_score_t0) if timing_enabled else 0.0
 
                 chooser_eval_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -1627,6 +1696,7 @@ def train(
                 weighted_loss = graph_loss.mean()
             reweight_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
+            _assert_finite_scalar("weighted_loss", weighted_loss, epoch=epoch + 1, batch_idx=batch_idx)
             phase_t0 = time.perf_counter() if timing_enabled else 0.0
             weighted_loss.backward()
             backward_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
@@ -1636,7 +1706,13 @@ def train(
 
             phase_t0 = time.perf_counter() if timing_enabled else 0.0
             if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            else:
+                grad_norm = _grad_norm(model.parameters())
+            grad_norm_value = _assert_finite_scalar("grad_norm", grad_norm, epoch=epoch + 1, batch_idx=batch_idx)
+            train_grad_norm_sum += grad_norm_value
+            train_grad_norm_count += 1
+            train_grad_norm_max = max(train_grad_norm_max, grad_norm_value)
 
             optimizer.step()
             optim_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
@@ -1807,6 +1883,10 @@ def train(
         train_direct_safety_loss = train_direct_safety_loss_sum / max(train_direct_safety_count, 1)
         train_policy_loss = train_policy_loss_sum / max(train_policy_count, 1)
         train_policy_acc = 100 * train_policy_correct / max(train_policy_count, 1)
+        train_grad_norm_mean = train_grad_norm_sum / max(train_grad_norm_count, 1)
+        train_param_norm, train_param_abs_max = _parameter_norm_stats(model)
+        _assert_finite_scalar("parameter_norm", train_param_norm, epoch=epoch + 1)
+        _assert_finite_scalar("parameter_abs_max", train_param_abs_max, epoch=epoch + 1)
         if timing_enabled and train_timing_epoch_count > 0:
             logger.info(
                 "Epoch %s train timing summary (%s batches, warmup=%s) | data=%.1fms forward=%.1fms base_loss=%.1fms chooser=%.1fms chooser_build=%.1fms chooser_score=%.1fms chooser_eval=%.1fms chooser_eval_constraints=%.1fms chooser_eval_math=%.1fms factor=%.1fms policy=%.1fms fix=%.1fms reweight=%.1fms backward=%.1fms optim=%.1fms metrics=%.1fms total=%.1fms",
@@ -1855,6 +1935,9 @@ def train(
         val_policy_loss_sum = 0.0
         val_policy_count = 0
         val_policy_correct = 0
+        val_edit_logit_abs_max = 0.0
+        val_factor_logit_abs_max = 0.0
+        val_chooser_score_abs_max = 0.0
         val_epoch_start = time.perf_counter()
         val_timing_window = _new_timing_bucket(val_timing_keys)
         val_timing_epoch = _new_timing_bucket(val_timing_keys)
@@ -1890,6 +1973,7 @@ def train(
                 assert out.dim() == 3 and out.size(1) == NUM_SLOTS and out.size(2) == model.num_target_ids, (
                     f"Expected out (B,{NUM_SLOTS},{model.num_target_ids}), got {tuple(out.shape)}"
                 )
+                val_edit_logit_abs_max = max(val_edit_logit_abs_max, _max_abs_value(out))
 
                 out_flat = out.reshape(-1, out.size(-1))
                 targets_flat = targets.reshape(-1)
@@ -1986,6 +2070,7 @@ def train(
                         ).view(-1)
                     assert factor_logits is not None, "Model output missing factor_logits_pre."
                     factor_logits = torch.as_tensor(factor_logits, device=graph_loss.device).view(-1)
+                    val_factor_logit_abs_max = max(val_factor_logit_abs_max, _max_abs_value(factor_logits))
                     assert factor_logits.numel() == factor_targets.numel(), (
                         "factor_logits_pre length must match factor_satisfied_pre length."
                     )
@@ -2057,6 +2142,10 @@ def train(
                         factor_logits_post_gold = torch.as_tensor(
                             factor_logits_post_gold, device=graph_loss.device
                         ).view(-1)
+                        val_factor_logit_abs_max = max(
+                            val_factor_logit_abs_max,
+                            _max_abs_value(factor_logits_post_gold),
+                        )
                         if factor_logits_post_gold.numel() != post_targets.numel():
                             raise AssertionError(
                                 "factor_logits_post_gold length must match factor_satisfied_post_gold length."
@@ -2210,6 +2299,7 @@ def train(
                     packed_scores = model.score_candidates_packed(
                         graph_emb, packed_candidate_tensor, packed_graph_index_tensor
                     )
+                    val_chooser_score_abs_max = max(val_chooser_score_abs_max, _max_abs_value(packed_scores))
                     chooser_packed_score_s = (time.perf_counter() - chooser_score_t0) if timing_enabled else 0.0
 
                     chooser_eval_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -2386,6 +2476,8 @@ def train(
                     graph_loss = graph_loss + direct_safety_losses
                     val_direct_safety_loss_sum += float(direct_safety_losses.sum().item())
                     val_direct_safety_count += direct_safety_losses.numel()
+
+                _assert_finite_scalar("validation_graph_loss_mean", graph_loss.mean(), epoch=epoch + 1, batch_idx=batch_idx)
 
                 # Accumulate validation metrics
                 phase_t0 = time.perf_counter() if timing_enabled else 0.0
@@ -2577,6 +2669,7 @@ def train(
             val_total,
         )
 
+        current_lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step(avg_val_loss)
 
         # Snapshot aggregate metrics for this epoch.
@@ -2586,6 +2679,17 @@ def train(
         history["val_acc_all6"].append(val_acc_all6)
         history["train_acc_slot"].append(train_acc_slot)
         history["val_acc_slot"].append(val_acc_slot)
+        history["learning_rate"].append(current_lr)
+        history["train_grad_norm_mean"].append(train_grad_norm_mean)
+        history["train_grad_norm_max"].append(train_grad_norm_max)
+        history["train_param_norm"].append(train_param_norm)
+        history["train_param_abs_max"].append(train_param_abs_max)
+        history["train_edit_logit_abs_max"].append(train_edit_logit_abs_max)
+        history["val_edit_logit_abs_max"].append(val_edit_logit_abs_max)
+        history["train_factor_logit_abs_max"].append(train_factor_logit_abs_max)
+        history["val_factor_logit_abs_max"].append(val_factor_logit_abs_max)
+        history["train_chooser_score_abs_max"].append(train_chooser_score_abs_max)
+        history["val_chooser_score_abs_max"].append(val_chooser_score_abs_max)
         history.setdefault("train_chooser_loss", []).append(train_chooser_loss)
         history.setdefault("val_chooser_loss", []).append(val_chooser_loss)
         history.setdefault("train_direct_safety_loss", []).append(train_direct_safety_loss)
@@ -2680,6 +2784,23 @@ def train(
             val_acc_all6,
             train_acc_slot,
             val_acc_slot,
+        )
+        logger.info(
+            "Epoch %s stability | lr=%.3g grad_norm_mean=%.4f grad_norm_max=%.4f "
+            "param_norm=%.4f param_abs_max=%.4f edit_logit_abs_max=train %.4f/val %.4f "
+            "factor_logit_abs_max=train %.4f/val %.4f chooser_score_abs_max=train %.4f/val %.4f",
+            epoch + 1,
+            current_lr,
+            train_grad_norm_mean,
+            train_grad_norm_max,
+            train_param_norm,
+            train_param_abs_max,
+            train_edit_logit_abs_max,
+            val_edit_logit_abs_max,
+            train_factor_logit_abs_max,
+            val_factor_logit_abs_max,
+            train_chooser_score_abs_max,
+            val_chooser_score_abs_max,
         )
         if factor_cfg.enabled:
             logger.info(

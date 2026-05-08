@@ -280,10 +280,11 @@ uv run scripts/make_hparam_search_configs_m1.py \
 
 Recommended search budget:
 
-- default: `4` configs max
+- default: `5` configs max
 - one seed only
 - no repeated sweeps
 - for development-speed searches, set `training_config.validation_subset_size: 25000` in the generated configs so each epoch validates on the first 25k validation graphs; remove it or set it to `null` before final paper-facing training
+- generated `M1C` configs use the conservative stability schedule: `learning_rate=1e-4`, `grad_clip=0.5`, `num_epochs=8`, `early_stopping_rounds=2`, `scheduler_patience=0`, and `chooser.loss_weight=0.25`
 
 Run the short search with the scheduler:
 
@@ -336,6 +337,7 @@ Backbone and optimizer:
 - `learning_rate`
 - `weight_decay`
 - `batch_size`
+- `grad_clip`
 - `scheduler_factor`
 - `scheduler_patience`
 - `early_stopping_rounds`

@@ -2,6 +2,8 @@
 """
 Generate a focused 5-config hyperparameter sweep for the appendix-only chooser model:
 - ``M1C`` proposal + chooser(Fix-1) + typed pressure
+- Conservative stability defaults: lr=1e-4, grad_clip=0.5, epochs=8,
+  early_stopping_rounds=2, scheduler_patience=0, chooser_loss_weight=0.25
 - Full dataset defaults: dataset_variant="full", min_occurrence=100
   (resolved to "full_minocc100")
 - Default encoding: "node_id"
@@ -37,10 +39,13 @@ from modules.data_encoders import (
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
 VALIDATION_SUBSET_SIZE = 25_000
-CHEAPER_NUM_EPOCHS = 15
-CHEAPER_EARLY_STOPPING_ROUNDS = 5
+CHEAPER_NUM_EPOCHS = 8
+CHEAPER_EARLY_STOPPING_ROUNDS = 2
 CHEAPER_SCHEDULER_FACTOR = 0.5
-CHEAPER_SCHEDULER_PATIENCE = 1
+CHEAPER_SCHEDULER_PATIENCE = 0
+STABLE_LEARNING_RATE = 1.0e-4
+STABLE_GRAD_CLIP = 0.5
+STABLE_CHOOSER_LOSS_WEIGHT = 0.25
 
 
 def _torch_load_trusted(path: Path) -> Any:
@@ -173,14 +178,14 @@ def main() -> None:
     # ---- Focused shortlist (5 configs) ----
     # These are the selected candidates for constrained-budget model selection.
     grid = [
-        # Beta sweep on concat pressure
-        HP("c1", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, 0.5, 20, 80, 0.10, "concat"),
-        HP("c2", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
-        HP("c3", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 2.0, 0.0, 0.5, 20, 80, 0.10, "concat"),
+        # Conservative beta sweep on concat pressure.
+        HP("c1", 256, STABLE_LEARNING_RATE, 1.1e-4, 0.17, 4, 400, 400, 0.0, 0.0, STABLE_CHOOSER_LOSS_WEIGHT, 20, 80, 0.10, "concat"),
+        HP("c2", 256, STABLE_LEARNING_RATE, 1.1e-4, 0.17, 4, 400, 400, 0.25, 0.0, STABLE_CHOOSER_LOSS_WEIGHT, 20, 80, 0.10, "concat"),
+        HP("c3", 256, STABLE_LEARNING_RATE, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, STABLE_CHOOSER_LOSS_WEIGHT, 20, 80, 0.10, "concat"),
         # Pressure-mode ablation
-        HP("g0", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.0, 0.5, 20, 80, 0.10, "gate"),
+        HP("g0", 256, STABLE_LEARNING_RATE, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.0, STABLE_CHOOSER_LOSS_WEIGHT, 20, 80, 0.10, "gate"),
         # Gamma stress test
-        HP("c10", 256, 3.0e-4, 1.1e-4, 0.17, 4, 400, 400, 1.0, 0.2, 0.35, 20, 80, 0.10, "concat"),
+        HP("c10", 256, STABLE_LEARNING_RATE, 1.1e-4, 0.17, 4, 400, 400, 0.5, 0.2, STABLE_CHOOSER_LOSS_WEIGHT, 20, 80, 0.10, "concat"),
     ]
 
     if args.num_configs > len(grid):
@@ -227,6 +232,7 @@ def main() -> None:
                 "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
                 "learning_rate": hp.lr,
                 "weight_decay": hp.wd,
+                "grad_clip": STABLE_GRAD_CLIP,
                 "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
                 "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
                 "num_workers": SAFE_STREAMING_NUM_WORKERS,

@@ -233,7 +233,7 @@ class ChooserConfig:
     max_candidates_total: int = 80
     beta_no_regression: float = 0.5
     gamma_primary: float = 0.0
-    loss_weight: float = 0.5
+    loss_weight: float = 0.25
     loss_mode: str = "fix1"  # fix1 | primary_only | global_fix
 
     @classmethod
@@ -448,13 +448,13 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     batch_size: int = 124  # Number of graphs per optimization step.
-    num_epochs: int = 5  # Maximum number of training epochs.
-    early_stopping_rounds: int = 5  # Patience before early stopping triggers.
-    grad_clip: float | None = 1.0  # Gradient norm cap; set None to disable clipping.
-    learning_rate: float = 3e-4  # Base learning rate for Adam.
+    num_epochs: int = 8  # Maximum number of training epochs.
+    early_stopping_rounds: int = 2  # Patience before early stopping triggers.
+    grad_clip: float | None = 0.5  # Gradient norm cap; set None to disable clipping.
+    learning_rate: float = 1e-4  # Base learning rate for Adam.
     weight_decay: float = 5e-4  # L2 penalty applied through Adam weight decay.
     scheduler_factor: float = 0.5  # Multiplicative drop factor for the LR scheduler.
-    scheduler_patience: int = 2  # Epochs with no improvement before lowering LR.
+    scheduler_patience: int = 0  # Epochs with no improvement before lowering LR.
     num_workers: int = 0  # Worker processes used by DataLoader.
     pin_memory: bool | None = None  # Override DataLoader pin_memory behaviour (None keeps the default).
     validate_factor_labels: bool = False  # Enable strict factor label assertions per batch.

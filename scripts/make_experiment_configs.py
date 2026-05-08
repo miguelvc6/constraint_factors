@@ -33,11 +33,12 @@ PASSIVE_SHARD_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)-
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
 VALIDATION_SUBSET_SIZE = 25_000
-CHEAPER_NUM_EPOCHS = 20
-CHEAPER_EARLY_STOPPING_ROUNDS = 5
-CHEAPER_LEARNING_RATE = 3e-4
+CHEAPER_NUM_EPOCHS = 8
+CHEAPER_EARLY_STOPPING_ROUNDS = 2
+CHEAPER_LEARNING_RATE = 1e-4
+CHEAPER_GRAD_CLIP = 0.5
 CHEAPER_SCHEDULER_FACTOR = 0.5
-CHEAPER_SCHEDULER_PATIENCE = 1
+CHEAPER_SCHEDULER_PATIENCE = 0
 
 
 def _parse_min_occurrence(variant: str) -> int:
@@ -146,9 +147,9 @@ class ProposalExperiment:
     pressure_type_conditioning: str
     chooser_enabled: bool = False
     chooser_loss_mode: str = "fix1"
-    chooser_loss_weight: float = 0.5
+    chooser_loss_weight: float = 0.25
     chooser_beta_no_regression: float = 0.5
-    chooser_gamma_primary: float = 1.0
+    chooser_gamma_primary: float = 0.0
     direct_safety_enabled: bool = False
     direct_safety_alpha_primary: float = 1.0
     direct_safety_beta_secondary: float = 0.5
@@ -199,6 +200,7 @@ def _proposal_config_payload(
             "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
             "learning_rate": CHEAPER_LEARNING_RATE,
             "weight_decay": 1e-4,
+            "grad_clip": CHEAPER_GRAD_CLIP,
             "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
             "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
             "num_workers": SAFE_STREAMING_NUM_WORKERS,
@@ -264,6 +266,7 @@ def _reranker_config_payload(
             "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
             "learning_rate": CHEAPER_LEARNING_RATE,
             "weight_decay": 1e-4,
+            "grad_clip": CHEAPER_GRAD_CLIP,
             "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
             "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
             "validation_subset_size": VALIDATION_SUBSET_SIZE,
@@ -332,9 +335,9 @@ def main() -> None:
             pressure_type_conditioning="concat",
             chooser_enabled=True,
             chooser_loss_mode="fix1",
-            chooser_loss_weight=0.5,
+            chooser_loss_weight=0.25,
             chooser_beta_no_regression=0.5,
-            chooser_gamma_primary=1.0,
+            chooser_gamma_primary=0.0,
             validate_factor_labels=True,
         ),
         ProposalExperiment(
