@@ -306,6 +306,33 @@ def main() -> int:
                                 "Stopping scheduler after eval failure (use --keep-going to continue)."
                             )
                             return 1
+                else:
+                    eval_flags: list[str] = []
+                    if args.eval_global_metrics:
+                        eval_flags.append("--global-metrics")
+                    if args.eval_per_constraint_csv or "--per-constraint-csv" not in eval_flags:
+                        eval_flags.append("--per-constraint-csv")
+                    if args.paper_suite and "--strict-global-metrics" not in eval_flags:
+                        eval_flags.append("--strict-global-metrics")
+                    chooser_enabled = bool(
+                        cfg.get("training_config", {}).get("chooser", {}).get("enabled", False)
+                    )
+                    policy_enabled = bool(cfg.get("model_config", {}).get("enable_policy_choice", False))
+                    if chooser_enabled:
+                        eval_flags.append("--use-chooser")
+                    if policy_enabled:
+                        eval_flags.append("--use-policy-choice")
+                    evaluation = run_evaluation(
+                        model_dir,
+                        sanitize_run_name(model_dir),
+                        logger,
+                        extra_flags=eval_flags,
+                    )
+                    record["evaluation"] = evaluation
+                    if evaluation.get("return_code") not in (0, None) and not args.keep_going:
+                        write_history(record)
+                        logger.error("Stopping scheduler after eval failure (use --keep-going to continue).")
+                        return 1
             write_history(record)
             continue
 

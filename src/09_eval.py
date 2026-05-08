@@ -135,12 +135,14 @@ class GlobalMetricsSupport:
                 pre_satisfied = getattr(data, "factor_satisfied_pre", None)
                 pre_checkable = getattr(data, "factor_checkable_pre", None)
                 primary_index = getattr(data, "primary_factor_index", None)
+                factor_constraint_ids = getattr(data, "factor_constraint_ids", None)
                 if pre_satisfied is None and pre_checkable is None and primary_index is None:
                     vectors.append({})
                     continue
                 any_vectors = True
                 vectors.append(
                     {
+                        "factor_constraint_ids": factor_constraint_ids,
                         "pre_satisfied": pre_satisfied,
                         "pre_checkable": pre_checkable,
                         "primary_factor_index": primary_index,

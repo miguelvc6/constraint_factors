@@ -958,6 +958,7 @@ class CandidateConstraintEvaluator:
         *,
         candidate_slots: Sequence[int],
         primary_factor_index: int | None = None,
+        factor_constraint_ids: Sequence[int] | None = None,
     ) -> Dict[str, Any]:
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
         p_local_set = p_local
@@ -1009,7 +1010,11 @@ class CandidateConstraintEvaluator:
             other_object=other_object,
         )
 
-        if self._constraint_scope == "focus":
+        if factor_constraint_ids is not None:
+            constraint_ids_raw = factor_constraint_ids
+        elif getattr(row, "factor_constraint_ids", None) is not None:
+            constraint_ids_raw = getattr(row, "factor_constraint_ids", None)
+        elif self._constraint_scope == "focus":
             constraint_ids_raw = getattr(row, "local_constraint_ids_focus", None)
             if constraint_ids_raw is None:
                 constraint_ids_raw = getattr(row, "local_constraint_ids", None)

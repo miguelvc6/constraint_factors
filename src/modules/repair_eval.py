@@ -815,7 +815,18 @@ def evaluate_global_repair_samples(
 
     for idx, (sample, row) in enumerate(zip(samples, rows)):
         candidate_slots = _candidate_slots_from_sample(sample, none_class)
-        details = evaluator.evaluate_full(row, candidate_slots=candidate_slots)
+        factor_constraint_ids_override = None
+        primary_index_override = None
+        if pre_vectors is not None and idx < len(pre_vectors):
+            override = pre_vectors[idx]
+            factor_constraint_ids_override = _coerce_factor_sequence(override.get("factor_constraint_ids"))
+            primary_index_override = override.get("primary_factor_index")
+        details = evaluator.evaluate_full(
+            row,
+            candidate_slots=candidate_slots,
+            primary_factor_index=primary_index_override,
+            factor_constraint_ids=factor_constraint_ids_override,
+        )
 
         local_constraint_ids = details["local_constraint_ids"]
         primary_index = details["primary_factor_index"]
@@ -830,10 +841,9 @@ def evaluate_global_repair_samples(
             if pre_checkable_override is not None and pre_satisfied_override is not None:
                 pre_checkable = [bool(v) for v in pre_checkable_override]
                 pre_satisfied = [int(v) for v in pre_satisfied_override]
-            primary_override = override.get("primary_factor_index")
-            if primary_override is not None:
+            if primary_index_override is not None:
                 try:
-                    primary_index = int(primary_override)
+                    primary_index = int(primary_index_override)
                 except (TypeError, ValueError):
                     pass
 
