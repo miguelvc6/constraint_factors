@@ -45,6 +45,7 @@ from modules.data_encoders import (
 )
 from modules.model_store import baseline_dir, config_copy_path, evaluations_dir, get_checkpoint_path
 from modules.models import BaseGraphModel, build_model
+from modules.h2_eval import H2RunSupport, write_h2_report
 from modules.repair_eval import (
     ConstraintRepairHeuristics,
     RepairSample,
@@ -1250,6 +1251,61 @@ def _enable_checkpoint_optional_heads(model: BaseGraphModel, state_dict: dict[st
         model.enable_chooser()
 
 
+def load_trained_model_for_eval(
+    *,
+    run_directory: Path,
+    model_cfg: ModelConfig,
+    device: torch.device,
+    chooser_support: ChooserSupport | None = None,
+) -> BaseGraphModel:
+    checkpoint_path = get_checkpoint_path(run_directory)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Trained model not found at {checkpoint_path}")
+
+    logging.info("Using model artifacts in %s", run_directory)
+    logging.info("Loading checkpoint from %s", checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    if isinstance(checkpoint, BaseGraphModel):
+        model = checkpoint.to(device)
+        if chooser_support is not None and not model.chooser_enabled:
+            model.enable_chooser()
+        return model
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)!r}")
+
+    model_name = checkpoint.get("model_name") or model_cfg.model
+    num_graph_nodes = checkpoint.get("num_graph_nodes")
+    state_dict = checkpoint.get("model_state")
+    if num_graph_nodes is None or state_dict is None:
+        raise ValueError("Checkpoint is missing required fields: 'num_graph_nodes' or 'model_state'.")
+
+    checkpoint_model_cfg = checkpoint.get("model_cfg", {})
+    if checkpoint_model_cfg:
+        effective_model_cfg = ModelConfig.from_mapping(checkpoint_model_cfg)
+    else:
+        effective_model_cfg = model_cfg
+
+    model = build_model(
+        model_name,
+        int(num_graph_nodes),
+        effective_model_cfg,
+    )
+    _enable_checkpoint_optional_heads(model, state_dict)
+    if chooser_support is not None and not model.chooser_enabled:
+        model.enable_chooser()
+    model.load_state_dict(state_dict)
+    model.to(device)
+    printable_config = {
+        k: v
+        for k, v in effective_model_cfg.to_dict().items()
+        if k not in ["entity_class_ids", "predicate_class_ids"]
+    }
+    logging.info("Loaded checkpoint with config: %s", printable_config)
+    return model
+
+
 # Load and run a trained torch model
 def evaluate_trained_model(
     *,
@@ -1274,46 +1330,12 @@ def evaluate_trained_model(
 
     model = None
     if precomputed_predictions is None:
-        logging.info("Using model artifacts in %s", run_directory)
-        logging.info("Loading checkpoint from %s", checkpoint_path)
-
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-        if isinstance(checkpoint, BaseGraphModel):
-            model = checkpoint.to(device)
-            if chooser_support is not None and not model.chooser_enabled:
-                model.enable_chooser()
-        elif isinstance(checkpoint, dict):
-            model_name = checkpoint.get("model_name") or model_cfg.model
-            num_graph_nodes = checkpoint.get("num_graph_nodes")
-            state_dict = checkpoint.get("model_state")
-            if num_graph_nodes is None or state_dict is None:
-                raise ValueError("Checkpoint is missing required fields: 'num_graph_nodes' or 'model_state'.")
-
-            checkpoint_model_cfg = checkpoint.get("model_cfg", {})
-            if checkpoint_model_cfg:
-                effective_model_cfg = ModelConfig.from_mapping(checkpoint_model_cfg)
-            else:
-                effective_model_cfg = model_cfg
-
-            model = build_model(
-                model_name,
-                int(num_graph_nodes),
-                effective_model_cfg,
-            )
-            _enable_checkpoint_optional_heads(model, state_dict)
-            if chooser_support is not None and not model.chooser_enabled:
-                model.enable_chooser()
-            model.load_state_dict(state_dict)
-            model.to(device)
-            printable_config = {
-                k: v
-                for k, v in effective_model_cfg.to_dict().items()
-                if k not in ["entity_class_ids", "predicate_class_ids"]
-            }
-            logging.info("Loaded checkpoint with config: %s", printable_config)
-        else:
-            raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)!r}")
+        model = load_trained_model_for_eval(
+            run_directory=run_directory,
+            model_cfg=model_cfg,
+            device=device,
+            chooser_support=chooser_support,
+        )
 
     _run_and_save(
         model=model,
@@ -1381,6 +1403,17 @@ def parse_args():
         help="Write per-constraint breakdown CSV in the evaluations directory.",
     )
     parser.add_argument(
+        "--h2-eval",
+        action="store_true",
+        help="Write H2 factor semantics/composition/counterfactual reports under evaluations/h2 without overwriting model.json.",
+    )
+    parser.add_argument(
+        "--h2-batch-size",
+        type=int,
+        default=16,
+        help="Batch size for --h2-eval forward passes.",
+    )
+    parser.add_argument(
         "--strict-global-metrics",
         action="store_true",
         help="Fail fast unless global metrics (GFR/SRR/SIR/disruption) can be computed.",
@@ -1443,6 +1476,8 @@ def parse_args():
             raise ValueError("--run-baselines requires --dataset.")
         if args.reranker_predictions:
             raise ValueError("--reranker-predictions is only supported for trained model evaluation.")
+        if args.h2_eval:
+            raise ValueError("--h2-eval is only supported for trained factorized model evaluation.")
         return args
 
     if args.run_directory is None:
@@ -1459,6 +1494,10 @@ def parse_args():
         raise FileNotFoundError(f"Run directory not found at {run_directory}")
     if not run_directory.is_dir():
         raise NotADirectoryError(f"Run directory path is not a directory: {run_directory}")
+    if args.h2_eval and args.reranker_predictions:
+        raise RuntimeError("--h2-eval cannot be combined with --reranker-predictions.")
+    if args.h2_batch_size <= 0:
+        raise ValueError("--h2-batch-size must be positive.")
 
     args.run_directory = run_directory
     return args
@@ -1682,8 +1721,44 @@ def main():
                 raise RuntimeError(
                     "Strict global metrics requested but could not be prepared. "
                     "Verify registry/encoder availability and factor fields."
-                )
+            )
             logging.warning("Global metrics requested but could not be prepared; skipping.")
+
+        if args.h2_eval:
+            if model_cfg.constraint_representation != "factorized":
+                raise RuntimeError("--h2-eval requires factorized processed graphs.")
+            if not _data_has_factor_fields(test_data):
+                raise RuntimeError(
+                    "--h2-eval requires factor fields on test graphs. "
+                    "Use processed graphs built from labeled interim parquet."
+                )
+            train_data = load_split(
+                base_path,
+                model_cfg.encoding,
+                "train",
+                constraint_representation=model_cfg.constraint_representation,
+            )
+            model = load_trained_model_for_eval(
+                run_directory=run_directory,
+                model_cfg=model_cfg,
+                device=device,
+                chooser_support=chooser_support,
+            )
+            h2_dir = evaluations_dir(run_directory, create=True) / "h2"
+            report = write_h2_report(
+                model=model,
+                train_data=train_data,
+                test_data=test_data,
+                device=device,
+                output_dir=h2_dir,
+                support=H2RunSupport(
+                    repair_support=repair_support,
+                    global_support=global_support,
+                ),
+                batch_size=args.h2_batch_size,
+            )
+            logging.info("Wrote H2 report to %s (status=%s)", h2_dir / "h2_report.json", report.get("status"))
+            return
 
         postprocess = None
         postprocess_state: dict[str, object] | None = None

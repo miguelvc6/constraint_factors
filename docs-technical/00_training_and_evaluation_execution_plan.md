@@ -224,6 +224,22 @@ This emits only:
 
 If appendix runs are needed later, generate them separately with `--include-experimental`.
 
+H2 supporting ablations are generated with a separate opt-in flag:
+
+```bash
+uv run scripts/make_experiment_configs.py \
+  --models-root models \
+  --include-h2-ablations
+```
+
+When run after canonical config generation, existing config files are left untouched and this adds only the three H2 appendix proposal configs:
+
+- `h2_a1_no_factor_loss__<variant>__<encoding>`
+- `h2_a1_shared_pressure__<variant>__<encoding>`
+- `h2_a1_legacy_shared_executor__<variant>__<encoding>`
+
+The flag does not modify existing checkpoints or existing config files. Generated H2 ablations should be trained later as separate runs.
+
 ### Step 2. Run heuristic baselines first
 
 Run baselines before any neural training so the paper already has stable reference numbers:
@@ -452,6 +468,41 @@ uv run src/09_eval.py \
   --strict-global-metrics \
   --per-constraint-csv
 ```
+
+### H2 diagnostics for factorized proposal models
+
+Run H2 as a read-only sidecar evaluation on an existing factorized checkpoint:
+
+```bash
+uv run src/09_eval.py \
+  --run-directory models/<run_dir> \
+  --strict-global-metrics \
+  --h2-eval
+```
+
+For chooser checkpoints, pass the chooser flag only to load the optional head if the checkpoint expects it:
+
+```bash
+uv run src/09_eval.py \
+  --run-directory models/<run_dir> \
+  --use-chooser \
+  --strict-global-metrics \
+  --h2-eval
+```
+
+Outputs are written under:
+
+- `models/<run_dir>/evaluations/h2/h2_report.json`
+- `models/<run_dir>/evaluations/h2/factor_semantics.csv`
+- `models/<run_dir>/evaluations/h2/transfer_slices.csv`
+- `models/<run_dir>/evaluations/h2/density_slices.csv`
+- `models/<run_dir>/evaluations/h2/density_factor_semantics.csv`
+- `models/<run_dir>/evaluations/h2/counterfactual_masking.csv`
+- `models/<run_dir>/evaluations/h2/counterfactual_deltas.csv`
+- `models/<run_dir>/evaluations/h2/counterfactual_overall_deltas.csv`
+- `models/<run_dir>/evaluations/h2/graph_density.csv`
+
+The command does not write `models/<run_dir>/evaluations/model.json` and does not mutate train/test graph artifacts. It requires factorized processed graphs with factor-label fields and reuses the existing processed train split only to count train exposure buckets.
 
 ### Reranker model
 

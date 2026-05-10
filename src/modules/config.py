@@ -361,6 +361,8 @@ class ModelConfig:
     """Toggle factor pressure injection during message passing."""
     pressure_type_conditioning: str = "none"
     """Condition pressure messages on factor types: none|concat|gate."""
+    pressure_module_sharing: str = "per_type"
+    """Share factor pressure modules: per_type|shared."""
     pressure_residual_scale: float = 0.1
     """Scale applied to degree-normalized pressure residual messages."""
     enable_policy_choice: bool = False
@@ -411,6 +413,11 @@ class ModelConfig:
             if value not in {"none", "concat", "gate"}:
                 raise ValueError("pressure_type_conditioning must be 'none', 'concat', or 'gate'")
             filtered["pressure_type_conditioning"] = value
+        if "pressure_module_sharing" in filtered and filtered["pressure_module_sharing"] is not None:
+            value = str(filtered["pressure_module_sharing"]).lower()
+            if value not in {"per_type", "shared"}:
+                raise ValueError("pressure_module_sharing must be 'per_type' or 'shared'")
+            filtered["pressure_module_sharing"] = value
         if "pressure_residual_scale" in filtered and filtered["pressure_residual_scale"] is not None:
             value = float(filtered["pressure_residual_scale"])
             if value < 0.0:

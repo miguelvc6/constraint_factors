@@ -67,7 +67,7 @@ The default config generator should emit only:
 - `m1d_safe_factor_direct`
 - `g0_globalfix_reference`
 
-Appendix or exploratory variants such as policy-choice, factor-loss-only, untyped-pressure, and non-paper rerankers should be gated behind `--include-experimental`.
+Appendix or exploratory variants such as policy-choice, factor-loss-only, untyped-pressure, and non-paper rerankers should be gated behind `--include-experimental` or a more specific appendix flag.
 
 ## Main evaluation suites
 
@@ -95,3 +95,27 @@ Appendix or exploratory variants such as policy-choice, factor-loss-only, untype
 
 ### Evaluation rule
 - `M1C`, `M1D`, and `G0` must share the same candidate-level symbolic evaluator contract so reported safety metrics are definitionally aligned.
+
+## H2 appendix diagnostics
+
+H2 is evaluated as an opt-in diagnostic layer over existing factorized train/test graph artifacts and trained checkpoints. It is not part of the canonical main-suite score and writes under `models/<run>/evaluations/h2/` so the normal `evaluations/model.json` remains unchanged.
+
+The H2 report includes:
+
+- factor semantic metrics for `factor_logits_pre` and `factor_logits_post_gold` against existing factor satisfaction labels, grouped by factor state, family, and compact type
+- transfer slices by train-set factor exposure bucket (`unseen`, `low_1_10`, `medium_11_100`, `high_gt100`), primary vs secondary role, and family
+- density/composition slices by local factor count bucket (`1`, `2_4`, `5_16`, `17_64`, `65_plus`) plus shared pressure-overlap summaries
+- inference-time pressure masking variants: `normal`, `no_factor_pressure`, `primary_only_pressure`, and `secondary_only_pressure`
+- counterfactual prediction-change rates and repair/global metric deltas relative to `normal`
+
+Factor semantic rows report support, positive rate, accuracy, precision, recall, F1, AUROC, AUPRC, and ECE. If a model checkpoint does not emit factor logits, the H2 report is marked partial and records the unsupported section instead of failing the whole evaluation.
+
+## H2 supporting ablations
+
+The H2 ablations are appendix/supporting runs. They are not canonical main-suite models and should be trained only into new run directories:
+
+- `h2_a1_no_factor_loss__<variant>__<encoding>`: A1-style factorized graph and pressure, but disables auxiliary factor satisfaction loss.
+- `h2_a1_shared_pressure__<variant>__<encoding>`: keeps factor pressure enabled but shares role pressure modules across factor types through `pressure_module_sharing="shared"`.
+- `h2_a1_legacy_shared_executor__<variant>__<encoding>`: uses the older shared factor executor path through `factor_executor_impl="legacy_shared"`.
+
+All three use current processed factorized graphs, A1-style slot inference, no chooser, and no direct safety objective.

@@ -361,6 +361,13 @@ Measures how invasive the predicted edit is:
 - `delete/add ratio`
 - optional graph-edit distance proxy.
 
+### H2 semantic/compositional diagnostics
+H2 should be evaluated with lightweight diagnostics in addition to final repair metrics:
+- factor satisfaction prediction on existing test factors,
+- existing-split transfer slices by constraint-instance exposure,
+- local constraint-density and shared-variable composition slices,
+- inference-time masking of factor pressure to test whether simultaneous factors affect predictions.
+
 ---
 
 ## 11) Expected Behaviors and Evaluation Outcomes

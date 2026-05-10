@@ -9,7 +9,8 @@ Default output:
 - ``m1d_safe_factor_direct``
 - ``g0_globalfix_reference``
 
-Optional appendix / ablation configs are only emitted with ``--include-experimental``.
+Optional appendix / ablation configs are only emitted with ``--include-experimental``
+or ``--include-h2-ablations``.
 """
 
 import argparse
@@ -132,10 +133,13 @@ def _iter_variant_encodings(processed_root: Path) -> Iterable[tuple[str, str]]:
             yield variant_dir.name, encoding
 
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
+def _write_json(path: Path, payload: dict[str, Any], *, overwrite: bool = True) -> bool:
+    if path.exists() and not overwrite:
+        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
+    return True
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,9 @@ class ProposalExperiment:
     validate_factor_labels: bool = False
     include_gold_candidates: bool = True
     enable_policy_choice: bool = False
+    pressure_module_sharing: str = "per_type"
+    factor_executor_impl: str = "per_type_v1"
+    factor_loss_enabled: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -182,13 +189,14 @@ def _proposal_config_payload(
             "min_occurrence": min_occurrence,
             "model": exp.model_name,
             "constraint_representation": exp.constraint_representation,
-            "factor_executor_impl": "per_type_v1",
+            "factor_executor_impl": exp.factor_executor_impl,
             "use_edge_attributes": True,
             "use_edge_subtraction": False,
             "use_role_embeddings": True,
             "role_embedding_dim": 16,
             "pressure_enabled": exp.pressure_enabled,
             "pressure_type_conditioning": exp.pressure_type_conditioning,
+            "pressure_module_sharing": exp.pressure_module_sharing,
             "pressure_residual_scale": 0.1,
             "num_factor_types": int(num_factor_types),
             "enable_policy_choice": exp.enable_policy_choice,
@@ -216,7 +224,11 @@ def _proposal_config_payload(
                 "enabled": False,
             },
             "factor_loss": {
-                "enabled": exp.constraint_representation == "factorized",
+                "enabled": (
+                    exp.factor_loss_enabled
+                    if exp.factor_loss_enabled is not None
+                    else exp.constraint_representation == "factorized"
+                ),
                 "weight_pre": 0.1,
                 "weight_post_gold": 0.1,
             },
@@ -294,6 +306,11 @@ def main() -> None:
     parser.add_argument("--models-root", type=Path, default=Path("models"))
     parser.add_argument("--limit", type=int, default=0, help="Limit variant/encoding pairs (0 = no limit).")
     parser.add_argument("--include-experimental", action="store_true")
+    parser.add_argument(
+        "--include-h2-ablations",
+        action="store_true",
+        help="Emit the three H2 supporting ablation configs. Existing config files are left untouched.",
+    )
     args = parser.parse_args()
 
     pairs = list(_iter_variant_encodings(args.processed_root))
@@ -360,6 +377,35 @@ def main() -> None:
             constraint_scope="local",
         )
     ]
+    h2_ablation_proposals: list[ProposalExperiment] = [
+        ProposalExperiment(
+            name="h2_a1_no_factor_loss",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            validate_factor_labels=True,
+            factor_loss_enabled=False,
+        ),
+        ProposalExperiment(
+            name="h2_a1_shared_pressure",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            pressure_module_sharing="shared",
+            validate_factor_labels=True,
+        ),
+        ProposalExperiment(
+            name="h2_a1_legacy_shared_executor",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            factor_executor_impl="legacy_shared",
+            validate_factor_labels=True,
+        ),
+    ]
 
     experimental_proposals: list[ProposalExperiment] = [
         ProposalExperiment(
@@ -405,6 +451,8 @@ def main() -> None:
 
         proposal_experiments = list(canonical_proposals)
         reranker_experiments = list(canonical_rerankers)
+        if args.include_h2_ablations:
+            proposal_experiments.extend(h2_ablation_proposals)
         if args.include_experimental:
             proposal_experiments.extend(experimental_proposals)
             reranker_experiments.extend(experimental_rerankers)
@@ -421,8 +469,8 @@ def main() -> None:
             )
             if exp.name == "x2_factor_loss_only_appendix":
                 payload["training_config"]["factor_loss"]["enabled"] = True
-            _write_json(cfg_path, payload)
-            created += 1
+            if _write_json(cfg_path, payload, overwrite=not args.include_h2_ablations):
+                created += 1
 
         for exp in reranker_experiments:
             exp_dir_name = f"{exp.name}__{variant}__{encoding}"
@@ -436,8 +484,8 @@ def main() -> None:
                 num_factor_types=num_factor_types,
                 proposal_config_tag=proposal_config_tag,
             )
-            _write_json(cfg_path, payload)
-            created += 1
+            if _write_json(cfg_path, payload, overwrite=not args.include_h2_ablations):
+                created += 1
 
     print(f"[ok] wrote {created} configs under {args.models_root}")
 
