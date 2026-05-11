@@ -576,3 +576,55 @@ Do not expand into:
 - appendix-model training
 
 unless the final paper suite fails in a way that blocks the main claims.
+
+## 8. H2 ablation appendix runs
+
+The H2 ablations are generated from the current processed factorized graph artifacts by adding `--include-h2-ablations` to the canonical config generator:
+
+```bash
+uv run scripts/make_experiment_configs.py \
+  --models-root models \
+  --include-h2-ablations
+```
+
+For the current paper artifact stack, this emits:
+
+- `models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id/config.json`
+- `models/h2_a1_shared_pressure__full_strat1m_minocc100__node_id/config.json`
+- `models/h2_a1_legacy_shared_executor__full_strat1m_minocc100__node_id/config.json`
+
+These are supporting ablations only. They use the existing processed graphs, the locked A1-style proposal setup, no chooser, and no direct-safety objective:
+
+- `h2_a1_no_factor_loss`: tests whether the auxiliary factor satisfaction loss contributes to H2 factor semantics.
+- `h2_a1_shared_pressure`: keeps pressure enabled but shares role pressure modules across factor types, testing typed pressure specifically.
+- `h2_a1_legacy_shared_executor`: uses the legacy shared factor executor, testing the newer per-type executor path.
+
+Train and evaluate the three runs with:
+
+```bash
+uv run src/10_scheduler.py \
+  --only h2_a1_ \
+  --paper-suite \
+  --keep-going
+```
+
+After the standard evaluation has completed, run the H2 sidecar report for each ablation:
+
+```bash
+uv run src/09_eval.py \
+  --run-directory models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id \
+  --strict-global-metrics \
+  --h2-eval
+
+uv run src/09_eval.py \
+  --run-directory models/h2_a1_shared_pressure__full_strat1m_minocc100__node_id \
+  --strict-global-metrics \
+  --h2-eval
+
+uv run src/09_eval.py \
+  --run-directory models/h2_a1_legacy_shared_executor__full_strat1m_minocc100__node_id \
+  --strict-global-metrics \
+  --h2-eval
+```
+
+The H2 outputs are written under each run's `evaluations/h2/` directory. These ablations should be reported as appendix diagnostics for H2, not as replacements for the canonical `B0`, `A1`, `M1C`, `M1D`, or `G0` results.
