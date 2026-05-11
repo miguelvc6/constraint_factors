@@ -34,12 +34,22 @@ PASSIVE_SHARD_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)-
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
 VALIDATION_SUBSET_SIZE = 25_000
-CHEAPER_NUM_EPOCHS = 8
+CHEAPER_NUM_EPOCHS = 10
 CHEAPER_EARLY_STOPPING_ROUNDS = 2
 CHEAPER_LEARNING_RATE = 1e-4
 CHEAPER_GRAD_CLIP = 0.5
 CHEAPER_SCHEDULER_FACTOR = 0.5
 CHEAPER_SCHEDULER_PATIENCE = 0
+LOCKED_NUM_LAYERS = 4
+LOCKED_HIDDEN_CHANNELS = 400
+LOCKED_HEAD_HIDDEN = 400
+LOCKED_DROPOUT = 0.17
+LOCKED_WEIGHT_DECAY = 1.1e-4
+LOCKED_PRESSURE_RESIDUAL_SCALE = 0.1
+LOCKED_FACTOR_LOSS_WEIGHT_PRE = 0.1
+LOCKED_FACTOR_LOSS_WEIGHT_POST_GOLD = 0.1
+LOCKED_CHOOSER_TOPK_CANDIDATES = 20
+LOCKED_CHOOSER_MAX_CANDIDATES_TOTAL = 80
 
 
 def _parse_min_occurrence(variant: str) -> int:
@@ -92,9 +102,12 @@ def _infer_num_factor_types(sample_data: Any) -> int:
 
 
 def _infer_num_factor_types_from_registry(dataset_variant: str, interim_root: Path = Path("data/interim")) -> int:
+    registry_bases = [dataset_variant, base_dataset_name(dataset_variant)]
+    if "_strat" in dataset_variant:
+        registry_bases.append(dataset_variant.split("_strat", 1)[0])
     candidates = [
-        interim_root / f"constraint_registry_{dataset_variant}.parquet",
-        interim_root / f"constraint_registry_{base_dataset_name(dataset_variant)}.parquet",
+        interim_root / f"constraint_registry_{name}.parquet"
+        for name in dict.fromkeys(registry_bases)
     ]
     for path in candidates:
         if not path.exists():
@@ -160,6 +173,8 @@ class ProposalExperiment:
     validate_factor_labels: bool = False
     include_gold_candidates: bool = True
     enable_policy_choice: bool = False
+    locked_backbone: bool = True
+    dynamic_reweighting_enabled: bool = False
     pressure_module_sharing: str = "per_type"
     factor_executor_impl: str = "per_type_v1"
     factor_loss_enabled: bool | None = None
@@ -181,33 +196,42 @@ def _proposal_config_payload(
     min_occurrence: int,
     num_factor_types: int,
 ) -> dict[str, Any]:
-    dynamic_reweighting = exp.name != "b0_eswc_reproduction"
+    model_config = {
+        "dataset_variant": variant,
+        "encoding": encoding,
+        "min_occurrence": min_occurrence,
+        "model": exp.model_name,
+        "constraint_representation": exp.constraint_representation,
+        "factor_executor_impl": exp.factor_executor_impl,
+        "use_edge_attributes": True,
+        "use_edge_subtraction": False,
+        "use_role_embeddings": True,
+        "role_embedding_dim": 16,
+        "pressure_enabled": exp.pressure_enabled,
+        "pressure_type_conditioning": exp.pressure_type_conditioning,
+        "pressure_module_sharing": exp.pressure_module_sharing,
+        "pressure_residual_scale": LOCKED_PRESSURE_RESIDUAL_SCALE,
+        "num_factor_types": int(num_factor_types),
+        "enable_policy_choice": exp.enable_policy_choice,
+        "policy_num_classes": 6,
+    }
+    if exp.locked_backbone:
+        model_config.update(
+            {
+                "num_layers": LOCKED_NUM_LAYERS,
+                "hidden_channels": LOCKED_HIDDEN_CHANNELS,
+                "head_hidden": LOCKED_HEAD_HIDDEN,
+                "dropout": LOCKED_DROPOUT,
+            }
+        )
     return {
-        "model_config": {
-            "dataset_variant": variant,
-            "encoding": encoding,
-            "min_occurrence": min_occurrence,
-            "model": exp.model_name,
-            "constraint_representation": exp.constraint_representation,
-            "factor_executor_impl": exp.factor_executor_impl,
-            "use_edge_attributes": True,
-            "use_edge_subtraction": False,
-            "use_role_embeddings": True,
-            "role_embedding_dim": 16,
-            "pressure_enabled": exp.pressure_enabled,
-            "pressure_type_conditioning": exp.pressure_type_conditioning,
-            "pressure_module_sharing": exp.pressure_module_sharing,
-            "pressure_residual_scale": 0.1,
-            "num_factor_types": int(num_factor_types),
-            "enable_policy_choice": exp.enable_policy_choice,
-            "policy_num_classes": 6,
-        },
+        "model_config": model_config,
         "training_config": {
             "batch_size": 256,
             "num_epochs": CHEAPER_NUM_EPOCHS,
             "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
             "learning_rate": CHEAPER_LEARNING_RATE,
-            "weight_decay": 1e-4,
+            "weight_decay": LOCKED_WEIGHT_DECAY,
             "grad_clip": CHEAPER_GRAD_CLIP,
             "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
             "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
@@ -217,7 +241,7 @@ def _proposal_config_payload(
             "validation_subset_size": VALIDATION_SUBSET_SIZE,
             "constraint_loss": {
                 "dynamic_reweighting": {
-                    "enabled": dynamic_reweighting,
+                    "enabled": exp.dynamic_reweighting_enabled,
                 }
             },
             "fix_probability_loss": {
@@ -229,8 +253,8 @@ def _proposal_config_payload(
                     if exp.factor_loss_enabled is not None
                     else exp.constraint_representation == "factorized"
                 ),
-                "weight_pre": 0.1,
-                "weight_post_gold": 0.1,
+                "weight_pre": LOCKED_FACTOR_LOSS_WEIGHT_PRE,
+                "weight_post_gold": LOCKED_FACTOR_LOSS_WEIGHT_POST_GOLD,
             },
             "chooser": {
                 "enabled": exp.chooser_enabled,
@@ -238,15 +262,15 @@ def _proposal_config_payload(
                 "loss_weight": exp.chooser_loss_weight,
                 "beta_no_regression": exp.chooser_beta_no_regression,
                 "gamma_primary": exp.chooser_gamma_primary,
-                "topk_candidates": 20,
-                "max_candidates_total": 80,
+                "topk_candidates": LOCKED_CHOOSER_TOPK_CANDIDATES,
+                "max_candidates_total": LOCKED_CHOOSER_MAX_CANDIDATES_TOTAL,
             },
             "direct_safety": {
                 "enabled": exp.direct_safety_enabled,
                 "alpha_primary": exp.direct_safety_alpha_primary,
                 "beta_secondary": exp.direct_safety_beta_secondary,
-                "topk_candidates": 20,
-                "max_candidates_total": 80,
+                "topk_candidates": LOCKED_CHOOSER_TOPK_CANDIDATES,
+                "max_candidates_total": LOCKED_CHOOSER_MAX_CANDIDATES_TOTAL,
             },
             "policy_filter_strict": True,
         },
@@ -335,6 +359,7 @@ def main() -> None:
             pressure_enabled=False,
             pressure_type_conditioning="none",
             validate_factor_labels=False,
+            locked_backbone=False,
         ),
         ProposalExperiment(
             name="a1_factorized_imitation",
@@ -353,7 +378,7 @@ def main() -> None:
             chooser_enabled=True,
             chooser_loss_mode="fix1",
             chooser_loss_weight=0.25,
-            chooser_beta_no_regression=0.5,
+            chooser_beta_no_regression=0.25,
             chooser_gamma_primary=0.0,
             validate_factor_labels=True,
         ),

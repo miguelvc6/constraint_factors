@@ -2,7 +2,7 @@
 """
 Generate a focused 5-config hyperparameter sweep for the appendix-only chooser model:
 - ``M1C`` proposal + chooser(Fix-1) + typed pressure
-- Conservative stability defaults: lr=1e-4, grad_clip=0.5, epochs=8,
+- Conservative stability defaults: lr=1e-4, grad_clip=0.5, epochs=10,
   early_stopping_rounds=2, scheduler_patience=0, chooser_loss_weight=0.25
 - Full dataset defaults: dataset_variant="full", min_occurrence=100
   (resolved to "full_minocc100")
@@ -39,7 +39,7 @@ from modules.data_encoders import (
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
 VALIDATION_SUBSET_SIZE = 25_000
-CHEAPER_NUM_EPOCHS = 8
+CHEAPER_NUM_EPOCHS = 10
 CHEAPER_EARLY_STOPPING_ROUNDS = 2
 CHEAPER_SCHEDULER_FACTOR = 0.5
 CHEAPER_SCHEDULER_PATIENCE = 0

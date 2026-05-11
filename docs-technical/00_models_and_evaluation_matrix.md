@@ -51,7 +51,7 @@ The default paper-facing generator should enforce these settings for `A1`, `M1C`
 - graph path: multi-relational / edge-attribute regime
 - encoding: whichever dataset artifact is selected, typically frozen text embeddings when available
 - role embeddings: enabled
-- dynamic per-type reweighting: enabled
+- dynamic per-type reweighting: fixed by the locked winning `M1C` configuration
 - fix-probability loss: disabled
 - factor-loss-only training: disabled
 

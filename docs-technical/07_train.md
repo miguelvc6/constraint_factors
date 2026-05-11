@@ -38,7 +38,7 @@
 - Early stopping patience is enforced even if validation batches fail intermittently; run with a stable validation split and monitor logs before trusting the saved checkpoint.
 - Non-finite weighted loss, validation loss, gradient norm, or parameter norm now raises a `FloatingPointError` with epoch/batch context rather than silently producing a corrupt checkpoint.
 - Subset validation changes model selection because scheduler and early stopping use the subset loss. Use full validation for final paper-facing runs.
-- Generated paper/hparam configs now default to `learning_rate=1e-4`, `grad_clip=0.5`, `num_epochs=8`, `early_stopping_rounds=2`, `scheduler_patience=0`, `num_workers=2`, and `pin_memory=false`. The data-loader defaults avoid shared-memory pressure; the optimization defaults reduce the late-epoch divergence observed in long M1C runs.
+- Generated paper configs now default to `learning_rate=1e-4`, `grad_clip=0.5`, `num_epochs=10`, `early_stopping_rounds=2`, `scheduler_patience=0`, `num_workers=2`, and `pin_memory=false`. The data-loader defaults avoid shared-memory pressure; the optimization defaults reduce the late-epoch divergence observed in long M1C runs.
 - If CUDA is available but `num_workers` is high, pin-memory can still amplify host-memory pressure on in-memory datasets; tune `pin_memory` in the config if throughput does not justify the footprint.
 - Fix-probability loss requires in-memory datasets (lists) so the script can attach `context_index` and look up contexts; streamed datasets will disable that term automatically.
 - Chooser training supports streamed datasets via per-graph `context_index` assignment; contexts/parquet sidecars must align with graph ordering/counts.

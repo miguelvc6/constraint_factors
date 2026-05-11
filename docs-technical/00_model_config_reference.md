@@ -72,7 +72,7 @@ Core optimization fields:
 Generator defaults for the paper-facing proposal configs:
 
 - `batch_size: 256`
-- `num_epochs: 8`
+- `num_epochs: 10`
 - `early_stopping_rounds: 2`
 - `grad_clip: 0.5`
 - `learning_rate: 1e-4`
@@ -83,7 +83,7 @@ Generator defaults for the paper-facing proposal configs:
 
 These defaults are intentionally conservative for the large streamed graph artifacts under `data/processed/`. The shorter schedule is meant to stop soon after the best validation checkpoint on runs that otherwise diverge after several good epochs.
 
-The paper-facing reranker generator uses the same cheaper schedule (`num_epochs: 8`, `early_stopping_rounds: 2`, `learning_rate: 1e-4`, `grad_clip: 0.5`, `scheduler_patience: 0`) with its own reranker batch size.
+The paper-facing reranker generator uses the same cheaper schedule (`num_epochs: 10`, `early_stopping_rounds: 2`, `learning_rate: 1e-4`, `grad_clip: 0.5`, `scheduler_patience: 0`) with its own reranker batch size.
 
 Set `validation_subset_size` to a positive integer for development runs that should validate on only the first N validation graphs each epoch. Leave it unset or `null` for full validation. For streamed graph artifacts, subset validation uses a single validation worker so the stream produces one global prefix rather than one prefix per worker.
 
