@@ -2962,30 +2962,37 @@ def main():
         num_role_types=role_spec.num_types if role_spec.enabled else 0,
         num_embedding_size=feature_dim if not use_node_embeddings else model_cfg.num_embedding_size,
     )
-    registry_factor_types = _registry_factor_type_count(model_cfg.dataset_variant)
+    if model_cfg.constraint_representation == "factorized":
+        registry_factor_types = _registry_factor_type_count(model_cfg.dataset_variant)
 
-    # Avoid scanning all graphs when num_factor_types is already explicit in config.
-    if model_cfg.num_factor_types > 0:
-        num_factor_types = int(model_cfg.num_factor_types)
-        if registry_factor_types > num_factor_types:
-            logger.warning(
-                "Config num_factor_types=%s is below registry-derived count=%s; using registry value instead.",
-                num_factor_types,
-                registry_factor_types,
-            )
-            num_factor_types = registry_factor_types
-            model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
-        logger.info("Using preconfigured num_factor_types=%s (skipping dataset scan).", num_factor_types)
-    else:
-        num_factor_types = registry_factor_types
-        if num_factor_types > 0:
-            model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
-            logger.info("Inferred num_factor_types=%s from constraint registry.", num_factor_types)
+        # Avoid scanning all graphs when num_factor_types is already explicit in config.
+        if model_cfg.num_factor_types > 0:
+            num_factor_types = int(model_cfg.num_factor_types)
+            if registry_factor_types > num_factor_types:
+                logger.warning(
+                    "Config num_factor_types=%s is below registry-derived count=%s; using registry value instead.",
+                    num_factor_types,
+                    registry_factor_types,
+                )
+                num_factor_types = registry_factor_types
+                model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
+            logger.info("Using preconfigured num_factor_types=%s (skipping dataset scan).", num_factor_types)
         else:
-            num_factor_types = derive_factor_type_count(train_data, val_data)
+            num_factor_types = registry_factor_types
             if num_factor_types > 0:
                 model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
-                logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
+                logger.info("Inferred num_factor_types=%s from constraint registry.", num_factor_types)
+            else:
+                num_factor_types = derive_factor_type_count(train_data, val_data)
+                if num_factor_types > 0:
+                    model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
+                    logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
+    elif model_cfg.num_factor_types != 0:
+        logger.info(
+            "Clearing num_factor_types=%s for passive constraint representation.",
+            model_cfg.num_factor_types,
+        )
+        model_cfg = model_cfg.updated(num_factor_types=0)
 
     _write_effective_experiment_config(
         config_path,

@@ -317,6 +317,7 @@ class BaseGraphModel(nn.Module, ABC):
         num_factor_types: int = 0,
         factor_type_embedding_dim: int = 8,
         factor_executor_impl: str = "per_type_v1",
+        constraint_representation: str = "factorized",
         pressure_enabled: bool = False,
         pressure_type_conditioning: str = "none",
         pressure_module_sharing: str = "per_type",
@@ -439,6 +440,9 @@ class BaseGraphModel(nn.Module, ABC):
         self._factor_executor_impl = str(factor_executor_impl).lower()
         if self._factor_executor_impl not in {"per_type_v1", "legacy_shared"}:
             raise ValueError("factor_executor_impl must be 'per_type_v1' or 'legacy_shared'")
+        self._constraint_representation = str(constraint_representation).lower()
+        if self._constraint_representation not in {"factorized", "eswc_passive"}:
+            raise ValueError("constraint_representation must be 'factorized' or 'eswc_passive'")
         self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
         self._pressure_module_sharing = str(pressure_module_sharing).lower()
         if self._pressure_module_sharing not in {"per_type", "shared"}:
@@ -694,6 +698,14 @@ class BaseGraphModel(nn.Module, ABC):
             factor_mask_pre = torch.as_tensor(
                 factor_checkable, dtype=torch.bool, device=node_emb.device
             ).view(-1)
+
+        if self._constraint_representation != "factorized":
+            return {
+                "factor_logits_pre": None,
+                "factor_logits_post_gold": None,
+                "factor_mask_pre": factor_mask_pre,
+                "factor_graph_index": None,
+            }
 
         factor_node_emb, factor_graph_index = _select_factor_nodes(node_emb, data)
         factor_logits_pre = None
@@ -1067,7 +1079,7 @@ class RepairGINFactorPressure(BaseGraphModel):
         )
 
     def _apply_pressure(self, x: torch.Tensor, data) -> torch.Tensor:
-        if not self._pressure_enabled:
+        if not self._pressure_enabled or self._constraint_representation != "factorized":
             return x
         if self._factor_executor_impl == "per_type_v1":
             runtime = self._build_factor_scope_runtime(x, data)
@@ -1381,6 +1393,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         num_factor_types=config.num_factor_types,
         factor_type_embedding_dim=config.factor_type_embedding_dim,
         factor_executor_impl=getattr(config, "factor_executor_impl", "per_type_v1"),
+        constraint_representation=getattr(config, "constraint_representation", "factorized"),
         pressure_enabled=config.pressure_enabled,
         pressure_type_conditioning=getattr(config, "pressure_type_conditioning", "none"),
         pressure_module_sharing=getattr(config, "pressure_module_sharing", "per_type"),

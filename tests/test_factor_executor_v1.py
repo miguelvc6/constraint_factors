@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 from torch_geometric.data import Batch, Data
 
@@ -10,7 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from modules.config import ModelConfig
-from modules.models import RepairGINFactorPressure, _build_factor_scope_runtime
+from modules.models import RepairGIN, RepairGINFactorPressure, _build_factor_scope_runtime
 
 
 def _make_factor_graph(*, factor_type: int, subject_id: int, predicate_id: int, object_id: int) -> Data:
@@ -63,17 +64,15 @@ def test_scope_runtime_roles_and_batch_order() -> None:
     assert runtime.object_factor_pos.tolist() == [0, 1]
 
 
-def test_unknown_factor_type_maps_to_fallback() -> None:
+def test_unknown_factor_type_is_rejected() -> None:
     graph = _make_factor_graph(factor_type=9, subject_id=1, predicate_id=2, object_id=3)
-    runtime = _build_factor_scope_runtime(
-        graph.x.float().view(-1, 1),
-        graph,
-        factor_edge_types=(4, 5, 6),
-        num_factor_types=2,
-    )
-
-    assert runtime is not None
-    assert runtime.factor_type_ids.tolist() == [2]
+    with pytest.raises(ValueError, match="factor_types contain values outside"):
+        _build_factor_scope_runtime(
+            graph.x.float().view(-1, 1),
+            graph,
+            factor_edge_types=(4, 5, 6),
+            num_factor_types=2,
+        )
 
 
 def test_per_type_executor_forward_emits_post_gold() -> None:
@@ -128,8 +127,57 @@ def test_per_type_executor_forward_emits_post_gold() -> None:
     assert any(g is not None for g in grads)
 
 
+def test_passive_representation_skips_factor_heads_without_factor_types() -> None:
+    cfg = ModelConfig(
+        num_embedding_size=8,
+        num_layers=2,
+        hidden_channels=8,
+        head_hidden=8,
+        dropout=0.1,
+        use_node_embeddings=True,
+        use_edge_attributes=False,
+        entity_class_ids=(0, 1, 2, 3, 4, 5, 6, 7),
+        predicate_class_ids=(0, 1, 2, 3, 4, 5, 6, 7),
+        num_factor_types=2,
+        factor_executor_impl="per_type_v1",
+        constraint_representation="eswc_passive",
+    )
+    model = RepairGIN(
+        num_input_graph_nodes=16,
+        num_embedding_size=cfg.num_embedding_size,
+        num_layers=cfg.num_layers,
+        hidden=cfg.hidden_channels,
+        head_hidden=cfg.head_hidden,
+        dropout=cfg.dropout,
+        use_node_embeddings=cfg.use_node_embeddings,
+        use_role_embeddings=cfg.use_role_embeddings,
+        num_role_types=cfg.num_role_types,
+        role_embedding_dim=cfg.role_embedding_dim,
+        use_edge_attributes=cfg.use_edge_attributes,
+        use_edge_subtraction=cfg.use_edge_subtraction,
+        entity_class_ids=cfg.entity_class_ids,
+        predicate_class_ids=cfg.predicate_class_ids,
+        num_factor_types=cfg.num_factor_types,
+        factor_type_embedding_dim=cfg.factor_type_embedding_dim,
+        factor_executor_impl=cfg.factor_executor_impl,
+        constraint_representation=cfg.constraint_representation,
+    )
+
+    data = _make_factor_graph(factor_type=1, subject_id=1, predicate_id=2, object_id=3)
+    del data.factor_types
+    del data.factor_checkable_pre
+    del data.factor_satisfied_pre
+    del data.factor_checkable_post_gold
+    del data.factor_satisfied_post_gold
+    outputs = model(data)
+
+    assert outputs["factor_logits_pre"] is None
+    assert outputs["factor_logits_post_gold"] is None
+
+
 if __name__ == "__main__":
     test_scope_runtime_roles_and_batch_order()
-    test_unknown_factor_type_maps_to_fallback()
+    test_unknown_factor_type_is_rejected()
     test_per_type_executor_forward_emits_post_gold()
+    test_passive_representation_skips_factor_heads_without_factor_types()
     print("factor executor v1 tests passed")
