@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
+import torch
+from torch_geometric.data import Data
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -45,6 +47,7 @@ EVAL_MODULE = _load_module(ROOT / "src" / "09_eval.py", "eval_09_for_test")
 _resolve_baseline_interim_paths = EVAL_MODULE._resolve_baseline_interim_paths
 load_baseline_split_from_parquet = EVAL_MODULE.load_baseline_split_from_parquet
 _strict_global_requires_factor_fields = EVAL_MODULE._strict_global_requires_factor_fields
+GlobalMetricsSupport = EVAL_MODULE.GlobalMetricsSupport
 
 
 def test_baseline_resolution_prefers_labeled_and_loads_factor_fields() -> None:
@@ -139,6 +142,43 @@ def test_strict_global_factor_field_requirement_is_representation_aware() -> Non
     assert _strict_global_requires_factor_fields(factorized_cfg) is True
 
 
+def test_global_support_ignores_passive_graph_factor_ids_without_labels() -> None:
+    graph = Data(x=torch.zeros((1,), dtype=torch.long))
+    graph.factor_constraint_ids = torch.tensor([123], dtype=torch.long)
+    graph.primary_factor_index = 0
+
+    calls: list[dict[str, object]] = []
+
+    class DummyEvaluator:
+        def evaluate_full(self, row, *, candidate_slots, primary_factor_index=None, factor_constraint_ids=None):
+            calls.append(
+                {
+                    "primary_factor_index": primary_factor_index,
+                    "factor_constraint_ids": factor_constraint_ids,
+                }
+            )
+            return {
+                "local_constraint_ids": [123, 456],
+                "primary_factor_index": 0,
+                "pre_checkable": [True, True],
+                "pre_satisfied": [1, 1],
+                "post_checkable": [True, True],
+                "post_satisfied": [1, 0],
+            }
+
+    support = GlobalMetricsSupport(rows=[object()], evaluator=DummyEvaluator())
+    postprocess, state = support.build_postprocess([graph])
+    predictions = torch.tensor([[0, 0, 0, 0, 0, 0]], dtype=torch.long)
+    targets = torch.tensor([[0, 0, 0, 0, 0, 0]], dtype=torch.long)
+
+    postprocess(predictions, targets, ["single"])
+
+    assert calls == [{"primary_factor_index": None, "factor_constraint_ids": None}]
+    overall = state["global_metrics"]["overall"]
+    assert overall["srr_denom_total"] == 1
+    assert overall["srr_total"] == 1
+
+
 def test_make_experiment_configs_empty_processed_root_message() -> None:
     module = _load_module(ROOT / "scripts" / "make_experiment_configs.py", "make_experiment_configs_for_test")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -172,5 +212,6 @@ if __name__ == "__main__":
     test_baseline_resolution_prefers_labeled_and_loads_factor_fields()
     test_baseline_resolution_falls_back_to_unlabeled()
     test_strict_global_factor_field_requirement_is_representation_aware()
+    test_global_support_ignores_passive_graph_factor_ids_without_labels()
     test_make_experiment_configs_empty_processed_root_message()
     print("paper run readiness tests passed")
