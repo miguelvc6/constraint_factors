@@ -4269,7 +4269,7 @@
     "min_occurrence": 100,
     "model": "GIN",
     "num_embedding_size": 128,
-    "num_factor_types": 29,
+    "num_factor_types": 0,
     "num_layers": 2,
     "num_role_types": 8,
     "policy_num_classes": 6,
