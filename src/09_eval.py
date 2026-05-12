@@ -896,6 +896,11 @@ def _data_has_factor_fields(test_data) -> bool:
     return has_ids and has_labels
 
 
+def _strict_global_requires_factor_fields(model_cfg: ModelConfig) -> bool:
+    """Strict global metrics need graph factor fields only for factorized graph runs."""
+    return str(model_cfg.constraint_representation).lower() == "factorized"
+
+
 def _dataset_graph_count(dataset, graph_path: Path) -> int | None:
     try:
         return len(dataset)
@@ -1692,7 +1697,8 @@ def main():
             )
 
         global_support = None
-        if strict_global and not _data_has_factor_fields(test_data):
+        strict_requires_factor_fields = _strict_global_requires_factor_fields(model_cfg)
+        if strict_global and strict_requires_factor_fields and not _data_has_factor_fields(test_data):
             raise RuntimeError(
                 "Strict global metrics require factor fields on test graphs. "
                 "Rebuild graphs with factor labels (factor_* fields) or disable strict mode."

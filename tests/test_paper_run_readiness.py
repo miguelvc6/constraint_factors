@@ -44,6 +44,7 @@ def _write_text(path: Path, content: str) -> None:
 EVAL_MODULE = _load_module(ROOT / "src" / "09_eval.py", "eval_09_for_test")
 _resolve_baseline_interim_paths = EVAL_MODULE._resolve_baseline_interim_paths
 load_baseline_split_from_parquet = EVAL_MODULE.load_baseline_split_from_parquet
+_strict_global_requires_factor_fields = EVAL_MODULE._strict_global_requires_factor_fields
 
 
 def test_baseline_resolution_prefers_labeled_and_loads_factor_fields() -> None:
@@ -130,6 +131,14 @@ def test_baseline_resolution_falls_back_to_unlabeled() -> None:
             assert encoder_path.resolve() == (base_dir / "globalintencoder.txt").resolve()
 
 
+def test_strict_global_factor_field_requirement_is_representation_aware() -> None:
+    passive_cfg = EVAL_MODULE.ModelConfig.from_mapping({"constraint_representation": "eswc_passive"})
+    factorized_cfg = EVAL_MODULE.ModelConfig.from_mapping({"constraint_representation": "factorized"})
+
+    assert _strict_global_requires_factor_fields(passive_cfg) is False
+    assert _strict_global_requires_factor_fields(factorized_cfg) is True
+
+
 def test_make_experiment_configs_empty_processed_root_message() -> None:
     module = _load_module(ROOT / "scripts" / "make_experiment_configs.py", "make_experiment_configs_for_test")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -162,5 +171,6 @@ def test_make_experiment_configs_empty_processed_root_message() -> None:
 if __name__ == "__main__":
     test_baseline_resolution_prefers_labeled_and_loads_factor_fields()
     test_baseline_resolution_falls_back_to_unlabeled()
+    test_strict_global_factor_field_requirement_is_representation_aware()
     test_make_experiment_configs_empty_processed_root_message()
     print("paper run readiness tests passed")

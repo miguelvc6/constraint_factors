@@ -441,6 +441,7 @@ The scheduler will:
 - train the run
 - copy `checkpoint.pth`, `training_history.json`, and `eval.json` back into the config directory
 - evaluate with strict global metrics
+- for passive `B0` graphs, strict global metrics use the interim parquet/registry state and do not require factor-label tensors on the passive test graphs
 - automatically add `--use-chooser` for chooser runs
 - automatically evaluate reranker runs from `reranker_predictions.json`
 
