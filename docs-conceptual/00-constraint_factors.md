@@ -215,8 +215,15 @@ $$
 $$
 3. Emit feedback messages to scoped variables:
 $$
-m_{c\to v}^{(k)} = g_{t(c)}\left(z_c^{(k)}, h_v^{(k)}\right)
+m_{c\to v}^{(k)} =
+g_{t(c), r(v,c)}
+\left(
+z_c^{(k)},
+h_v^{(k)},
+\mathrm{viol}_c^{(k)}
+\right)
 $$
+where `r(v,c)` is the role of variable `v` in factor `c` (for example predicate, subject, or object/value). The violation signal `viol_c` may be passed explicitly, or represented implicitly inside the learned factor state produced by the factor executor.
 
 ### Constraint-to-variable integration (factor feedback)
 Variables incorporate constraint pressure:
