@@ -210,6 +210,8 @@ Documentation is intentionally split into two areas:
 Recommended entry points:
 
 - [docs-conceptual/00-constraint_factors.md](docs-conceptual/00-constraint_factors.md)
+- [docs-conceptual/00-results_aligned_constraint_factors.md](docs-conceptual/00-results_aligned_constraint_factors.md)
+- [docs-conceptual/constraint_factors_research_overview.html](docs-conceptual/constraint_factors_research_overview.html)
 - [docs-conceptual/constraint_types.md](docs-conceptual/constraint_types.md)
 - [docs-technical/00_models_and_evaluation_matrix.md](docs-technical/00_models_and_evaluation_matrix.md)
 - [docs-technical/00_training_and_evaluation_execution_plan.md](docs-technical/00_training_and_evaluation_execution_plan.md)
