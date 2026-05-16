@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -135,6 +136,10 @@
     th.num {
       text-align: right;
       font-variant-numeric: tabular-nums;
+    }
+
+    tr.section-break td {
+      border-top: 3px double #8fa0b3;
     }
 
     .subtitle {
@@ -339,957 +344,1009 @@
   </script>
   <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
 </head>
+
 <body>
-<main>
-  <article>
-    <header>
-      <h1>Executable Constraint Factors for Wikidata Repair</h1>
-      <p class="subtitle">
-        A self-contained research overview of the project idea, scientific motivation,
-        model suite, current results, revised paper narrative, and next experiments.
-      </p>
-      <div class="meta">
-        <span class="pill">Project: constraint_factors</span>
-        <span class="pill">Dataset: full_strat1m_minocc100</span>
-        <span class="pill">Encoding: node_id</span>
-        <span class="pill">Status: results-aligned narrative</span>
-      </div>
-      <nav class="toc" aria-label="Table of contents">
-        <a href="#summary">1. Executive Summary</a>
-        <a href="#problem">2. Scientific Problem</a>
-        <a href="#idea">3. Research Idea</a>
-        <a href="#method-math">4. Methodology in Equations</a>
-        <a href="#models">5. Model Suite</a>
-        <a href="#metrics">6. Evaluation Metrics</a>
-        <a href="#results">7. Current Results</a>
-        <a href="#h2">8. H2 Diagnostics</a>
-        <a href="#narrative">9. Why the Narrative Changed</a>
-        <a href="#relevance">10. Scientific Relevance</a>
-        <a href="#next">11. Next Experiments</a>
-      </nav>
-    </header>
-
-    <section id="summary">
-      <h2>1. Executive Summary</h2>
-      <div class="callout">
-        <strong>Thesis:</strong> Executable constraint factors help neural repair models imitate
-        historical Wikidata edits more accurately, but better edit imitation does not automatically
-        produce safer post-edit graphs. Repair fidelity and symbolic constraint safety are partly
-        misaligned objectives.
-      </div>
-      <p>
-        This project studies neural repair of Wikidata constraint violations. A constraint violation
-        is a local inconsistency detected by Wikidata's property constraints; a repair is an edit
-        that adds or deletes statements to address that inconsistency. Prior work treats the violated
-        constraint mostly as context and trains a model to imitate historical curator edits. This
-        project asks whether constraints should instead be represented as active objects inside the
-        model: small learned modules that estimate whether a constraint is satisfied and send that
-        information back into the graph neural network.
-      </p>
-      <p>
-        The current narrative is that historical repair imitation and symbolic repair safety are
-        related but distinct objectives. Factorized executable constraints substantially improve
-        historical edit prediction, but they do not by themselves improve aggregate global
-        satisfaction or secondary regression metrics. A global reranker can improve global
-        satisfaction, but at a large cost to curator fidelity.
-      </p>
-      <p>
-        The scientific value of the project is therefore not simply "our model wins." The stronger
-        contribution is an empirical demonstration that historical repair imitation and symbolic
-        graph safety must be evaluated separately, and that executable constraint factors expose
-        this trade-off in a measurable way.
-      </p>
-    </section>
-
-    <section id="problem">
-      <h2>2. Scientific Problem</h2>
-      <p>
-        Wikidata is a collaborative knowledge graph with soft, evolving constraints. A constraint
-        violation indicates that a statement is suspicious or inconsistent with a property-level
-        rule, but not every violation should be repaired in the same way. Human curators often fix
-        one local issue at a time, and their edits reflect conventions, local context, and practical
-        trade-offs rather than global logical optimization.
-      </p>
-      <p>
-        Neural repair systems can learn from historical edit logs. Given a violation instance, they
-        predict an add/delete edit that resembles a human repair. This is useful, but it creates a
-        narrow optimization target: the model can become good at imitating the historical edit while
-        remaining unaware of how that edit affects other locally applicable constraints.
-      </p>
-      <div class="grid">
-        <div class="card">
-          <h3>Historical Fidelity</h3>
-          <p>
-            Does the model predict the same repair slots that curators historically used?
-            This is measured with precision, recall, and micro-F1 over edit slots.
-          </p>
+  <main>
+    <article>
+      <header>
+        <h1>Executable Constraint Factors for Wikidata Repair</h1>
+        <p class="subtitle">
+          A self-contained research overview of the project idea, scientific motivation,
+          model suite, current results, revised paper narrative, and next experiments.
+        </p>
+        <div class="meta">
+          <span class="pill">Project: constraint_factors</span>
+          <span class="pill">Dataset: full_strat1m_minocc100</span>
+          <span class="pill">Encoding: node_id</span>
+          <span class="pill">Status: results-aligned narrative</span>
         </div>
-        <div class="card">
-          <h3>Symbolic Safety</h3>
-          <p>
-            Does the predicted edit fix the primary violation and avoid making other local
-            constraints worse? This requires symbolic post-edit evaluation.
-          </p>
+        <nav class="toc" aria-label="Table of contents">
+          <a href="#summary">1. Executive Summary</a>
+          <a href="#problem">2. Scientific Problem</a>
+          <a href="#idea">3. Research Idea</a>
+          <a href="#method-math">4. Methodology in Equations</a>
+          <a href="#models">5. Model Suite and Training Objectives</a>
+          <a href="#metrics">6. Evaluation</a>
+          <a href="#results">7. Current Results</a>
+          <a href="#h2">8. H2 Diagnostics</a>
+          <a href="#narrative">9. Why the Narrative Changed</a>
+          <a href="#relevance">10. Scientific Relevance</a>
+          <a href="#next">11. Next Experiments</a>
+        </nav>
+      </header>
+
+      <section id="summary">
+        <h2>1. Executive Summary</h2>
+        <div class="callout">
+          <strong>Thesis:</strong> Executable constraint factors help neural repair models imitate
+          historical Wikidata edits more accurately, but better edit imitation does not automatically
+          produce safer post-edit graphs. Repair fidelity and symbolic constraint safety are partly
+          misaligned objectives.
         </div>
-      </div>
-      <p>
-        The central research question is whether models can improve both at once, or whether these
-        two goals form a fidelity-safety frontier.
-      </p>
-    </section>
+        <p>
+          This project studies neural repair of Wikidata constraint violations. A constraint violation
+          is a local inconsistency detected by Wikidata's property constraints; a repair is an edit
+          that adds or deletes statements to address that inconsistency. Prior work treats the violated
+          constraint mostly as context and trains a model to imitate historical curator edits. This
+          project asks whether constraints should instead be represented as active objects inside the
+          model: small learned modules that estimate whether a constraint is satisfied and send that
+          information back into the graph neural network.
+        </p>
+        <p>
+          The current narrative is that historical repair imitation and symbolic repair safety are
+          related but distinct objectives. Factorized executable constraints substantially improve
+          historical edit prediction, but they do not by themselves improve aggregate global
+          satisfaction or secondary regression metrics. A global reranker can improve global
+          satisfaction, but at a large cost to curator fidelity.
+        </p>
+        <p>
+          The scientific value of the project is therefore not simply "our model wins." The stronger
+          contribution is an empirical demonstration that historical repair imitation and symbolic
+          graph safety must be evaluated separately, and that executable constraint factors expose
+          this trade-off in a measurable way.
+        </p>
+      </section>
 
-    <section id="idea">
-      <h2>3. Research Idea</h2>
-      <p>
-        The method can be read as a neuro-symbolic repair model. The neural part learns from
-        historical repair examples and predicts edit slots. The symbolic part evaluates what those
-        edits do to Wikidata constraints. The proposed bridge between the two is to expose symbolic
-        constraint structure inside the neural graph representation.
-      </p>
-
-      <h3>Terminology used in this document</h3>
-      <p>
-        Several terms are specific to this project, so they are introduced here before the model
-        descriptions:
-      </p>
-      <ul>
-        <li>
-          A <strong>violation instance</strong> is one observed constraint violation together with
-          its local graph context and the historical curator edit used as supervision.
-        </li>
-        <li>
-          The <strong>primary constraint</strong> is the violated constraint that defines the
-          repair task for that instance.
-        </li>
-        <li>
-          <strong>Secondary constraints</strong> are other locally applicable constraints that may
-          be affected by the same edit.
-        </li>
-        <li>
-          A <strong>candidate repair</strong> is one possible add/delete edit that can be evaluated
-          symbolically before choosing it.
-        </li>
-        <li>
-          A <strong>reranker</strong> is a second-stage model that receives candidate repairs and
-          selects one according to an objective such as global constraint satisfaction.
-        </li>
-      </ul>
-
-      <h3>Executable constraint factors</h3>
-      <p>
-        The core idea is to represent locally applicable constraints as executable factor nodes
-        inside each violation subgraph. A factor node is a learned module associated with one local
-        constraint. It is typed by a constraint family, such as
-        <code>single</code>, <code>conflictWith</code>, <code>type</code>,
-        <code>valueType</code>, or <code>inverse</code>. Each factor is connected to the local
-        variables that determine its satisfaction.
-      </p>
-      <p>
-        Instead of being a passive label or connector, a factor node computes a differentiable
-        approximation of constraint satisfaction and emits messages back to scoped variable nodes.
-        These messages are called <strong>constraint pressure</strong>. Intuitively, pressure is the
-        model's learned signal that some nearby entity, property, or value is relevant to satisfying
-        or violating a constraint. The graph neural network can use these pressure signals while it
-        builds representations for repair prediction.
-      </p>
-
-      <h3>Repair representation</h3>
-      <p>
-        The repair target is a six-slot add/delete edit:
-        <code>subject_add</code>, <code>predicate_add</code>, <code>object_add</code>,
-        <code>subject_delete</code>, <code>predicate_delete</code>, and
-        <code>object_delete</code>. Historical repair fidelity is evaluated by comparing predicted
-        slots to the curator edit.
-      </p>
-
-      <h3>Primary and secondary constraints</h3>
-      <p>
-        Each instance has a primary violated constraint. The local subgraph can also contain
-        secondary constraints that may be affected by the predicted edit. The project therefore
-        distinguishes:
-      </p>
-      <ul>
-        <li><strong>Primary repair:</strong> whether the originally violated constraint is fixed.</li>
-        <li><strong>Secondary no-regression:</strong> whether other satisfied constraints remain satisfied.</li>
-        <li><strong>Global local satisfaction:</strong> the aggregate post-edit state of all local constraints.</li>
-      </ul>
-
-      <p>
-        The important distinction is that a model can use these factor signals for different
-        purposes. It can use them to imitate the historical edit more accurately, or it can use them
-        to select an edit that improves symbolic constraint satisfaction. The current results show
-        that the first effect is strong, while the second requires more explicit decision-level
-        machinery.
-      </p>
-    </section>
-
-    <section id="method-math">
-      <h2>4. Methodology in Equations</h2>
-      <p>
-        This section gives a compact mathematical view of the method. The equations are intentionally
-        written at the level of the paper idea rather than repository internals.
-      </p>
-
-      <h3>Repair instance and local constraints</h3>
-      <p>
-        Each training example starts from a graph state before repair, a historical edit, and a set
-        of locally applicable constraints. One of those constraints is the primary violation; the
-        rest are secondary constraints that might be affected by the same edit.
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Repair instance</span>
-        \[
-\begin{aligned}
-x &= \left(G^{-}, c^{\star}, C_{\mathrm{local}}, \Delta^{\star}\right) \\
-C_{\mathrm{local}} &= \{c^{\star}, c_1, \ldots, c_m\}
-\end{aligned}
-\]
-      </div>
-      <p>
-        Here, <code>G-</code> is the pre-repair local graph, <code>c*</code> is the primary
-        violated constraint, <code>C_local</code> is the set of local constraints considered by the
-        evaluator, and <code>Delta*</code> is the historical curator edit.
-      </p>
-
-      <h3>Six-slot repair target</h3>
-      <p>
-        The model predicts a single add/delete repair in six slots: three slots for a triple to add
-        and three slots for a triple to delete.
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Repair edit</span>
-        \[
-\begin{aligned}
-\Delta &= \left(s^{+}, p^{+}, o^{+}, s^{-}, p^{-}, o^{-}\right) \\
-P\!\left(\Delta \mid G^{-}, C_{\mathrm{local}}\right)
-&= \prod_{j=1}^{6} P\!\left(y_j \mid G^{-}, C_{\mathrm{local}}\right)
-\end{aligned}
-\]
-      </div>
-      <p>
-        The product form is the slot-wise prediction approximation used for edit imitation. It is
-        useful for learning curator-like repairs, but it does not by itself guarantee that the
-        combined edit is globally safe.
-      </p>
-
-      <h3>Executable factor representation</h3>
-      <p>
-        For every local constraint <code>c</code>, the model builds a factor node. The factor reads
-        embeddings from the variables in its scope, predicts a satisfaction signal, and emits
-        pressure back to those variables.
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Factor execution</span>
-        \[
-\begin{aligned}
-z_c^{(k)}
-&= \operatorname{AGG}_{t(c)}
-\left(\{h_v^{(k)} : v \in \operatorname{Scope}(c)\}\right) \\
-\hat{s}_c^{(k)}
-&= \sigma\!\left(f_{t(c)}\!\left(z_c^{(k)}\right)\right) \\
-m_{c \to v}^{(k)}
-&= g_{t(c)}\!\left(z_c^{(k)}, h_v^{(k)}\right)
-\end{aligned}
-\]
-      </div>
-      <p>
-        <code>t(c)</code> is the constraint family. Parameters are shared by family, so all
-        <code>single</code> factors share one executor, all <code>type</code> factors share another,
-        and so on. This is the compositional part of the model.
-      </p>
-
-      <h3>Message passing with constraint pressure</h3>
-      <p>
-        Variable embeddings are updated from ordinary graph neighbors and from factor pressure. The
-        pressure term is the learned route through which local constraint state can affect repair
-        prediction.
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Variable update</span>
-        \[
-h_v^{(k+1)}
-=
-\operatorname{GNN}\!\left(h_v^{(k)}, \mathcal{N}(v)\right)
-+
-\lambda
-\sum_{c:\, v \in \operatorname{Scope}(c)}
-m_{c \to v}^{(k)}
-\]
-      </div>
-      <p>
-        The H2 pressure-masking diagnostics test this term by removing all pressure, primary-only
-        pressure, or secondary-only pressure at inference time.
-      </p>
-
-      <h3>Training objectives</h3>
-      <p>
-        The common objective is edit imitation: predict the historical repair slots. Factorized
-        models also learn auxiliary factor satisfaction predictions.
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Imitation and factor supervision</span>
-        \[
-\begin{aligned}
-\mathcal{L}_{\mathrm{edit}}
-&= \sum_{j=1}^{6}
-\operatorname{CE}\!\left(
-y_j^{\star},
-P\!\left(y_j \mid G^{-}, C_{\mathrm{local}}\right)
-\right) \\
-\mathcal{L}_{\mathrm{factor}}
-&= \sum_{c \in C_{\mathrm{local}}}
-\left[
-\operatorname{BCE}\!\left(s_c^{-}, \hat{s}_c^{\mathrm{pre}}\right)
-+
-\operatorname{BCE}\!\left(s_c^{+}, \hat{s}_c^{\mathrm{post}}\right)
-\right]
-\end{aligned}
-\]
-      </div>
-      <p>
-        The practical model variants add different safety terms. <code>M1C</code> scores symbolic
-        candidate repairs with a chooser loss. <code>M1D</code> adds direct expected penalties for
-        primary failure and secondary regression.
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Model objectives</span>
-        \[
-\begin{aligned}
-\mathcal{L}_{\mathrm{A1}}
-&= \mathcal{L}_{\mathrm{edit}}
-+ \eta\,\mathcal{L}_{\mathrm{factor}} \\
-\mathcal{L}_{\mathrm{M1C}}
-&= \mathcal{L}_{\mathrm{edit}}
-+ \eta\,\mathcal{L}_{\mathrm{factor}}
-+ \mu\,\mathcal{L}_{\mathrm{chooser}} \\
-\mathcal{L}_{\mathrm{M1D}}
-&= \mathcal{L}_{\mathrm{edit}}
-+ \eta\,\mathcal{L}_{\mathrm{factor}}
-+ \alpha\,\mathcal{L}_{\mathrm{primary}}
-+ \beta\,\mathcal{L}_{\mathrm{secondary}}
-\end{aligned}
-\]
-      </div>
-
-      <h3>Symbolic post-edit evaluation</h3>
-      <p>
-        For evaluation, the predicted edit is applied to the pre-repair graph and the constraint
-        set is evaluated symbolically. Let <code>S_c(G)</code> be 1 if constraint <code>c</code> is
-        satisfied in graph state <code>G</code>, and 0 otherwise.
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Post-edit graph</span>
-        \[
-\begin{aligned}
-G^{\Delta} &= \operatorname{Apply}\!\left(G^{-}, \Delta\right) \\
-S_c(G) &\in \{0, 1\}
-\end{aligned}
-\]
-      </div>
-      <p>
-        The central safety metrics are then computed over the local constraints:
-      </p>
-      <div class="equation math-block">
-        <span class="eq-label">Safety metrics</span>
-        \[
-\begin{aligned}
-\operatorname{PrimaryFix}
-&= S_{c^{\star}}\!\left(G^{\Delta}\right) \\
-\operatorname{GFR}
-&= \frac{1}{|C_{\mathrm{local}}|}
-\sum_{c \in C_{\mathrm{local}}}
-S_c\!\left(G^{\Delta}\right) \\
-\operatorname{SRR}
-&=
-\frac{
-\left|\{c \neq c^{\star} :
-S_c(G^{-}) = 1 \land S_c(G^{\Delta}) = 0\}\right|
-}{
-\left|\{c \neq c^{\star} :
-S_c(G^{-}) = 1\}\right|
-} \\
-\operatorname{SIR}
-&=
-\frac{
-\left|\{c \neq c^{\star} :
-S_c(G^{-}) = 0 \land S_c(G^{\Delta}) = 1\}\right|
-}{
-\left|\{c \neq c^{\star} :
-S_c(G^{-}) = 0\}\right|
-}
-\end{aligned}
-\]
-      </div>
-      <p>
-        These equations make the central result easier to interpret. Micro-F1 measures whether
-        <code>Delta</code> resembles the historical edit <code>Delta*</code>. The safety metrics
-        measure what <code>Delta</code> does to the symbolic constraint state after it is applied.
-        The project shows that those two evaluations do not necessarily agree.
-      </p>
-    </section>
-
-    <section id="models">
-      <h2>5. Model Suite</h2>
-      <p>
-        The project compares a small sequence of models. The names are shorthand for positions in
-        an experimental ladder: start with a passive baseline, add executable factor structure, then
-        test whether candidate-level safety objectives can use that structure to make safer repair
-        choices.
-      </p>
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Role</th>
-            <th>Representation</th>
-            <th>Objective</th>
-            <th>Research question</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>B0</code></td>
-            <td>ESWC-style learned baseline</td>
-            <td>Passive constraint context</td>
-            <td>Edit imitation</td>
-            <td>How strong is the prior passive-context repair model?</td>
-          </tr>
-          <tr>
-            <td><code>A1</code></td>
-            <td>Factorized imitation model</td>
-            <td>Executable factor graph</td>
-            <td>Edit imitation plus auxiliary factor supervision</td>
-            <td>Does factorized constraint context improve historical repair modeling?</td>
-          </tr>
-          <tr>
-            <td><code>M1C</code></td>
-            <td>Safe factor chooser</td>
-            <td>Executable factor graph plus symbolic candidates</td>
-            <td>Edit imitation plus chooser loss</td>
-            <td>Can a chooser prefer safer symbolic candidates?</td>
-          </tr>
-          <tr>
-            <td><code>M1D</code></td>
-            <td>Direct safety-loss model</td>
-            <td>Executable factor graph plus candidate scoring from logits</td>
-            <td>Edit imitation plus primary and secondary safety penalties</td>
-            <td>Can direct safety pressure improve the local safety trade-off?</td>
-          </tr>
-          <tr>
-            <td><code>G0</code></td>
-            <td>Global-fix reranker reference</td>
-            <td>Factorized proposal plus reranker</td>
-            <td>Global satisfaction objective</td>
-            <td>What happens at the high-consistency end of the frontier?</td>
-          </tr>
-        </tbody>
-      </table>
-      <div class="callout warn">
-        <strong>Important experimental note:</strong> the completed canonical <code>M1C</code>
-        result is not the final word on chooser-based safety. A follow-up <code>M1C</code> run with
-        a stronger secondary/safety term is currently running. Any new result from that run should
-        be compared against the completed <code>M1C</code> row before final paper claims are fixed.
-      </div>
-    </section>
-
-    <section id="metrics">
-      <h2>6. Evaluation Metrics</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Metric</th>
-            <th>Meaning</th>
-            <th>Interpretation</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>Micro-F1</td>
-            <td>Historical edit-slot fidelity.</td>
-            <td>Higher means better imitation of curator edits.</td>
-          </tr>
-          <tr>
-            <td>Primary fix rate</td>
-            <td>Whether the predicted edit fixes the original violation.</td>
-            <td>Higher means better intent fulfillment.</td>
-          </tr>
-          <tr>
-            <td>GFR</td>
-            <td>Global fix rate over the local constraint set after applying the edit.</td>
-            <td>Higher means better local symbolic satisfaction.</td>
-          </tr>
-          <tr>
-            <td>SRR</td>
-            <td>Secondary regression rate.</td>
-            <td>Lower means fewer previously satisfied secondary constraints are broken.</td>
-          </tr>
-          <tr>
-            <td>SIR</td>
-            <td>Secondary improvement rate.</td>
-            <td>Higher means more previously unsatisfied secondary constraints become satisfied.</td>
-          </tr>
-          <tr>
-            <td>Disruption</td>
-            <td>Mean number of edit operations or changed triples.</td>
-            <td>Lower usually means more edit-minimal repairs.</td>
-          </tr>
-        </tbody>
-      </table>
-      <p class="metric-note">
-        The paper should not rank models by a single metric. A model can be better at historical
-        imitation while being worse at symbolic no-regression.
-      </p>
-    </section>
-
-    <section id="results">
-      <h2>7. Current Results</h2>
-      <p>
-        This section compares the paper-facing models on the main evaluation metrics. The goal is
-        not to declare a single winner, but to see which part of the research hypothesis each model
-        supports: historical imitation, primary repair, secondary no-regression, or global local
-        consistency.
-      </p>
-      <p>
-        The table below uses the completed paper-suite evaluations available locally. The ongoing
-        follow-up experiment is an <code>M1C</code> chooser run with a stronger secondary/safety
-        term, marked as TBD below. The completed <code>M1D</code> reference shown here uses
-        <code>alpha_primary = 1.0</code> and <code>beta_secondary = 0.5</code>.
-      </p>
-      <table>
-        <thead>
-          <tr>
-            <th>Model</th>
-            <th class="num">Primary Fix</th>
-            <th class="num">Micro-F1</th>
-            <th class="num">GFR</th>
-            <th class="num">SRR</th>
-            <th class="num">SIR</th>
-            <th class="num">Disruption</th>
-            <th>Interpretation</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>B0</code></td>
-            <td class="num">0.8603</td>
-            <td class="num">0.5434</td>
-            <td class="num">0.8705</td>
-            <td class="num">0.0097</td>
-            <td class="num">0.1925</td>
-            <td class="num">1.0036</td>
-            <td>Weakest learned fidelity, unexpectedly strong aggregate safety baseline.</td>
-          </tr>
-          <tr>
-            <td><code>A1</code></td>
-            <td class="num">0.8589</td>
-            <td class="num">0.6785</td>
-            <td class="num">0.8638</td>
-            <td class="num">0.0128</td>
-            <td class="num">0.1397</td>
-            <td class="num">1.0330</td>
-            <td>Strong representation win for imitation, but worse symbolic safety than <code>B0</code>.</td>
-          </tr>
-          <tr>
-            <td><code>M1C</code></td>
-            <td class="num">0.8496</td>
-            <td class="num">0.6898</td>
-            <td class="num">0.8629</td>
-            <td class="num">0.0137</td>
-            <td class="num">0.1381</td>
-            <td class="num">1.0663</td>
-            <td>Best proposal fidelity, but no aggregate safety win in this completed config.</td>
-          </tr>
-          <tr>
-            <td><code>M1D</code> reference</td>
-            <td class="num">0.8588</td>
-            <td class="num">0.6772</td>
-            <td class="num">0.8661</td>
-            <td class="num">0.0103</td>
-            <td class="num">0.1396</td>
-            <td class="num">1.0274</td>
-            <td>Closest practical safety variant, but not a decisive aggregate win over <code>B0</code>.</td>
-          </tr>
-          <tr>
-            <td><code>M1C</code> updated secondary/safety run</td>
-            <td class="num">TBD</td>
-            <td class="num">TBD</td>
-            <td class="num">TBD</td>
-            <td class="num">TBD</td>
-            <td class="num">TBD</td>
-            <td class="num">TBD</td>
-            <td>Running. This tests whether a stronger chooser-side secondary/safety term improves safety.</td>
-          </tr>
-          <tr>
-            <td><code>G0</code></td>
-            <td class="num">0.7174</td>
-            <td class="num">0.2804</td>
-            <td class="num">0.9098</td>
-            <td class="num">0.0091</td>
-            <td class="num">0.2441</td>
-            <td class="num">1.0000</td>
-            <td>High-consistency reference: best <code>GFR</code>, but fidelity collapses.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <div class="grid">
-        <div class="card">
-          <h3><span class="status good">Supported</span>: representation helps imitation</h3>
-          <p>
-            <code>A1</code> improves micro-F1 from <code>0.5434</code> to
-            <code>0.6785</code> relative to <code>B0</code>. This is the cleanest positive
-            result for executable factors.
-          </p>
+      <section id="problem">
+        <h2>2. Scientific Problem</h2>
+        <p>
+          Wikidata is a collaborative knowledge graph with soft, evolving constraints. A constraint
+          violation indicates that a statement is suspicious or inconsistent with a property-level
+          rule, but not every violation should be repaired in the same way. Human curators often fix
+          one local issue at a time, and their edits reflect conventions, local context, and practical
+          trade-offs rather than global logical optimization.
+        </p>
+        <p>
+          Neural repair systems can learn from historical edit logs. Given a violation instance, they
+          predict an add/delete edit that resembles a human repair. This is useful, but it creates a
+          narrow optimization target: the model can become good at imitating the historical edit while
+          remaining unaware of how that edit affects other locally applicable constraints.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <h3>Historical Fidelity</h3>
+            <p>
+              Does the model predict the same repair slots that curators historically used?
+              This is measured with precision, recall, and micro-F1 over edit slots.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Symbolic Safety</h3>
+            <p>
+              Does the predicted edit fix the primary violation and avoid making other local
+              constraints worse? This requires symbolic post-edit evaluation.
+            </p>
+          </div>
         </div>
-        <div class="card">
-          <h3><span class="status weak">Not supported</span>: representation alone improves safety</h3>
-          <p>
-            <code>A1</code> is worse than <code>B0</code> on aggregate <code>GFR</code>,
-            <code>SRR</code>, and <code>SIR</code>. The factorized representation does not
-            automatically reduce secondary regressions.
-          </p>
+        <p>
+          The central research question is whether models can improve both at once, or whether these
+          two goals form a fidelity-safety frontier.
+        </p>
+      </section>
+
+      <section id="idea">
+        <h2>3. Research Idea</h2>
+        <p>
+          The method can be read as a neuro-symbolic repair model. The neural part learns from
+          historical repair examples and predicts edit slots. The symbolic part evaluates what those
+          edits do to Wikidata constraints. The proposed bridge between the two is to expose symbolic
+          constraint structure inside the neural graph representation.
+        </p>
+
+        <h3>Terminology used in this document</h3>
+        <p>
+          Several terms are specific to this project, so they are introduced here before the model
+          descriptions:
+        </p>
+        <ul>
+          <li>
+            A <strong>violation instance</strong> is one observed constraint violation together with
+            its local graph context and the historical curator edit used as supervision.
+          </li>
+          <li>
+            The <strong>primary constraint</strong> is the violated constraint that defines the
+            repair task for that instance.
+          </li>
+          <li>
+            <strong>Secondary constraints</strong> are other locally applicable constraints that may
+            be affected by the same edit.
+          </li>
+          <li>
+            A <strong>candidate repair</strong> is one possible add/delete edit that can be evaluated
+            symbolically before choosing it.
+          </li>
+          <li>
+            A <strong>reranker</strong> is a second-stage model that receives candidate repairs and
+            selects one according to an objective such as global constraint satisfaction.
+          </li>
+        </ul>
+
+        <h3>Executable constraint factors</h3>
+        <p>
+          The core idea is to represent locally applicable constraints as executable factor nodes
+          inside each violation subgraph. A factor node is a learned module associated with one local
+          constraint. It is typed by a constraint family, such as
+          <code>single</code>, <code>conflictWith</code>, <code>type</code>,
+          <code>valueType</code>, or <code>inverse</code>. Each factor is connected to the local
+          variables that determine its satisfaction.
+        </p>
+        <p>
+          Instead of being a passive label or connector, a factor node computes a differentiable
+          approximation of constraint satisfaction and emits messages back to scoped variable nodes.
+          These messages are called <strong>constraint pressure</strong>. Intuitively, pressure is the
+          model's learned signal that some nearby entity, property, or value is relevant to satisfying
+          or violating a constraint. The graph neural network can use these pressure signals while it
+          builds representations for repair prediction.
+        </p>
+
+        <h3>Repair representation</h3>
+        <p>
+          The repair target is a six-slot add/delete edit:
+          <code>subject_add</code>, <code>predicate_add</code>, <code>object_add</code>,
+          <code>subject_delete</code>, <code>predicate_delete</code>, and
+          <code>object_delete</code>. Historical repair fidelity is evaluated by comparing predicted
+          slots to the curator edit.
+        </p>
+
+        <h3>Primary and secondary constraints</h3>
+        <p>
+          Each instance has a primary violated constraint. The local subgraph can also contain
+          secondary constraints that may be affected by the predicted edit. The project therefore
+          distinguishes:
+        </p>
+        <ul>
+          <li><strong>Primary repair:</strong> whether the originally violated constraint is fixed.</li>
+          <li><strong>Secondary no-regression:</strong> whether other satisfied constraints remain satisfied.</li>
+          <li><strong>Global local satisfaction:</strong> the aggregate post-edit state of all local constraints.</li>
+        </ul>
+
+        <p>
+          The important distinction is that a model can use these factor signals for different
+          purposes. It can use them to imitate the historical edit more accurately, or it can use them
+          to select an edit that improves symbolic constraint satisfaction. The current results show
+          that the first effect is strong, while the second requires more explicit decision-level
+          machinery.
+        </p>
+      </section>
+
+      <section id="method-math">
+        <h2>4. Methodology in Equations</h2>
+        <p>
+          This section gives a compact mathematical view of the method. The equations are intentionally
+          written at the level of the paper idea rather than repository internals.
+        </p>
+
+        <h3>Repair instance and local constraints</h3>
+        <p>
+          Each training example starts from a graph state before repair, a historical edit, and a set
+          of locally applicable constraints. One of those constraints is the primary violation; the
+          rest are secondary constraints that might be affected by the same edit.
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Repair instance</span>
+          \[
+          \begin{aligned}
+          x &= \left(G^{-}, \Delta^{\star}\right), C_{\mathrm{local}} \\
+          C_{\mathrm{local}} &= \{c^{\star}, c_1, \ldots, c_m\}
+          \end{aligned}
+          \]
         </div>
-        <div class="card">
-          <h3><span class="status mixed">Mixed</span>: local safety objectives</h3>
-          <p>
-            The completed <code>M1D</code> is directionally promising, especially in dense slices,
-            but the completed aggregate result is not enough to claim broad baseline dominance.
-            The running <code>M1C</code> follow-up will test whether chooser-side safety pressure
-            can improve this picture.
-          </p>
+        <p>
+          Here, <code>G-</code> is the pre-repair local graph, <code>Delta*</code> is the historical curator
+          edit, <code>C_local</code> is the set of local constraints, and <code>c*</code> is the primary violated
+          constraint.
+        </p>
+
+        <h3>Six-slot repair target</h3>
+        <p>
+          The model predicts a single add/delete repair in six slots: three slots for a triple to add
+          and three slots for a triple to delete.
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Repair edit</span>
+          \[
+          \Delta \left(s^{+}, p^{+}, o^{+}, s^{-}, p^{-}, o^{-}\right) 
+          \]
         </div>
-        <div class="card">
-          <h3><span class="status good">Supported</span>: global reranking moves the frontier</h3>
-          <p>
-            <code>G0</code> improves global satisfaction, showing that safer candidate choices
-            exist, but its low fidelity shows the cost of optimizing global consistency directly.
-          </p>
+
+        <h3>Executable factor representation</h3>
+        <p>
+          For every local constraint instance <code>c</code>, the model builds a typed factor node.
+          Its scope identifies the variable nodes needed to evaluate that constraint: predicates,
+          subjects, objects or values, depending on the constraint family. The factor aggregates
+          those scoped embeddings into a local constraint state, then uses a type-specific executor
+          to estimate whether the current configuration is satisfied.
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Factor execution</span>
+          \[
+          \begin{aligned}
+          z_c^{(k)}
+          &= \operatorname{AGG}_{t(c)}
+          \left(\{h_v^{(k)} : v \in \operatorname{Scope}(c)\}\right) \\
+          \hat{s}_c^{(k)}
+          &= \sigma\!\left(f_{t(c)}\!\left(z_c^{(k)}\right)\right) \\
+          \operatorname{viol}_c^{(k)}
+          &= 1 - \hat{s}_c^{(k)} \\
+          m_{c \to v}^{(k)}
+          &=
+          g_{t(c), r(v,c)}
+          \!\left(
+          z_c^{(k)},
+          h_v^{(k)},
+          \operatorname{viol}_c^{(k)}
+          \right)
+          \end{aligned}
+          \]
         </div>
-      </div>
-    </section>
+        <p>
+          <code>t(c)</code> is the constraint family, and <code>r(v,c)</code> is the role of variable
+          <code>v</code> inside that constraint, such as predicate, subject, object, or value.
+          Parameters are shared by family, so all <code>single</code> factors share one executor,
+          all <code>type</code> factors share another, and so on. This is the compositional part of
+          the model: new local graphs reuse the same learned constraint operators across many
+          concrete constraint instances.
+        </p>
+        <p>
+          The violation signal may be passed as an explicit scalar, as written above, or carried
+          implicitly in the learned factor state produced by <code>f_t</code>. In both cases, the
+          factor is not a hardcoded symbolic validator; it is a differentiable approximation trained
+          from factor satisfaction labels and repair behavior.
+        </p>
 
-    <section id="h2">
-      <h2>8. H2 Diagnostics</h2>
-      <p>
-        The main result table tells us what happened, but not why it happened. H2 is the diagnostic
-        layer designed to answer that question. It is run only for factorized models because it
-        inspects internal factor outputs and pressure pathways that do not exist in the passive
-        <code>B0</code> baseline.
-      </p>
-      <p>
-        H2 has three purposes. First, it checks whether the learned factor modules can predict
-        symbolic constraint satisfaction. Second, it slices performance by local constraint density,
-        because a repair with many nearby constraints is a harder and more relevant case for this
-        project. Third, it masks parts of the factor-pressure mechanism at inference time to test
-        whether the model is actually using those signals.
-      </p>
-
-      <h3>Factor semantics</h3>
-      <p>
-        In this diagnostic, the model's factor heads are treated as satisfaction predictors. A high
-        score means that the model has learned to approximate whether a local constraint is
-        satisfied before repair or after the historical repair. This does not by itself prove that
-        the final edit choice is safe, but it tells us whether the constraint modules contain useful
-        information.
-      </p>
-      <table>
-        <thead>
-          <tr>
-            <th>Model</th>
-            <th>State</th>
-            <th class="num">Weighted F1</th>
-            <th class="num">Weighted AUROC</th>
-            <th>Interpretation</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>A1</code></td>
-            <td>pre</td>
-            <td class="num">0.9836</td>
-            <td class="num">0.9551</td>
-            <td>Factor satisfaction signals are learned well.</td>
-          </tr>
-          <tr>
-            <td><code>A1</code></td>
-            <td>post_gold</td>
-            <td class="num">0.9833</td>
-            <td class="num">0.9512</td>
-            <td>Post-repair factor state is also modeled well.</td>
-          </tr>
-          <tr>
-            <td><code>M1C</code></td>
-            <td>post_gold</td>
-            <td class="num">0.9822</td>
-            <td class="num">0.9406</td>
-            <td>Strong F1, slightly weaker discrimination than <code>A1</code>.</td>
-          </tr>
-          <tr>
-            <td><code>M1D</code></td>
-            <td>post_gold</td>
-            <td class="num">0.9814</td>
-            <td class="num">0.9394</td>
-            <td>Strong semantics, but not enough by itself to guarantee safe edits.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <div class="callout warn">
-        <strong>Calibration caveat:</strong> several factor families are highly imbalanced. High F1
-        can reflect the fact that most factors are already satisfied. AUROC, AUPRC, and calibration
-        should be reported alongside F1 for families such as <code>valueRequiresStatement</code>,
-        <code>oneOf</code>, <code>single</code>, and <code>itemRequiresStatement</code>.
-      </div>
-
-      <h3>Pressure masking</h3>
-      <p>
-        Pressure masking is an intervention: the model is evaluated again while some factor-pressure
-        messages are removed. If performance changes substantially, the removed pathway was
-        causally important for prediction. If performance barely changes, the model was not relying
-        much on that pathway.
-      </p>
-      <table>
-        <thead>
-          <tr>
-            <th>Model</th>
-            <th>Masking variant</th>
-            <th class="num">Delta Micro-F1</th>
-            <th class="num">Delta Primary Fix</th>
-            <th class="num">Prediction Changed</th>
-            <th>Interpretation</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>A1</code></td>
-            <td>no factor pressure</td>
-            <td class="num">-0.4270</td>
-            <td class="num">-0.4174</td>
-            <td class="num">62.5%</td>
-            <td>Factor pressure is causally important for prediction.</td>
-          </tr>
-          <tr>
-            <td><code>M1C</code></td>
-            <td>no factor pressure</td>
-            <td class="num">-0.4438</td>
-            <td class="num">-0.4318</td>
-            <td class="num">63.6%</td>
-            <td>Chooser model still relies heavily on factor pressure.</td>
-          </tr>
-          <tr>
-            <td><code>M1D</code></td>
-            <td>no factor pressure</td>
-            <td class="num">-0.3714</td>
-            <td class="num">-0.3491</td>
-            <td class="num">59.3%</td>
-            <td>Direct safety model also uses factor pressure heavily.</td>
-          </tr>
-          <tr>
-            <td><code>A1</code></td>
-            <td>secondary only pressure</td>
-            <td class="num">-0.0014</td>
-            <td class="num">-0.0016</td>
-            <td class="num">2.7%</td>
-            <td>Secondary pressure barely changes decisions.</td>
-          </tr>
-          <tr>
-            <td><code>M1C</code></td>
-            <td>secondary only pressure</td>
-            <td class="num">-0.0175</td>
-            <td class="num">-0.0101</td>
-            <td class="num">4.7%</td>
-            <td>Some effect, but still weak relative to primary/focal pressure.</td>
-          </tr>
-          <tr>
-            <td><code>M1D</code></td>
-            <td>secondary only pressure</td>
-            <td class="num">-0.0001</td>
-            <td class="num">-0.0005</td>
-            <td class="num">2.9%</td>
-            <td>Secondary routing remains weak.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <div class="callout">
-        <strong>H2 conclusion:</strong> the factorized architecture does learn and use constraint
-        pressure, but the pressure primarily supports historical edit imitation and primary repair
-        behavior. It is not yet strong enough as a secondary no-regression mechanism.
-      </div>
-    </section>
-
-    <section id="narrative">
-      <h2>9. Why the Narrative Changed</h2>
-      <p>
-        The main body of this document presents the current, results-aligned narrative. This section
-        explains why it differs from the original framing, because that change is scientifically
-        important rather than cosmetic.
-      </p>
-      <h3>Original narrative</h3>
-      <p>
-        The original paper narrative was that executable constraint factors would preserve curator
-        fidelity and directly reduce secondary regressions. This would have made <code>M1C</code>
-        or <code>M1D</code> the main practical winning model.
-      </p>
-
-      <h3>Updated narrative</h3>
-      <p>
-        The results support a different and more precise narrative:
-      </p>
-      <div class="callout">
-        Better historical repair imitation is not the same as safer graph repair. Executable
-        constraint factors improve the representation used for edit prediction, but safe local
-        repair requires explicit candidate-level reasoning over primary fix, secondary regression,
-        global satisfaction, and disruption.
-      </div>
-
-      <h3>Research questions for the paper</h3>
-      <ol>
-        <li>
-          <strong>Do executable constraint factors improve historical repair modeling?</strong>
-          Yes. <code>A1</code> strongly improves micro-F1 over <code>B0</code>.
-        </li>
-        <li>
-          <strong>Does better repair imitation imply safer post-edit graphs?</strong>
-          No. <code>A1</code> improves fidelity but worsens aggregate safety metrics.
-        </li>
-        <li>
-          <strong>Can local safety objectives move the safety frontier?</strong>
-          Partially. The completed <code>M1D</code> result is directionally promising in some
-          regimes, and the running <code>M1C</code> follow-up will test whether chooser-side safety
-          pressure improves the result.
-        </li>
-        <li>
-          <strong>What happens when global consistency is optimized directly?</strong>
-          <code>G0</code> improves global satisfaction but sharply sacrifices fidelity.
-        </li>
-      </ol>
-
-      <h3>One-paragraph abstract candidate</h3>
-      <p>
-        We study neural repair of Wikidata constraint violations under two competing objectives:
-        fidelity to historical curator edits and symbolic safety of the post-edit graph. We propose
-        executable constraint factors, a factorized graph representation in which locally applicable
-        constraints act as typed satisfaction operators that inject pressure into message passing.
-        On a stratified Wikidata repair benchmark, factorized imitation substantially improves
-        historical edit prediction over a passive ESWC-style baseline. However, this fidelity gain
-        does not translate into lower secondary regression or higher global satisfaction, revealing
-        a mismatch between curator imitation and symbolic safety. Diagnostic masking analyses show
-        that factor pressure is learned and causally affects predictions, but mostly supports primary
-        repair and imitation rather than secondary no-regression. A global reranker improves
-        satisfaction at a large fidelity cost, establishing a fidelity-safety frontier for future
-        repair models.
-      </p>
-    </section>
-
-    <section id="relevance">
-      <h2>10. Scientific Relevance</h2>
-      <p>
-        The project is scientifically relevant because it challenges a common assumption in
-        data-driven repair: that learning to imitate historical fixes is enough. In collaborative
-        knowledge graphs, historical repairs are useful supervision, but they are not a complete
-        proxy for post-edit consistency.
-      </p>
-      <div class="grid">
-        <div class="card">
-          <h3>For Knowledge Graph repair</h3>
-          <p>
-            The work introduces a richer evaluation surface that measures collateral constraint
-            effects, not only whether the primary violation was repaired.
-          </p>
+        <h3>Message passing with constraint pressure</h3>
+        <p>
+          Variable embeddings are updated in two stages. First, ordinary graph message passing
+          collects neighborhood context from the data graph. Then scoped constraint factors inject
+          pressure back into the variables they touch. This second term is how local constraint
+          state becomes visible to the repair decoder without hardcoding a delete-or-add rule.
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Variable update</span>
+          \[
+          h_v^{(k+1)}
+          =
+          \operatorname{GNN}\!\left(h_v^{(k)}, \mathcal{N}(v)\right)
+          +
+          \lambda
+          \sum_{c:\, v \in \operatorname{Scope}(c)}
+          m_{c \to v}^{(k)}
+          \]
         </div>
-        <div class="card">
-          <h3>For neuro-symbolic learning</h3>
-          <p>
-            The results show that symbolic factors can be learned and used by neural models, but
-            that using them for safe decisions requires more than representation learning.
-          </p>
+        <p>
+          The coefficient <code>lambda</code> controls the strength of the residual pressure update.
+          Multiple factors can act on the same variable, so the model can represent competing local
+          constraint signals rather than treating each violation in isolation. The pressure message
+          is role-conditioned: a factor can send different information to the predicate than to the
+          subject or value node.
+        </p>
+        <p>
+          The H2 pressure-masking diagnostics test whether this pathway matters by removing all
+          pressure, keeping only primary-factor pressure, or keeping only secondary-factor pressure
+          at inference time.
+        </p>
+
+      </section>
+
+      <section id="models">
+        <h2>5. Model Suite and Training Objectives</h2>
+        <p>
+          The project compares a small sequence of models. The names are shorthand for positions in
+          the research comparison: start with a passive learned baseline, add executable factor
+          structure, then test whether candidate-level safety objectives can use that structure to make
+          safer repair choices.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Role</th>
+              <th>Representation</th>
+              <th>Objective</th>
+              <th>Research question</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>B0</code></td>
+              <td>ESWC-style learned baseline</td>
+              <td>Passive constraint context</td>
+              <td>Edit imitation</td>
+              <td>How strong is the prior passive-context repair model?</td>
+            </tr>
+            <tr>
+              <td><code>A1</code></td>
+              <td>Factorized imitation model</td>
+              <td>Executable factor graph</td>
+              <td>Edit imitation plus auxiliary factor supervision</td>
+              <td>Does factorized constraint context improve historical repair modeling?</td>
+            </tr>
+            <tr>
+              <td><code>M1C</code></td>
+              <td>Safe factor chooser</td>
+              <td>Executable factor graph plus symbolic candidates</td>
+              <td>Edit imitation plus chooser loss</td>
+              <td>Can a chooser prefer safer symbolic candidates?</td>
+            </tr>
+            <tr>
+              <td><code>M1D</code></td>
+              <td>Direct safety-loss model</td>
+              <td>Executable factor graph plus candidate scoring from logits</td>
+              <td>Edit imitation plus primary and secondary safety penalties</td>
+              <td>Can direct safety pressure improve the local safety trade-off?</td>
+            </tr>
+            <tr>
+              <td><code>G0</code></td>
+              <td>Global-fix reranker reference</td>
+              <td>Factorized proposal plus reranker</td>
+              <td>Global satisfaction objective</td>
+              <td>What happens at the high-consistency end of the frontier?</td>
+            </tr>
+            <tr class="section-break">
+              <td><code>H1</code></td>
+              <td>Delete-focus heuristic</td>
+              <td>Symbolic rule baseline</td>
+              <td>Always delete the violating triple</td>
+              <td>How strong is the simplest primary-repair rule?</td>
+            </tr>
+            <tr>
+              <td><code>H2</code></td>
+              <td>Add-mirror heuristic</td>
+              <td>Symbolic rule baseline</td>
+              <td>Add mirrored triples for inverse or symmetric constraints</td>
+              <td>How far can constraint-shape-specific rules go?</td>
+            </tr>
+            <tr>
+              <td><code>H3</code></td>
+              <td>Constraint-shape majority heuristic</td>
+              <td>Symbolic/statistical rule baseline</td>
+              <td>Use the most common historical repair for each constraint shape</td>
+              <td>How much repair behavior is explained by constraint-family priors?</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Training objectives</h3>
+        <p>
+          The common learned objective is edit imitation: predict the historical repair slots.
+          Factorized models also learn auxiliary factor satisfaction predictions.
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Imitation and factor supervision</span>
+          \[
+          \begin{aligned}
+          \mathcal{L}_{\mathrm{edit}}
+          &= \sum_{j=1}^{6}
+          \operatorname{CE}\!\left(
+          y_j^{\star},
+          P\!\left(y_j \mid G^{-}, C_{\mathrm{local}}\right)
+          \right) \\
+          \mathcal{L}_{\mathrm{factor}}
+          &= \sum_{c \in C_{\mathrm{local}}}
+          \left[
+          \operatorname{BCE}\!\left(s_c^{-}, \hat{s}_c^{\mathrm{pre}}\right)
+          +
+          \operatorname{BCE}\!\left(s_c^{+}, \hat{s}_c^{\mathrm{post}}\right)
+          \right]
+          \end{aligned}
+          \]
         </div>
-        <div class="card">
-          <h3>For benchmark design</h3>
-          <p>
-            The paper separates historical fidelity from graph safety, making failure modes visible
-            that would be hidden by edit-slot F1 alone.
-          </p>
+        <p>
+          The practical model variants add different safety terms. <code>M1C</code> scores symbolic
+          candidate repairs with a chooser loss. <code>M1D</code> adds direct expected penalties for
+          primary failure and secondary regression.
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Model objectives</span>
+          \[
+          \begin{aligned}
+          \mathcal{L}_{\mathrm{A1}}
+          &= \mathcal{L}_{\mathrm{edit}}
+          + \eta\,\mathcal{L}_{\mathrm{factor}} \\
+          \mathcal{L}_{\mathrm{M1C}}
+          &= \mathcal{L}_{\mathrm{edit}}
+          + \eta\,\mathcal{L}_{\mathrm{factor}}
+          + \mu\,\mathcal{L}_{\mathrm{chooser}} \\
+          \mathcal{L}_{\mathrm{M1D}}
+          &= \mathcal{L}_{\mathrm{edit}}
+          + \eta\,\mathcal{L}_{\mathrm{factor}}
+          + \alpha\,\mathcal{L}_{\mathrm{primary}}
+          + \beta\,\mathcal{L}_{\mathrm{secondary}}
+          \end{aligned}
+          \]
         </div>
-        <div class="card">
-          <h3>For future systems</h3>
-          <p>
-            The results point toward candidate-oracle analysis, reranking, calibration, and stronger
-            secondary-pressure routing as concrete next steps.
-          </p>
+      </section>
+
+      <section id="metrics">
+        <h2>6.Evaluation</h2>
+        <p>
+          For evaluation, the predicted edit is applied to the pre-repair graph and the constraint
+          set is evaluated symbolically. Let <code>S_c(G)</code> be 1 if constraint <code>c</code> is
+          satisfied in graph state <code>G</code>, and 0 otherwise.
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Post-edit graph</span>
+          \[
+          \begin{aligned}
+          G^{\Delta} &= \operatorname{Apply}\!\left(G^{-}, \Delta\right) \\
+          S_c(G) &\in \{0, 1\}
+          \end{aligned}
+          \]
         </div>
-      </div>
-    </section>
+        <p>
+          The central safety metrics are computed over the local constraints:
+        </p>
+        <div class="equation math-block">
+          <span class="eq-label">Safety metrics</span>
+          \[
+          \begin{aligned}
+          \operatorname{PrimaryFix}
+          &= S_{c^{\star}}\!\left(G^{\Delta}\right) \\
+          \operatorname{GFR}
+          &= \frac{1}{|C_{\mathrm{local}}|}
+          \sum_{c \in C_{\mathrm{local}}}
+          S_c\!\left(G^{\Delta}\right) \\
+          \operatorname{SRR}
+          &=
+          \frac{
+          \left|\{c \neq c^{\star} :
+          S_c(G^{-}) = 1 \land S_c(G^{\Delta}) = 0\}\right|
+          }{
+          \left|\{c \neq c^{\star} :
+          S_c(G^{-}) = 1\}\right|
+          } \\
+          \operatorname{SIR}
+          &=
+          \frac{
+          \left|\{c \neq c^{\star} :
+          S_c(G^{-}) = 0 \land S_c(G^{\Delta}) = 1\}\right|
+          }{
+          \left|\{c \neq c^{\star} :
+          S_c(G^{-}) = 0\}\right|
+          }
+          \end{aligned}
+          \]
+        </div>
+        <p>
+          These equations make the central result easier to interpret. Micro-F1 measures whether
+          <code>Delta</code> resembles the historical edit <code>Delta*</code>. The safety metrics
+          measure what <code>Delta</code> does to the symbolic constraint state after it is applied.
+          The project shows that those two evaluations do not necessarily agree.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Meaning</th>
+              <th>Interpretation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Micro-F1</td>
+              <td>Historical edit-slot fidelity.</td>
+              <td>Higher means better imitation of curator edits.</td>
+            </tr>
+            <tr>
+              <td>Primary fix rate</td>
+              <td>Whether the predicted edit fixes the original violation.</td>
+              <td>Higher means better intent fulfillment.</td>
+            </tr>
+            <tr>
+              <td>GFR</td>
+              <td>Global fix rate over the local constraint set after applying the edit.</td>
+              <td>Higher means better local symbolic satisfaction.</td>
+            </tr>
+            <tr>
+              <td>SRR</td>
+              <td>Secondary regression rate.</td>
+              <td>Lower means fewer previously satisfied secondary constraints are broken.</td>
+            </tr>
+            <tr>
+              <td>SIR</td>
+              <td>Secondary improvement rate.</td>
+              <td>Higher means more previously unsatisfied secondary constraints become satisfied.</td>
+            </tr>
+            <tr>
+              <td>Disruption</td>
+              <td>Mean number of edit operations or changed triples.</td>
+              <td>Lower usually means more edit-minimal repairs.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="metric-note">
+          The paper should not rank models by a single metric. A model can be better at historical
+          imitation while being worse at symbolic no-regression.
+        </p>
+      </section>
 
-    <section id="next">
-      <h2>11. Next Experiments</h2>
-      <p>
-        The next experiments should be chosen carefully because the full neural runs are expensive.
-        The priority is therefore not a broad hyperparameter search. The priority is to run the
-        ablations that explain the mechanism, plus the already-started <code>M1C</code> follow-up
-        that tests whether chooser-side safety pressure changes the result.
-      </p>
+      <section id="results">
+        <h2>7. Current Results</h2>
+        <p>
+          This section compares the paper-facing models on the main evaluation metrics. The goal is
+          not to declare a single winner, but to see which part of the research hypothesis each model
+          supports: historical imitation, primary repair, secondary no-regression, or global local
+          consistency.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th class="num">Primary Fix</th>
+              <th class="num">Micro-F1</th>
+              <th class="num">GFR</th>
+              <th class="num">SRR</th>
+              <th class="num">SIR</th>
+              <th class="num">Disruption</th>
+              <th>Interpretation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>B0</code></td>
+              <td class="num">0.8603</td>
+              <td class="num">0.5434</td>
+              <td class="num">0.8705</td>
+              <td class="num">0.0097</td>
+              <td class="num">0.1925</td>
+              <td class="num">1.0036</td>
+              <td>Weakest learned fidelity, unexpectedly strong aggregate safety baseline.</td>
+            </tr>
+            <tr>
+              <td><code>A1</code></td>
+              <td class="num">0.8589</td>
+              <td class="num">0.6785</td>
+              <td class="num">0.8638</td>
+              <td class="num">0.0128</td>
+              <td class="num">0.1397</td>
+              <td class="num">1.0330</td>
+              <td>Strong representation win for imitation, but worse symbolic safety than <code>B0</code>.</td>
+            </tr>
+            <tr>
+              <td><code>M1C</code></td>
+              <td class="num">0.8496</td>
+              <td class="num">0.6898</td>
+              <td class="num">0.8629</td>
+              <td class="num">0.0137</td>
+              <td class="num">0.1381</td>
+              <td class="num">1.0663</td>
+              <td>Best proposal fidelity, but no aggregate safety win in this completed config.</td>
+            </tr>
+            <tr>
+              <td><code>M1D</code> reference</td>
+              <td class="num">0.8588</td>
+              <td class="num">0.6772</td>
+              <td class="num">0.8661</td>
+              <td class="num">0.0103</td>
+              <td class="num">0.1396</td>
+              <td class="num">1.0274</td>
+              <td>Closest practical safety variant, but not a decisive aggregate win over <code>B0</code>.</td>
+            </tr>
+            <tr>
+              <td><code>G0</code></td>
+              <td class="num">0.7174</td>
+              <td class="num">0.2804</td>
+              <td class="num">0.9098</td>
+              <td class="num">0.0091</td>
+              <td class="num">0.2441</td>
+              <td class="num">1.0000</td>
+              <td>High-consistency reference: best <code>GFR</code>, but fidelity collapses.</td>
+            </tr>
+            <tr>
+              <td><code>H1</code> DeleteFocusBaseline</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td>Heuristic baseline not yet evaluated.</td>
+            </tr>
+            <tr>
+              <td><code>H2</code> AddMirrorBaseline</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td>Heuristic baseline not yet evaluated.</td>
+            </tr>
+            <tr>
+              <td><code>H3</code> ConstraintShapeMajority</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td class="num">TBD</td>
+              <td>Heuristic baseline not yet evaluated.</td>
+            </tr>
+          </tbody>
+        </table>
 
-      <h3>Priority 1: Finish the updated <code>M1C</code> chooser run</h3>
-      <p>
-        The current follow-up run is an <code>M1C</code> chooser variant with a stronger
-        secondary/safety term. Once it finishes, compare it against the completed
-        <code>M1C</code>, <code>A1</code>, and <code>B0</code> rows.
-      </p>
-      <p>
-        The run is useful if it lowers <code>SRR</code>, improves <code>GFR</code>, or improves
-        dense-context safety without collapsing primary fix. If it only improves micro-F1, it should
-        be interpreted as another fidelity result rather than a safety result.
-      </p>
+        <div class="grid">
+          <div class="card">
+            <h3><span class="status good">Supported</span>: representation helps imitation</h3>
+            <p>
+              <code>A1</code> improves micro-F1 from <code>0.5434</code> to
+              <code>0.6785</code> relative to <code>B0</code>. This is the cleanest positive
+              result for executable factors.
+            </p>
+          </div>
+          <div class="card">
+            <h3><span class="status weak">Not supported</span>: representation alone improves safety</h3>
+            <p>
+              <code>A1</code> is worse than <code>B0</code> on aggregate <code>GFR</code>,
+              <code>SRR</code>, and <code>SIR</code>. The factorized representation does not
+              automatically reduce secondary regressions.
+            </p>
+          </div>
+          <div class="card">
+            <h3><span class="status mixed">Mixed</span>: local safety objectives</h3>
+            <p>
+              The completed <code>M1D</code> is directionally promising, especially in dense slices,
+              but the completed aggregate result is not enough to claim broad baseline dominance.
+              The running <code>M1C</code> follow-up will test whether chooser-side safety pressure
+              can improve this picture.
+            </p>
+          </div>
+          <div class="card">
+            <h3><span class="status good">Supported</span>: global reranking moves the frontier</h3>
+            <p>
+              <code>G0</code> improves global satisfaction, showing that safer candidate choices
+              exist, but its low fidelity shows the cost of optimizing global consistency directly.
+            </p>
+          </div>
+        </div>
+      </section>
 
-      <h3>Priority 2: Spend compute on ablations</h3>
-      <p>
-        The most valuable next experiments are ablations, because the current paper narrative
-        depends on explaining why executable factors help fidelity but do not automatically improve
-        safety. These ablations should be evaluated with both main metrics and H2 diagnostics.
-      </p>
-      <ul>
-        <li><strong>No auxiliary factor loss:</strong> tests whether factor supervision is needed for the learned constraint semantics.</li>
-        <li><strong>Shared pressure modules:</strong> tests whether type-specific pressure is important or whether a simpler shared mechanism works.</li>
-        <li><strong>Legacy shared factor executor:</strong> tests whether the newer per-type executor is actually responsible for the useful factor behavior.</li>
-      </ul>
+      <section id="h2">
+        <h2>8. H2 Diagnostics</h2>
+        <p>
+          The main result table tells us what happened, but not why it happened. H2 is the diagnostic
+          layer designed to answer that question. It is run only for factorized models because it
+          inspects internal factor outputs and pressure pathways that do not exist in the passive
+          <code>B0</code> baseline.
+        </p>
+        <p>
+          H2 has three purposes. First, it checks whether the learned factor modules can predict
+          symbolic constraint satisfaction. Second, it slices performance by local constraint density,
+          because a repair with many nearby constraints is a harder and more relevant case for this
+          project. Third, it masks parts of the factor-pressure mechanism at inference time to test
+          whether the model is actually using those signals.
+        </p>
 
-      <h3>Priority 3: Candidate-oracle analysis</h3>
-      <p>
-        Candidate-oracle analysis does not require training a new model. For each test instance,
-        determine whether the candidate set contains a repair that fixes the primary constraint,
-        avoids secondary regressions, improves or preserves <code>GFR</code>, and keeps disruption
-        low.
-      </p>
-      <p>
-        This distinguishes two failure modes: if safe candidates exist but the model does not select
-        them, the bottleneck is scoring or training; if safe candidates rarely exist, the bottleneck
-        is candidate generation.
-      </p>
+        <h3>Factor semantics</h3>
+        <p>
+          In this diagnostic, the model's factor heads are treated as satisfaction predictors. A high
+          score means that the model has learned to approximate whether a local constraint is
+          satisfied before repair or after the historical repair. This does not by itself prove that
+          the final edit choice is safe, but it tells us whether the constraint modules contain useful
+          information.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>State</th>
+              <th class="num">Weighted F1</th>
+              <th class="num">Weighted AUROC</th>
+              <th>Interpretation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>A1</code></td>
+              <td>pre</td>
+              <td class="num">0.9836</td>
+              <td class="num">0.9551</td>
+              <td>Factor satisfaction signals are learned well.</td>
+            </tr>
+            <tr>
+              <td><code>A1</code></td>
+              <td>post_gold</td>
+              <td class="num">0.9833</td>
+              <td class="num">0.9512</td>
+              <td>Post-repair factor state is also modeled well.</td>
+            </tr>
+            <tr>
+              <td><code>M1C</code></td>
+              <td>post_gold</td>
+              <td class="num">0.9822</td>
+              <td class="num">0.9406</td>
+              <td>Strong F1, slightly weaker discrimination than <code>A1</code>.</td>
+            </tr>
+            <tr>
+              <td><code>M1D</code></td>
+              <td>post_gold</td>
+              <td class="num">0.9814</td>
+              <td class="num">0.9394</td>
+              <td>Strong semantics, but not enough by itself to guarantee safe edits.</td>
+            </tr>
+          </tbody>
+        </table>
 
-      <h3>Priority 4: Report density and family slices</h3>
-      <p>
-        Aggregate metrics hide important structure. The paper should report results by local
-        factor-density bucket and constraint family, especially for dense contexts where executable
-        factors should matter most.
-      </p>
+        <div class="callout warn">
+          <strong>Calibration caveat:</strong> several factor families are highly imbalanced. High F1
+          can reflect the fact that most factors are already satisfied. AUROC, AUPRC, and calibration
+          should be reported alongside F1 for families such as <code>valueRequiresStatement</code>,
+          <code>oneOf</code>, <code>single</code>, and <code>itemRequiresStatement</code>.
+        </div>
 
-      <h3>Priority 5: Optional <code>M1D</code> safety-weight grid</h3>
-      <p>
-        A larger <code>M1D</code> safety-weight grid may be useful later, but it is not the initial
-        compute priority. It should be treated as optional unless the ablations or candidate-oracle
-        analysis show that stronger direct safety pressure is the most likely path to a clear
-        result.
-      </p>
+        <h3>Pressure masking</h3>
+        <p>
+          Pressure masking is an intervention: the model is evaluated again while some factor-pressure
+          messages are removed. If performance changes substantially, the removed pathway was
+          causally important for prediction. If performance barely changes, the model was not relying
+          much on that pathway.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Masking variant</th>
+              <th class="num">Delta Micro-F1</th>
+              <th class="num">Delta Primary Fix</th>
+              <th class="num">Prediction Changed</th>
+              <th>Interpretation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>A1</code></td>
+              <td>no factor pressure</td>
+              <td class="num">-0.4270</td>
+              <td class="num">-0.4174</td>
+              <td class="num">62.5%</td>
+              <td>Factor pressure is causally important for prediction.</td>
+            </tr>
+            <tr>
+              <td><code>M1C</code></td>
+              <td>no factor pressure</td>
+              <td class="num">-0.4438</td>
+              <td class="num">-0.4318</td>
+              <td class="num">63.6%</td>
+              <td>Chooser model still relies heavily on factor pressure.</td>
+            </tr>
+            <tr>
+              <td><code>M1D</code></td>
+              <td>no factor pressure</td>
+              <td class="num">-0.3714</td>
+              <td class="num">-0.3491</td>
+              <td class="num">59.3%</td>
+              <td>Direct safety model also uses factor pressure heavily.</td>
+            </tr>
+            <tr>
+              <td><code>A1</code></td>
+              <td>secondary only pressure</td>
+              <td class="num">-0.0014</td>
+              <td class="num">-0.0016</td>
+              <td class="num">2.7%</td>
+              <td>Secondary pressure barely changes decisions.</td>
+            </tr>
+            <tr>
+              <td><code>M1C</code></td>
+              <td>secondary only pressure</td>
+              <td class="num">-0.0175</td>
+              <td class="num">-0.0101</td>
+              <td class="num">4.7%</td>
+              <td>Some effect, but still weak relative to primary/focal pressure.</td>
+            </tr>
+            <tr>
+              <td><code>M1D</code></td>
+              <td>secondary only pressure</td>
+              <td class="num">-0.0001</td>
+              <td class="num">-0.0005</td>
+              <td class="num">2.9%</td>
+              <td>Secondary routing remains weak.</td>
+            </tr>
+          </tbody>
+        </table>
 
-      <h3>Priority 6: Calibrate factor semantics</h3>
-      <p>
-        For imbalanced factor families, report AUROC, AUPRC, and calibration alongside F1. This
-        prevents overclaiming from high F1 when almost all examples are positive.
-      </p>
-    </section>
-  </article>
-</main>
+        <div class="callout">
+          <strong>H2 conclusion:</strong> the factorized architecture does learn and use constraint
+          pressure, but the pressure primarily supports historical edit imitation and primary repair
+          behavior. It is not yet strong enough as a secondary no-regression mechanism.
+        </div>
+      </section>
+
+      <section id="narrative">
+        <h2>9. Why the Narrative Changed</h2>
+        <p>
+          The main body of this document presents the current, results-aligned narrative. This section
+          explains why it differs from the original framing, because that change is scientifically
+          important rather than cosmetic.
+        </p>
+        <h3>Original narrative</h3>
+        <p>
+          The original paper narrative was that executable constraint factors would preserve curator
+          fidelity and directly reduce secondary regressions. This would have made <code>M1C</code>
+          or <code>M1D</code> the main practical winning model.
+        </p>
+
+        <h3>Updated narrative</h3>
+        <p>
+          The results support a different and more precise narrative:
+        </p>
+        <div class="callout">
+          Better historical repair imitation is not the same as safer graph repair. Executable
+          constraint factors improve the representation used for edit prediction, but safe local
+          repair requires explicit candidate-level reasoning over primary fix, secondary regression,
+          global satisfaction, and disruption.
+        </div>
+
+        <h3>Research questions for the paper</h3>
+        <ol>
+          <li>
+            <strong>Do executable constraint factors improve historical repair modeling?</strong>
+            Yes. <code>A1</code> strongly improves micro-F1 over <code>B0</code>.
+          </li>
+          <li>
+            <strong>Does better repair imitation imply safer post-edit graphs?</strong>
+            No. <code>A1</code> improves fidelity but worsens aggregate safety metrics.
+          </li>
+          <li>
+            <strong>Can local safety objectives move the safety frontier?</strong>
+            Partially. The completed <code>M1D</code> result is directionally promising in some
+            regimes, and the running <code>M1C</code> follow-up will test whether chooser-side safety
+            pressure improves the result.
+          </li>
+          <li>
+            <strong>What happens when global consistency is optimized directly?</strong>
+            <code>G0</code> improves global satisfaction but sharply sacrifices fidelity.
+          </li>
+        </ol>
+
+        <h3>One-paragraph abstract candidate</h3>
+        <p>
+          We study neural repair of Wikidata constraint violations under two competing objectives:
+          fidelity to historical curator edits and symbolic safety of the post-edit graph. We propose
+          executable constraint factors, a factorized graph representation in which locally applicable
+          constraints act as typed satisfaction operators that inject pressure into message passing.
+          On a stratified Wikidata repair benchmark, factorized imitation substantially improves
+          historical edit prediction over a passive ESWC-style baseline. However, this fidelity gain
+          does not translate into lower secondary regression or higher global satisfaction, revealing
+          a mismatch between curator imitation and symbolic safety. Diagnostic masking analyses show
+          that factor pressure is learned and causally affects predictions, but mostly supports primary
+          repair and imitation rather than secondary no-regression. A global reranker improves
+          satisfaction at a large fidelity cost, establishing a fidelity-safety frontier for future
+          repair models.
+        </p>
+      </section>
+
+      <section id="relevance">
+        <h2>10. Scientific Relevance</h2>
+        <p>
+          The project is scientifically relevant because it challenges a common assumption in
+          data-driven repair: that learning to imitate historical fixes is enough. In collaborative
+          knowledge graphs, historical repairs are useful supervision, but they are not a complete
+          proxy for post-edit consistency.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <h3>For Knowledge Graph repair</h3>
+            <p>
+              The work introduces a richer evaluation surface that measures collateral constraint
+              effects, not only whether the primary violation was repaired.
+            </p>
+          </div>
+          <div class="card">
+            <h3>For neuro-symbolic learning</h3>
+            <p>
+              The results show that symbolic factors can be learned and used by neural models, but
+              that using them for safe decisions requires more than representation learning.
+            </p>
+          </div>
+          <div class="card">
+            <h3>For benchmark design</h3>
+            <p>
+              The paper separates historical fidelity from graph safety, making failure modes visible
+              that would be hidden by edit-slot F1 alone.
+            </p>
+          </div>
+          <div class="card">
+            <h3>For future systems</h3>
+            <p>
+              The results point toward candidate-oracle analysis, reranking, calibration, and stronger
+              secondary-pressure routing as concrete next steps.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="next">
+        <h2>11. Next Experiments</h2>
+        <p>
+          The next experiments should be chosen carefully because the full neural runs are expensive.
+          The priority is therefore not a broad hyperparameter search. The priority is to run the
+          ablations that explain the mechanism, plus the already-started <code>M1C</code> follow-up
+          that tests whether chooser-side safety pressure changes the result.
+        </p>
+
+        <h3>Priority 1: Finish the updated <code>M1C</code> chooser run</h3>
+        <p>
+          The current follow-up run is an <code>M1C</code> chooser variant with a stronger
+          secondary/safety term. Once it finishes, compare it against the completed
+          <code>M1C</code>, <code>A1</code>, and <code>B0</code> rows.
+        </p>
+        <p>
+          The run is useful if it lowers <code>SRR</code>, improves <code>GFR</code>, or improves
+          dense-context safety without collapsing primary fix. If it only improves micro-F1, it should
+          be interpreted as another fidelity result rather than a safety result.
+        </p>
+
+        <h3>Priority 2: Spend compute on ablations</h3>
+        <p>
+          The most valuable next experiments are ablations, because the current paper narrative
+          depends on explaining why executable factors help fidelity but do not automatically improve
+          safety. These ablations should be evaluated with both main metrics and H2 diagnostics.
+        </p>
+        <ul>
+          <li><strong>No auxiliary factor loss:</strong> tests whether factor supervision is needed for the learned
+            constraint semantics.</li>
+          <li><strong>Shared pressure modules:</strong> tests whether type-specific pressure is important or whether a
+            simpler shared mechanism works.</li>
+          <li><strong>Legacy shared factor executor:</strong> tests whether the newer per-type executor is actually
+            responsible for the useful factor behavior.</li>
+        </ul>
+
+        <h3>Priority 3: Candidate-oracle analysis</h3>
+        <p>
+          Candidate-oracle analysis does not require training a new model. For each test instance,
+          determine whether the candidate set contains a repair that fixes the primary constraint,
+          avoids secondary regressions, improves or preserves <code>GFR</code>, and keeps disruption
+          low.
+        </p>
+        <p>
+          This distinguishes two failure modes: if safe candidates exist but the model does not select
+          them, the bottleneck is scoring or training; if safe candidates rarely exist, the bottleneck
+          is candidate generation.
+        </p>
+
+        <h3>Priority 4: Report density and family slices</h3>
+        <p>
+          Aggregate metrics hide important structure. The paper should report results by local
+          factor-density bucket and constraint family, especially for dense contexts where executable
+          factors should matter most.
+        </p>
+
+        <h3>Priority 5: Optional <code>M1D</code> safety-weight grid</h3>
+        <p>
+          A larger <code>M1D</code> safety-weight grid may be useful later, but it is not the initial
+          compute priority. It should be treated as optional unless the ablations or candidate-oracle
+          analysis show that stronger direct safety pressure is the most likely path to a clear
+          result.
+        </p>
+
+        <h3>Priority 6: Calibrate factor semantics</h3>
+        <p>
+          For imbalanced factor families, report AUROC, AUPRC, and calibration alongside F1. This
+          prevents overclaiming from high F1 when almost all examples are positive.
+        </p>
+      </section>
+    </article>
+  </main>
 </body>
+
 </html>
