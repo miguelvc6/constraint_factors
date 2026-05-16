@@ -19,38 +19,38 @@ This conceptual specification does not assume that every decision-time safety qu
 We work with a **heterogeneous factor graph** per violation instance.
 
 ### Node sets
-- **Variable nodes** \( v \in \mathcal{V} \)
+- **Variable nodes** $v \in \mathcal{V}$
   - entities, predicates, literals, role-specific nodes
-- **Constraint factor nodes** \( c \in \mathcal{C} \)
+- **Constraint factor nodes** $c \in \mathcal{C}$
   - each corresponds to a *constraint instance*
-  - each has a constraint type \( t(c) \in \mathcal{T} \)
+  - each has a constraint type $t(c) \in \mathcal{T}$
 
 ### Scope of a constraint
-Each factor node \( c \) has a scope:
-\[
+Each factor node $c$ has a scope:
+$$
 \mathrm{scope}(c) \subseteq \mathcal{V}
-\]
+$$
 representing the variables involved in that constraint.
 
 Examples:
-- `conflictWith(p,q)` → scope = {predicate node \(p\), predicate node \(q\), optional subject node \(s\)}
-- `single(p)` → scope = {subject \(s\), predicate \(p\), all value nodes \(o_i\)}
+- `conflictWith(p,q)` → scope = {predicate node $p$, predicate node $q$, optional subject node $s$}
+- `single(p)` → scope = {subject $s$, predicate $p$, all value nodes $o_i$}
 
 ---
 
 ## 2. Variable-to-Variable Message Passing (Base GNN)
 
-Let \( h_v^{(k)} \in \mathbb{R}^d \) be the embedding of variable node \(v\) at layer \(k\).
+Let $h_v^{(k)} \in \mathbb{R}^d$ be the embedding of variable node $v$ at layer $k$.
 
 We use a standard GNN backbone (e.g., GIN over a multi-relational graph):
 
-\[
+$$
 \tilde{h}_v^{(k+1)} =
 \mathrm{GNN}\Big(
 h_v^{(k)},
 \big\{ (h_u^{(k)}, e_{u\to v}) : u \in \mathcal{N}(v) \big\}
 \Big)
-\]
+$$
 
 This step captures **structural and semantic context** from the data graph alone, without constraints.
 
@@ -62,10 +62,10 @@ Constraint factors are **executable operators**, not passive nodes.
 
 ### 3.1 Type-specific constraint function
 
-Each constraint type \( t \in \mathcal{T} \) has a shared neural function:
-\[
+Each constraint type $t \in \mathcal{T}$ has a shared neural function:
+$$
 f_t : \mathbb{R}^{|\mathrm{scope}(c)| \cdot d} \rightarrow \mathbb{R}
-\]
+$$
 
 All constraint instances of the same type share parameters.
 
@@ -73,28 +73,28 @@ All constraint instances of the same type share parameters.
 
 ### 3.2 Example: `conflictWith` constraint
 
-For a `conflictWith(p,q)` constraint with optional subject \(s\), define:
+For a `conflictWith(p,q)` constraint with optional subject $s$, define:
 
-\[
+$$
 z_c^{(k)} = 
 \big[
 h_p^{(k)} \;\Vert\; h_q^{(k)} \;\Vert\; h_s^{(k)}
 \big]
-\]
+$$
 
 Violation score:
-\[
+$$
 \mathrm{viol}_c^{(k)} =
 \sigma\big( W_{conflict} \cdot z_c^{(k)} \big)
-\]
+$$
 
 where:
-- \( \sigma \) is a sigmoid,
-- \( \mathrm{viol}_c \in [0,1] \).
+- $\sigma$ is a sigmoid,
+- $\mathrm{viol}_c \in [0,1]$.
 
 **Interpretation**
-- \( \mathrm{viol}_c \approx 0 \): configuration compatible
-- \( \mathrm{viol}_c \approx 1 \): strong violation
+- $\mathrm{viol}_c \approx 0$: configuration compatible
+- $\mathrm{viol}_c \approx 1$: strong violation
 
 This learned function **replaces**:
 - heuristic rule matching,
@@ -105,9 +105,9 @@ This learned function **replaces**:
 ### 3.3 Satisfaction score
 
 We define satisfaction as:
-\[
+$$
 \hat{s}_c^{(k)} = 1 - \mathrm{viol}_c^{(k)}
-\]
+$$
 
 This is the quantity used in:
 - auxiliary satisfaction losses,
@@ -126,9 +126,9 @@ Each factor emits **directed, role-conditioned pressure messages** to its scoped
 
 ### 4.1 Pressure generation
 
-For each \( v \in \mathrm{scope}(c) \):
+For each $v \in \mathrm{scope}(c)$:
 
-\[
+$$
 m_{c \rightarrow v}^{(k)} =
 g_{t(c), r(v,c)}
 \big(
@@ -136,34 +136,34 @@ z_c^{(k)},\;
 h_v^{(k)},\;
 \mathrm{viol}_c^{(k)}
 \big)
-\]
+$$
 
 where:
-- \( r(v,c) \) is the *role* of variable \(v\) in constraint \(c\),
-- \( g_{t,r} \) is a small MLP, shared per (constraint type, role).
+- $r(v,c)$ is the *role* of variable $v$ in constraint $c$,
+- $g_{t,r}$ is a small MLP, shared per (constraint type, role).
 
 ---
 
 ### 4.2 Simplified example (conflictWith)
 
-For predicates \(p, q\):
+For predicates $p, q$:
 
-\[
+$$
 m_{c \rightarrow p}^{(k)} =
 - \alpha \cdot \mathrm{viol}_c^{(k)} \cdot h_p^{(k)}
-\]
+$$
 
-\[
+$$
 m_{c \rightarrow q}^{(k)} =
 - \alpha \cdot \mathrm{viol}_c^{(k)} \cdot h_q^{(k)}
-\]
+$$
 
-Optionally, for subject \(s\):
+Optionally, for subject $s$:
 
-\[
+$$
 m_{c \rightarrow s}^{(k)} =
 - \alpha_s \cdot \mathrm{viol}_c^{(k)} \cdot h_s^{(k)}
-\]
+$$
 
 ---
 
@@ -181,15 +181,15 @@ This is **not** symbolic deletion:
 
 ## 5. Variable State Update with Constraint Pressure
 
-The final variable update at layer \(k+1\) is:
+The final variable update at layer $k+1$ is:
 
-\[
+$$
 h_v^{(k+1)} =
 \tilde{h}_v^{(k+1)}
 +
 \sum_{c : v \in \mathrm{scope}(c)}
 m_{c \rightarrow v}^{(k)}
-\]
+$$
 
 Thus:
 - standard GNN aggregation builds context,
@@ -218,7 +218,7 @@ Instead:
 
 ### 6.2 Decoder intuition
 
-Let \( h_G \) be the pooled graph embedding.
+Let $h_G$ be the pooled graph embedding.
 
 High constraint pressure on:
 - a predicate embedding → higher probability of deletion
