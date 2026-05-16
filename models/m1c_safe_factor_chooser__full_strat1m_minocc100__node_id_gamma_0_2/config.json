@@ -4790,7 +4790,7 @@
     "chooser": {
       "beta_no_regression": 0.25,
       "enabled": true,
-      "gamma_primary": 0.0,
+      "gamma_primary": 0.2,
       "loss_mode": "fix1",
       "loss_weight": 0.25,
       "max_candidates_total": 80,
