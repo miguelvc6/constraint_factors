@@ -37,6 +37,7 @@ Reproducibility notes:
 - `src/08_train_reranker.py` accepts `--seed`; use `--seed 42` for all reranker runs.
 - heuristic baselines are deterministic.
 - do not mix encodings or dataset variants inside the same paper table.
+- keep `training_config.validation_subset_size: 25000` for the paper proposal runs. This is the frozen validation policy for the current paper line, not a development-only shortcut.
 - do not edit configs once training starts; generate configs once, then only make one explicit “locked” hyperparameter update after the short search.
 
 Recommended run ledger:
@@ -299,7 +300,7 @@ Recommended search budget:
 - default: `5` configs max
 - one seed only
 - no repeated sweeps
-- for development-speed searches, set `training_config.validation_subset_size: 25000` in the generated configs so each epoch validates on the first 25k validation graphs; remove it or set it to `null` before final paper-facing training
+- keep `training_config.validation_subset_size: 25000` in the generated configs and in the final paper-facing proposal configs. This keeps search and final runs on the same validation policy and bounds validation cost consistently.
 - generated `M1C` configs use the conservative stability schedule: `learning_rate=1e-4`, `grad_clip=0.5`, `num_epochs=10`, `early_stopping_rounds=2`, `scheduler_patience=0`, and `chooser.loss_weight=0.25`
 
 Run the short search with the scheduler:
@@ -331,12 +332,12 @@ Primary selection criteria:
 
 Practical rule:
 
-- use the `model_selection` block in each copied `eval.json` as a quick ranking aid
+- use the `model_selection` block in each run's `evaluations/model.json` as a quick ranking aid
 - do not accept a config that improves fidelity by noticeably worsening `SRR`
 
 Search outputs to inspect:
 
-- `models/hp_m1c_*/eval.json`
+- `models/hp_m1c_*/evaluations/model.json`
 
 If you need the per-constraint breakdown, inspect the resolved run directory under `models/`; the scheduler does not copy `per_constraint.csv` back into the config directory.
 
@@ -439,7 +440,7 @@ uv run src/10_scheduler.py --only g0_globalfix_reference --paper-suite
 The scheduler will:
 
 - train the run
-- copy `checkpoint.pth`, `training_history.json`, and `eval.json` back into the config directory
+- leave `checkpoint.pth`, `training_history.json`, and evaluation artifacts in the run directory
 - evaluate with strict global metrics
 - for passive `B0` graphs, strict global metrics use the interim parquet/registry state and do not require factor-label tensors on the passive test graphs
 - automatically add `--use-chooser` for chooser runs
@@ -558,7 +559,8 @@ Before declaring the suite complete, verify:
   - `config.json`
   - `checkpoint.pth`
   - `training_history.json`
-  - `eval.json`
+  - `evaluations/model.json`
+  - `evaluations/per_constraint.csv`
 - baselines were written under `models/baselines/full_strat1m/parquet/`
 - the resolved runtime directories under `models/` contain `evaluations/model.json` and `evaluations/per_constraint.csv` for the final paper runs
 
@@ -574,7 +576,7 @@ Do not expand into:
 - per-model searches
 - multi-seed sweeps
 - separate reranker searches
-- appendix-model training
+- broad appendix-model training beyond the planned H2 ablations
 
 unless the final paper suite fails in a way that blocks the main claims.
 
@@ -629,3 +631,50 @@ uv run src/09_eval.py \
 ```
 
 The H2 outputs are written under each run's `evaluations/h2/` directory. These ablations should be reported as appendix diagnostics for H2, not as replacements for the canonical `B0`, `A1`, `M1C`, `M1D`, or `G0` results.
+
+## 9. Candidate-oracle analysis
+
+Candidate-oracle analysis is the next non-training diagnostic after the H2 ablations. It answers whether the candidate set already contains safe repairs that the model fails to select, or whether the candidate generator rarely proposes safe repairs in the first place.
+
+This should be implemented as a read-only analysis script that reuses the existing candidate and symbolic-evaluation code paths:
+
+- candidate generation: `modules.candidates.CandidateConfig` and `modules.candidates.build_candidates`
+- symbolic candidate scoring: `modules.reranker_eval.CandidateConstraintEvaluator`
+- model logits/proposals: the trained `A1`, `M1C`, and `M1D` checkpoints
+
+Recommended script interface:
+
+If `scripts/analyze_candidate_oracle.py` does not exist yet, add it as the implementation of this diagnostic rather than folding oracle logic into `src/09_eval.py`.
+
+```bash
+uv run scripts/analyze_candidate_oracle.py \
+  --run-directory models/m1c_safe_factor_chooser__full_strat1m_minocc100__node_id_gamma_0 \
+  --strict-global-metrics \
+  --output-dir models/m1c_safe_factor_chooser__full_strat1m_minocc100__node_id_gamma_0/evaluations/oracle
+```
+
+Run the same analysis for `A1`, final `M1C`, and `M1D`. If the updated `M1C` chooser run replaces the current `gamma_0` run, use that updated run as the final `M1C` oracle row.
+
+For each test instance, the script should:
+
+1. Build the candidate set using the run's configured candidate policy.
+2. Evaluate every candidate against the local symbolic constraint state.
+3. Mark whether at least one candidate:
+   - fixes the primary constraint;
+   - introduces no secondary regression;
+   - preserves or improves local `GFR`;
+   - stays within the accepted disruption budget.
+4. Compare the oracle candidate against the model-selected candidate and, where relevant, the `G0` reranker-selected candidate.
+
+Required outputs:
+
+- `oracle_summary.json`: aggregate oracle rates, selected-candidate rates, and gaps.
+- `oracle_by_density.csv`: oracle and selected-candidate rates by factor-density bucket.
+- `oracle_by_constraint_type.csv`: oracle and selected-candidate rates by primary constraint family.
+- `oracle_examples.csv`: representative rows where a safe oracle candidate exists but the model selected an unsafe candidate.
+
+Decision rule:
+
+- if the oracle is strong but `M1C`/`M1D` are weak, the bottleneck is selection learning or objective design;
+- if the oracle is weak, the bottleneck is candidate generation;
+- if oracle strength is concentrated in dense contexts or specific families, scope any safety claim to those regimes.

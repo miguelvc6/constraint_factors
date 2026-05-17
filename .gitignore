@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info
+data/
+kg_repairs/*
+deprecated/*
+99_*
+model-configs/*
+models/*/*.pth
+logs/*
+models/baselines/full_strat1m/parquet/baselines_all.json
