@@ -64,15 +64,16 @@ Interpretation:
 
 Current result:
 
-- micro-F1 is the best among canonical proposal models;
-- primary fix, `GFR`, `SRR`, and disruption do not improve over `B0`;
-- the trained canonical config used `gamma_primary = 0.0`, which conflicts with the paper-facing matrix expectation that the primary term should be non-zero.
+- the completed follow-up run uses the intended non-zero primary term (`gamma_primary = 0.2`);
+- micro-F1 is lower than `A1` and the earlier `gamma_primary = 0.0` chooser run;
+- `SRR` is slightly lower than the earlier chooser run, but still worse than `B0` and `M1D`;
+- primary fix, `GFR`, `SIR`, and disruption do not improve over `B0`.
 
 Interpretation:
 
 - The current `M1C` result should not be framed as the main positive safety result.
-- It is evidence that chooser supervision, as currently configured, mostly preserves or improves imitation rather than producing a clear no-regression benefit.
-- The `gamma_primary` mismatch should be treated as an unresolved experimental issue before finalizing claims about chooser-based safe selection.
+- The non-zero-primary follow-up resolves the configuration mismatch but does not change the conclusion: chooser supervision, as currently configured, does not produce a clear no-regression or global-safety win.
+- The small `SRR` improvement over the earlier chooser run comes with lower fidelity and lower primary-fix behavior, so it should be treated as a trade-off result rather than a recovered safety result.
 
 ### `M1D`: Direct-loss safe factor model
 
@@ -273,20 +274,22 @@ The discussion should position safe candidate selection as the main open challen
 
 The next experiments should be targeted rather than broad. The goal is to determine whether the safety side of the current trade-off narrative can be strengthened, while prioritizing mechanism-focused ablations over expensive broad sweeps.
 
-### E1: Finish the updated `M1C` chooser run
+### E1: Completed updated `M1C` chooser run
 
-The current follow-up run is an `M1C` chooser variant with a stronger secondary/safety term. Compare it against the completed `M1C`, `A1`, and `B0` rows once it finishes.
+The updated `M1C` chooser run completed with `gamma_primary = 0.2`. It should be used as the final non-zero-primary chooser result, while the earlier `gamma_primary = 0.0` run remains useful as a diagnostic comparison.
 
-Decision rule:
+Outcome:
 
-- prefer the new `M1C` only if it lowers `SRR`, improves `GFR`, or improves dense-context safety without collapsing primary fix;
-- do not choose a run merely because it improves fidelity.
+- it lowers `SRR` slightly relative to the earlier chooser run;
+- it does not improve `GFR` over `B0`, `A1`, or `M1D`;
+- it reduces fidelity and primary-fix behavior relative to the earlier chooser run and `A1`;
+- it therefore does not justify reframing `M1C` as the main successful safety model.
 
 Why this matters:
 
 - `M1C` is the practical chooser-based path for local safe selection;
-- the completed canonical `M1C` did not produce a safety win;
-- the follow-up tests whether stronger chooser-side safety pressure changes that result.
+- the completed non-zero-primary follow-up shows that stronger chooser-side primary pressure does not, by itself, recover the safety side of the trade-off;
+- the remaining question is whether candidate-oracle analysis shows a selection-learning bottleneck or a candidate-generation bottleneck.
 
 ### E2: Spend compute on H2 supporting ablations
 

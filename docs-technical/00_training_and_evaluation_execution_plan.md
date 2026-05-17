@@ -648,12 +648,12 @@ If `scripts/analyze_candidate_oracle.py` does not exist yet, add it as the imple
 
 ```bash
 uv run scripts/analyze_candidate_oracle.py \
-  --run-directory models/m1c_safe_factor_chooser__full_strat1m_minocc100__node_id_gamma_0 \
+  --run-directory models/m1c_safe_factor_chooser__full_strat1m_minocc100__node_id_gamma_0_2 \
   --strict-global-metrics \
-  --output-dir models/m1c_safe_factor_chooser__full_strat1m_minocc100__node_id_gamma_0/evaluations/oracle
+  --output-dir models/m1c_safe_factor_chooser__full_strat1m_minocc100__node_id_gamma_0_2/evaluations/oracle
 ```
 
-Run the same analysis for `A1`, final `M1C`, and `M1D`. If the updated `M1C` chooser run replaces the current `gamma_0` run, use that updated run as the final `M1C` oracle row.
+Run the same analysis for `A1`, final `M1C`, and `M1D`. Use `m1c_safe_factor_chooser__full_strat1m_minocc100__node_id_gamma_0_2` as the final non-zero-primary `M1C` oracle row; keep the earlier `gamma_0` run only as an optional diagnostic comparison.
 
 For each test instance, the script should:
 

@@ -354,12 +354,6 @@
           A self-contained research overview of the project idea, scientific motivation,
           model suite, current results, revised paper narrative, and next experiments.
         </p>
-        <div class="meta">
-          <span class="pill">Project: constraint_factors</span>
-          <span class="pill">Dataset: full_strat1m_minocc100</span>
-          <span class="pill">Encoding: node_id</span>
-          <span class="pill">Status: results-aligned narrative</span>
-        </div>
         <nav class="toc" aria-label="Table of contents">
           <a href="#summary">1. Executive Summary</a>
           <a href="#problem">2. Scientific Problem</a>
@@ -377,33 +371,29 @@
 
       <section id="summary">
         <h2>1. Executive Summary</h2>
-        <div class="callout">
-          <strong>Thesis:</strong> Executable constraint factors help neural repair models imitate
-          historical Wikidata edits more accurately, but better edit imitation does not automatically
-          produce safer post-edit graphs. Repair fidelity and symbolic constraint safety are partly
-          misaligned objectives.
-        </div>
         <p>
-          This project studies neural repair of Wikidata constraint violations. A constraint violation
-          is a local inconsistency detected by Wikidata's property constraints; a repair is an edit
-          that adds or deletes statements to address that inconsistency. Prior work treats the violated
-          constraint mostly as context and trains a model to imitate historical curator edits. This
-          project asks whether constraints should instead be represented as active objects inside the
-          model: small learned modules that estimate whether a constraint is satisfied and send that
-          information back into the graph neural network.
+          <strong>Abstract.</strong>
+          Collaborative knowledge graphs such as Wikidata use soft property constraints to flag suspicious or
+          inconsistent statements, yet repairing these violations remains difficult: a locally plausible edit may
+          imitate historical curator behavior while introducing or preserving other constraint violations. We study
+          neural repair under this fidelity-safety tension. Given a violated Wikidata statement, local graph context,
+          and historical repair supervision, the task is to predict an add/delete edit that both resembles curator
+          behavior and improves the post-edit symbolic state. We introduce executable constraint factors, a
+          neuro-symbolic graph representation in which locally applicable constraints are represented as typed factor
+          nodes. These factors estimate constraint satisfaction and inject role-conditioned pressure messages into a
+          graph neural repair model. Experiments on a stratified Wikidata repair benchmark show that executable factors
+          substantially improve historical edit prediction, raising micro-F1 from 0.5434 to 0.6785 over a passive
+          constraint-context baseline (my ESWC paper's model). However, this improvement does not automatically yield
+          safer repairs: the factorized imitation model worsens aggregate local satisfaction and secondary-regression
+          metrics. A global-fix reranking reference achieves the best local satisfaction but collapses historical
+          fidelity, revealing a clear fidelity-safety frontier. These findings suggest that learned knowledge graph
+          repair should evaluate curator imitation and symbolic safety as separate objectives, and that safe repair
+          requires explicit decision-level reasoning beyond representation learning.
         </p>
         <p>
-          The current narrative is that historical repair imitation and symbolic repair safety are
-          related but distinct objectives. Factorized executable constraints substantially improve
-          historical edit prediction, but they do not by themselves improve aggregate global
-          satisfaction or secondary regression metrics. A global reranker can improve global
-          satisfaction, but at a large cost to curator fidelity.
-        </p>
-        <p>
-          The scientific value of the project is therefore not simply "our model wins." The stronger
-          contribution is an empirical demonstration that historical repair imitation and symbolic
-          graph safety must be evaluated separately, and that executable constraint factors expose
-          this trade-off in a measurable way.
+          <strong>Keywords:</strong> knowledge graph repair; Wikidata constraints; neuro-symbolic
+          learning; executable constraint factors; graph neural networks; edit imitation; symbolic
+          safety.
         </p>
       </section>
 
@@ -499,6 +489,57 @@
           builds representations for repair prediction.
         </p>
 
+        <h3>Relation to factor-graph neural models</h3>
+        <p>
+          The architecture is related to neural factor-graph message-passing models, but it should not
+          be framed as a new general-purpose Factor Graph Neural Network. Existing models such as
+          Zhang et al.'s <strong>Factor Graph Neural Network</strong>, Satorras and Welling's
+          <strong>Neural Enhanced Belief Propagation</strong>, and Kuck et al.'s
+          <strong>Belief Propagation Neural Network</strong> already show that factor-graph structure
+          can be neuralized for approximate inference and representation learning. They use
+          variable-to-factor and factor-to-variable message passing to estimate marginals, refine
+          belief-propagation messages, decode structured variables, or approximate partition functions.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Related model</th>
+              <th>Commonality with this project</th>
+              <th>Key difference</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Zhang et al. FGNN</td>
+              <td>Uses variable nodes, factor nodes, and learned variable-factor message passing to model higher-order
+                dependencies.</td>
+              <td>Targets general factor-graph representation/inference; this project uses factors as typed Wikidata
+                constraint instances for repair prediction.</td>
+            </tr>
+            <tr>
+              <td>Satorras and Welling NEBP</td>
+              <td>Combines factor-graph GNN messages with belief-propagation-style inference.</td>
+              <td>Refines BP messages for probabilistic inference tasks; this project uses neural factors to inject
+                constraint pressure into a KG repair model.</td>
+            </tr>
+            <tr>
+              <td>Kuck et al. BPNN</td>
+              <td>Preserves factor-graph structure and learns BP-like iterative operators.</td>
+              <td>Focuses on partition-function/model-count estimation and BP-like guarantees; this project focuses on
+                local graph edits, curator fidelity, and secondary no-regression.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          The scientific contribution is therefore not the generic use of factor nodes. The contribution
+          is to make <strong>symbolic KG constraints executable inside a learned repair model</strong>.
+          Each local constraint instance becomes a typed operator that estimates satisfaction and sends
+          role-conditioned pressure messages to the variables in its scope, while symbolic validators
+          remain responsible for grounded candidate-level safety evaluation. In this sense, the model
+          uses the factor-graph abstraction not to approximate belief propagation, but to make soft
+          Wikidata constraints active participants in safer local edit prediction.
+        </p>
+
         <h3>Repair representation</h3>
         <p>
           The repair target is a six-slot add/delete edit:
@@ -565,7 +606,7 @@
         <div class="equation math-block">
           <span class="eq-label">Repair edit</span>
           \[
-          \Delta \left(s^{+}, p^{+}, o^{+}, s^{-}, p^{-}, o^{-}\right) 
+          \Delta \left(s^{+}, p^{+}, o^{+}, s^{-}, p^{-}, o^{-}\right)
           \]
         </div>
 
@@ -924,13 +965,13 @@
             </tr>
             <tr>
               <td><code>M1C</code></td>
-              <td class="num">TBD</td>
-              <td class="num">TBD</td>
-              <td class="num">TBD</td>
-              <td class="num">TBD</td>
-              <td class="num">TBD</td>
-              <td class="num">TBD</td>
-              <td>Best proposal fidelity, but no aggregate safety win in this completed config.</td>
+              <td class="num">0.8155</td>
+              <td class="num">0.6198</td>
+              <td class="num">0.8629</td>
+              <td class="num">0.0132</td>
+              <td class="num">0.1158</td>
+              <td class="num">1.0663</td>
+              <td>Non-zero-primary chooser follow-up; slight <code>SRR</code> improvement over the earlier chooser, but no aggregate safety win.</td>
             </tr>
             <tr>
               <td><code>M1D</code> reference</td>
@@ -980,7 +1021,8 @@
               <td class="num">0.0103</td>
               <td class="num">0.1916</td>
               <td class="num">1.0404</td>
-              <td>Strong heuristic anchor; high primary-fix behavior with fidelity below the best factorized models.</td>
+              <td>Strong heuristic anchor; high primary-fix behavior with fidelity below the best factorized models.
+              </td>
             </tr>
           </tbody>
         </table>
@@ -1007,8 +1049,9 @@
             <p>
               The completed <code>M1D</code> is directionally promising, especially in dense slices,
               but the completed aggregate result is not enough to claim broad baseline dominance.
-              The running <code>M1C</code> follow-up will test whether chooser-side safety pressure
-              can improve this picture.
+              The completed non-zero-primary <code>M1C</code> follow-up lowers chooser-side
+              <code>SRR</code> slightly, but the gain comes with lower fidelity and primary-fix
+              behavior.
             </p>
           </div>
           <div class="card">
@@ -1209,30 +1252,14 @@
           <li>
             <strong>Can local safety objectives move the safety frontier?</strong>
             Partially. The completed <code>M1D</code> result is directionally promising in some
-            regimes, and the running <code>M1C</code> follow-up will test whether chooser-side safety
-            pressure improves the result.
+            regimes. The completed non-zero-primary <code>M1C</code> follow-up shows a small
+            chooser-side <code>SRR</code> reduction but not a broad safety win.
           </li>
           <li>
             <strong>What happens when global consistency is optimized directly?</strong>
             <code>G0</code> improves global satisfaction but sharply sacrifices fidelity.
           </li>
         </ol>
-
-        <h3>One-paragraph abstract candidate</h3>
-        <p>
-          We study neural repair of Wikidata constraint violations under two competing objectives:
-          fidelity to historical curator edits and symbolic safety of the post-edit graph. We propose
-          executable constraint factors, a factorized graph representation in which locally applicable
-          constraints act as typed satisfaction operators that inject pressure into message passing.
-          On a stratified Wikidata repair benchmark, factorized imitation substantially improves
-          historical edit prediction over a passive ESWC-style baseline. However, this fidelity gain
-          does not translate into lower secondary regression or higher global satisfaction, revealing
-          a mismatch between curator imitation and symbolic safety. Diagnostic masking analyses show
-          that factor pressure is learned and causally affects predictions, but mostly supports primary
-          repair and imitation rather than secondary no-regression. A global reranker improves
-          satisfaction at a large fidelity cost, establishing a fidelity-safety frontier for future
-          repair models.
-        </p>
       </section>
 
       <section id="relevance">
@@ -1280,20 +1307,19 @@
         <p>
           The next experiments should be chosen carefully because the full neural runs are expensive.
           The priority is therefore not a broad hyperparameter search. The priority is to run the
-          ablations that explain the mechanism, plus the already-started <code>M1C</code> follow-up
-          that tests whether chooser-side safety pressure changes the result.
+          ablations that explain the mechanism, plus candidate-oracle analysis to determine whether
+          the remaining bottleneck is candidate generation or candidate selection.
         </p>
 
-        <h3>Priority 1: Finish the updated <code>M1C</code> chooser run</h3>
+        <h3>Priority 1: Interpret the completed <code>M1C</code> chooser follow-up</h3>
         <p>
-          The current follow-up run is an <code>M1C</code> chooser variant with a stronger
-          secondary/safety term. Once it finishes, compare it against the completed
-          <code>M1C</code>, <code>A1</code>, and <code>B0</code> rows.
+          The completed follow-up uses a non-zero primary term. It lowers <code>SRR</code> slightly
+          relative to the earlier chooser run, but it also lowers micro-F1 and primary fix, and it
+          does not improve aggregate <code>GFR</code>.
         </p>
         <p>
-          The run is useful if it lowers <code>SRR</code>, improves <code>GFR</code>, or improves
-          dense-context safety without collapsing primary fix. If it only improves micro-F1, it should
-          be interpreted as another fidelity result rather than a safety result.
+          Treat this as a trade-off result, not as evidence that the current chooser objective solves
+          local safe repair.
         </p>
 
         <h3>Priority 2: Spend compute on ablations</h3>
