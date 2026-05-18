@@ -613,8 +613,8 @@
         </div>
         <div class="callout bad">
           <strong>Non-claim.</strong>
-          This report does not claim full Wikidata repair. It studies local statement-level repair under a six-slot add/delete abstraction. Qualifiers,
-          references, ranks, exceptions, constraint evolution, and T-Box repair are outside this local repair task unless explicitly added later.
+          This project does not claim full Wikidata repair. It studies local statement-level repair under a six-slot add/delete abstraction. Qualifiers,
+          references, ranks, exceptions, constraint evolution, and T-Box repair are outside this local repair task.
         </div>
       </section>
 
@@ -757,8 +757,8 @@
           <tbody>
             <tr>
               <td><code>B0</code></td>
-              <td>Passive learned baseline</td>
-              <td>Passive constraint context; edit imitation</td>
+              <td>Learned GNN baseline</td>
+              <td>Passive GNN with no factors; edit imitation</td>
               <td>How far a non-factorized model goes.</td>
             </tr>
             <tr>
@@ -787,19 +787,19 @@
             </tr>
             <tr class="section-break">
               <td><code>H1</code></td>
-              <td>Delete-focus control</td>
+              <td>Symbolic baseline: Delete-focus control</td>
               <td>Always delete the violating triple</td>
               <td>Whether G0 merely rediscovers deletion.</td>
             </tr>
             <tr>
               <td><code>H2</code></td>
-              <td>Conservative add heuristic</td>
+              <td>Symbolic baseline: Conservative add heuristic</td>
               <td>Add mirrored triples for inverse/symmetric cases</td>
               <td>How much specific constraint-shape logic helps.</td>
             </tr>
             <tr>
               <td><code>H3</code></td>
-              <td>Family-prior baseline</td>
+              <td>Symbolic baseline: Family-prior baseline</td>
               <td>Most common historical repair by constraint family</td>
               <td>How much behavior is explained by coarse priors.</td>
             </tr>
@@ -1046,10 +1046,27 @@
       <section id="diagnostics">
         <h2>8. Diagnostics: What the Factors Actually Do</h2>
         <p>
-          The diagnostics explain the mechanism behind the headline results. They show that the factors are not decorative: they learn satisfaction
-          signals and affect predictions. However, they are mostly used by the model for historical imitation and primary repair behavior.
+          The diagnostics explain the mechanism behind the headline results. They are not additional leaderboard metrics. They are tests of whether the
+          factor pathway learns meaningful constraint information, whether that information changes repair predictions, and whether the change is driven
+          by the primary violated constraint or by secondary constraints in the local context.
+        </p>
+        <p>
+          This matters because the main result has two parts that need to be reconciled: executable factors improve edit-slot imitation, but they do not
+          automatically improve aggregate symbolic safety. The diagnostics show that the factors are not decorative: they learn satisfaction signals and
+          affect predictions. However, the pressure is mostly used for historical imitation and primary repair behavior.
         </p>
         <h3>Factor semantics</h3>
+        <p>
+          Factor semantics <b>measures whether the learned factor heads can predict symbolic constraint satisfaction</b>. Each factor node outputs a satisfaction
+          probability for its local constraint instance. The diagnostic compares those neural predictions against labels produced by the symbolic
+          validators.
+        </p>
+        <p>
+          The <code>State</code> column identifies which graph state is being predicted. <code>pre</code> is the local graph before any repair is applied.
+          <code>post_gold</code> is the local graph after applying the historical curator edit. Strong results on <code>pre</code> show that the model
+          recognizes existing local constraint state; strong results on <code>post_gold</code> show that it also models the symbolic state associated with
+          historical repairs.
+        </p>
         <table class="tight-table">
           <thead>
             <tr>
@@ -1098,6 +1115,17 @@
         </div>
 
         <h3>Pressure masking</h3>
+        <p>
+          Pressure masking is an inference-time intervention. The same trained model is evaluated again after removing selected factor-to-variable
+          pressure messages. If performance changes substantially, the removed pressure pathway was causally important for the prediction. If performance
+          barely changes, the model was not relying strongly on that pathway.
+        </p>
+        <p>
+          <code>No factor pressure</code> removes all executable-factor feedback, leaving the model without factor-to-variable pressure messages.
+          <code>Secondary-only pressure</code> keeps pressure from secondary constraints while removing the primary/focal pressure pathway. This isolates
+          whether non-primary constraints can influence the edit decision on their own. The deltas report metric change relative to the unmasked model;
+          negative values mean the intervention hurt performance.
+        </p>
         <table class="tight-table">
           <thead>
             <tr>
