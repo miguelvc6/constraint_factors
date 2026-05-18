@@ -73,7 +73,8 @@ Appendix or exploratory variants such as policy-choice, factor-loss-only, untype
 
 ### Main results
 - `DFB`
-- `CSM`
+- `CFM`
+- `CDM`
 - `B0`
 - `A1`
 - `M1C`

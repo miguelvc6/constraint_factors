@@ -327,8 +327,11 @@ Always delete the violating triple.
 #### H2) AddMirrorBaseline (AMB)
 For inverse/symmetric constraints, add mirrored triple.
 
-#### H3) ConstraintShapeMajority (CSM)
-Memorize the most common repair for each constraint definition.
+#### H3) ConstraintFamilyMajority (CFM)
+Memorize the most common repair for each coarse constraint family, such as `single`, `inverse`, or `valueType`.
+
+#### H4) ConstraintDefinitionMajority (CDM)
+Memorize the most common repair for each concrete constraint definition. This is an IID/memorization reference, not a weak shape heuristic.
 
 ---
 
@@ -385,7 +388,8 @@ H2 should be evaluated with lightweight diagnostics in addition to final repair 
 | Main       | Slightly ↓ |      Same/↑ |          ↑ |     ↓↓ |        Low |
 | Global Fix |         ↓↓ |        High |         ↑↑ |      ↓ |         ↑↑ |
 | DFB        |        Low | High (some) |   Unstable |   High |       High |
-| CSM        |     Medium |      Medium |     Medium | Medium |        Low |
+| CFM        |        Low |      Medium |     Medium | Medium |        Low |
+| CDM        |     Medium |        High |     Medium | Medium |        Low |
 
 ### Heuristics
 #### DFB
@@ -397,10 +401,15 @@ H2 should be evaluated with lightweight diagnostics in addition to final repair 
 - Very high Fix Rate on inverse constraints
 - Low coverage elsewhere → poor overall performance
 
-#### CSM
-- Moderate to high Historical Fidelity (memorizes common repairs)
+#### CFM
+- Low to moderate Historical Fidelity from coarse family priors
+- Useful sanity check for how much is explained without concrete constraint IDs
+- Better generalization story than CDM, but intentionally weak
+
+#### CDM
+- Moderate to high Historical Fidelity by memorizing repeated concrete constraint definitions
 - Good Primary Fix Rate when repair patterns are stable
-- Limited generalization, moderate SRR
+- IID reference only; limited evidence of generalization to unseen constraints
 
 ---
 

@@ -14,7 +14,12 @@ from modules.models import BaseGraphModel
 
 logger = logging.getLogger(__name__)
 
-BASELINE_NAMES: Tuple[str, ...] = ("DeleteFocusBaseline", "AddMirrorBaseline", "ConstraintShapeMajorityBaseline")
+BASELINE_NAMES: Tuple[str, ...] = (
+    "DeleteFocusBaseline",
+    "AddMirrorBaseline",
+    "ConstraintDefinitionMajorityBaseline",
+    "ConstraintFamilyMajorityBaseline",
+)
 
 
 # ----------------------------
@@ -243,16 +248,16 @@ class AddMirrorBaseline(Baseline):
 
 
 # ----------------------------
-# (7) Constraint-Shape Majority (CSM)
+# Majority baselines
 # ----------------------------
 
 
-class ConstraintShapeMajorityBaseline(Baseline):
+class _PerKeyMajorityBaseline(Baseline):
     """
-    Learns, from training data, the modal repair per constraint type.
-    Requires per-sample:
-      - shape_id or constraint_shape_id (int)
-      - y labels present in training Data (Tensor [6])
+    Learns modal repair slots from training data for keys extracted by subclasses.
+
+    The majority is computed per output head. This mirrors the historical
+    slot-argmax evaluation setup used by the learned models.
     """
 
     def __init__(
@@ -269,22 +274,29 @@ class ConstraintShapeMajorityBaseline(Baseline):
             default_del_class,
             placeholders=placeholders,
         )
-        self.constraint_to_majority: Dict[int, List[int]] = {}
+        self.key_to_majority: Dict[Any, List[int]] = {}
         self.global_majority: List[int] = [self.default_add_class] * 3 + [self.default_del_class] * 3
+
+    @abstractmethod
+    def _extract_key(self, d: Data) -> Any | None:
+        ...
+
+    @property
+    def _display_name(self) -> str:
+        return type(self).__name__
 
     def fit(self, train_data: Optional[Iterable[Data]] = None) -> None:
         if train_data is None:
-            raise ValueError("CSM.fit(train_data=...) requires training data to compute majorities.")
+            raise ValueError(f"{self._display_name}.fit(train_data=...) requires training data.")
 
-        # Per-head counters
         global_counters = [Counter() for _ in range(6)]
-        shape_counters: Dict[int, List[Counter]] = defaultdict(lambda: [Counter() for _ in range(6)])
+        key_counters: Dict[Any, List[Counter]] = defaultdict(lambda: [Counter() for _ in range(6)])
 
         n_used = 0
         for d in train_data:
-            sid = _extract_shape_id(d)
+            key = self._extract_key(d)
             y = getattr(d, "y", None)
-            if sid is None or y is None:
+            if key is None or y is None:
                 continue
             if isinstance(y, torch.Tensor):
                 y = y.detach().cpu().view(-1).tolist()
@@ -296,35 +308,61 @@ class ConstraintShapeMajorityBaseline(Baseline):
                 cls = int(cls)
                 if 0 <= cls < self.num_graph_nodes:
                     global_counters[i][cls] += 1
-                    shape_counters[sid][i][cls] += 1
+                    key_counters[key][i][cls] += 1
 
-        # Fallback to defaults if nothing usable
         if n_used == 0:
             return
 
         def argmax_counter(c: Counter, fallback: int) -> int:
             if not c:
                 return fallback
-            # ties resolved arbitrarily by max over (count, -class)
             return max(c.items(), key=lambda kv: (kv[1], -kv[0]))[0]
 
-        # Global majorities
         fallbacks = [self.default_add_class] * 3 + [self.default_del_class] * 3
         self.global_majority = [argmax_counter(global_counters[i], fallbacks[i]) for i in range(6)]
 
-        # Per-shape majorities with global fallback per head
-        for sid, head_counters in shape_counters.items():
-            self.constraint_to_majority[int(sid)] = [
+        for key, head_counters in key_counters.items():
+            self.key_to_majority[key] = [
                 argmax_counter(head_counters[i], self.global_majority[i]) for i in range(6)
             ]
 
     def predict_one(self, d: Data) -> torch.Tensor:
-        sid = _extract_shape_id(d)
-        if sid is not None and sid in self.constraint_to_majority:
-            y = self.constraint_to_majority[sid]
+        key = self._extract_key(d)
+        if key is not None and key in self.key_to_majority:
+            y = self.key_to_majority[key]
         else:
             y = self.global_majority
         return torch.tensor(y, dtype=torch.long)
+
+
+class ConstraintDefinitionMajorityBaseline(_PerKeyMajorityBaseline):
+    """
+    Learns, from training data, the modal repair per concrete constraint definition.
+
+    This is an IID/memorization baseline: in the parquet loader, ``shape_id`` is
+    the concrete ``constraint_id``.
+    Requires per-sample:
+      - shape_id or constraint_shape_id (int)
+      - y labels present in training Data (Tensor [6])
+    """
+
+    def _extract_key(self, d: Data) -> int | None:
+        return _extract_shape_id(d)
+
+
+class ConstraintFamilyMajorityBaseline(_PerKeyMajorityBaseline):
+    """
+    Learns, from training data, the modal repair per coarse constraint family.
+
+    This is the true shape/family majority baseline: keys are values such as
+    ``inverse``, ``single``, or ``valueType``, not concrete constraint IDs.
+    Requires per-sample:
+      - constraint_type / constraint_kind / shape_kind (str)
+      - y labels present in training Data (Tensor [6])
+    """
+
+    def _extract_key(self, d: Data) -> str | None:
+        return _extract_constraint_type(d)
 
 
 # ----------------------------
@@ -411,16 +449,26 @@ def _build_cli_baseline(
             default_del_class=default_del_class,
             placeholders=placeholders,
         )
-    if name == "ConstraintShapeMajorityBaseline":
-        csm = ConstraintShapeMajorityBaseline(
+    if name == "ConstraintDefinitionMajorityBaseline":
+        definition_majority = ConstraintDefinitionMajorityBaseline(
             num_graph_nodes=num_graph_nodes,
             default_add_class=default_add_class,
             default_del_class=default_del_class,
             placeholders=placeholders,
         )
         if fit_csm_on_train and train_data is not None:
-            csm.fit(train_data)
-        return csm
+            definition_majority.fit(train_data)
+        return definition_majority
+    if name == "ConstraintFamilyMajorityBaseline":
+        family_majority = ConstraintFamilyMajorityBaseline(
+            num_graph_nodes=num_graph_nodes,
+            default_add_class=default_add_class,
+            default_del_class=default_del_class,
+            placeholders=placeholders,
+        )
+        if fit_csm_on_train and train_data is not None:
+            family_majority.fit(train_data)
+        return family_majority
     raise ValueError(f"Unknown baseline: {name}")
 
 

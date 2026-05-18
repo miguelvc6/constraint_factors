@@ -16,7 +16,7 @@ Conceptual-to-technical mapping for this paper line:
 - conceptual `M0 ESWC model` -> technical `B0`
 - conceptual `M1 Main model` -> technical `A1`, `M1C`, and `M1D`
 - conceptual `M2 Global Fix model` -> technical `G0`
-- heuristic results -> `DFB`, `AMB`, `CSM`
+- heuristic results -> `DFB`, `AMB`, `CFM`, `CDM`
 
 `A1` is the representation-only step inside the broader conceptual `M1` story, while `M1C` and `M1D` are the two decision-level safe-factor realizations of that same model family.
 
@@ -73,7 +73,7 @@ This order avoids spending time on secondary model families before the main mode
 
 Result coverage relative to the conceptual docs:
 
-- heuristic references: `DFB`, `AMB`, `CSM`
+- heuristic references: `DFB`, `AMB`, `CFM`, `CDM`
 - prior passive-context baseline: `B0`
 - representation effect inside the main executable-factor story: `A1`
 - main safe-factor results: `M1C`, `M1D`
@@ -262,7 +262,8 @@ This gives the reference results for:
 
 - `DFB`
 - `AMB`
-- `CSM`
+- `CFM`
+- `CDM`
 
 If `AMB` is not used in the final main table, keep it as appendix support.
 
@@ -530,7 +531,7 @@ uv run src/09_eval.py \
 
 Only the following runs should feed the paper tables:
 
-- heuristic baselines: `DFB`, `CSM`, optional `AMB`
+- heuristic baselines: `DFB`, `CFM`, `CDM`, optional `AMB`
 - learned models:
   - `B0`
   - `A1`
@@ -546,7 +547,7 @@ These runs are sufficient to support the conceptual paper claims:
 - `A1` tests whether executable-factor structure helps before safety-aware decision logic
 - `M1C` and `M1D` are the main safe-factor results
 - `G0` serves as the global-satisfaction reference / upper-bound style comparison
-- `DFB`, `AMB`, and `CSM` provide heuristic anchors
+- `DFB`, `AMB`, `CFM`, and `CDM` provide heuristic anchors
 
 ## 6. Minimal reproducibility checklist
 
@@ -644,7 +645,7 @@ This should be implemented as a read-only analysis script that reuses the existi
 
 Recommended script interface:
 
-If `scripts/analyze_candidate_oracle.py` does not exist yet, add it as the implementation of this diagnostic rather than folding oracle logic into `src/09_eval.py`.
+The repository provides this diagnostic as `scripts/analyze_candidate_oracle.py`.
 
 ```bash
 uv run scripts/analyze_candidate_oracle.py \

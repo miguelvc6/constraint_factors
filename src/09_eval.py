@@ -1369,7 +1369,7 @@ def parse_args():
     parser.add_argument(
         "--run-baselines",
         action="store_true",
-        help="Run the three baselines (DFB, AMB, CSM).",
+        help="Run heuristic and majority baselines (DFB, AMB, definition-majority, family-majority).",
     )
     parser.add_argument(
         "--dataset",

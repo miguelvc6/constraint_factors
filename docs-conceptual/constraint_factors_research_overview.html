@@ -238,6 +238,44 @@
       margin-top: -8px;
     }
 
+    .sort-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 12px 0 8px;
+    }
+
+    .sort-controls span {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .sort-controls button {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #ffffff;
+      color: #21344d;
+      cursor: pointer;
+      font: inherit;
+      font-size: 13px;
+      padding: 5px 9px;
+    }
+
+    .sort-controls button:hover,
+    .sort-controls button:focus-visible {
+      border-color: var(--accent);
+      outline: none;
+    }
+
+    .sort-controls button.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: #15344f;
+      font-weight: 650;
+    }
+
     .status {
       font-weight: 650;
     }
@@ -341,6 +379,52 @@
         }
       }
     };
+  </script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('[data-sort-table]').forEach((table) => {
+        const controls = document.querySelector(`[data-sort-controls="${table.id}"]`);
+        const tbody = table.querySelector('tbody');
+        if (!controls || !tbody) {
+          return;
+        }
+
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.forEach((row, index) => {
+          row.dataset.narrative = String(index);
+        });
+
+        const sortRows = (key, direction) => {
+          const sorted = [...rows].sort((a, b) => {
+            if (key === 'narrative') {
+              return Number(a.dataset.narrative) - Number(b.dataset.narrative);
+            }
+            if (key === 'metricName') {
+              return (a.dataset.metricName || '').localeCompare(b.dataset.metricName || '');
+            }
+            const aValue = Number(a.dataset[key]);
+            const bValue = Number(b.dataset[key]);
+            if (Number.isNaN(aValue) || Number.isNaN(bValue)) {
+              return 0;
+            }
+            return direction === 'asc' ? aValue - bValue : bValue - aValue;
+          });
+          sorted.forEach((row) => tbody.appendChild(row));
+        };
+
+        controls.querySelectorAll('button[data-sort-key]').forEach((button) => {
+          button.addEventListener('click', () => {
+            controls.querySelectorAll('button').forEach((item) => {
+              item.classList.remove('active');
+              item.removeAttribute('aria-pressed');
+            });
+            button.classList.add('active');
+            button.setAttribute('aria-pressed', 'true');
+            sortRows(button.dataset.sortKey, button.dataset.sortDirection || 'desc');
+          });
+        });
+      });
+    });
   </script>
   <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
 </head>
@@ -759,10 +843,17 @@
             </tr>
             <tr>
               <td><code>H3</code></td>
-              <td>Constraint-shape majority heuristic</td>
+              <td>Constraint-family majority heuristic</td>
               <td>Symbolic/statistical rule baseline</td>
-              <td>Use the most common historical repair for each constraint shape</td>
-              <td>How much repair behavior is explained by constraint-family priors?</td>
+              <td>Use the most common historical repair for each coarse constraint family</td>
+              <td>How much repair behavior is explained without concrete constraint IDs?</td>
+            </tr>
+            <tr>
+              <td><code>H4</code></td>
+              <td>Constraint-definition majority heuristic</td>
+              <td>IID/statistical reference</td>
+              <td>Use the most common historical repair for each concrete constraint definition</td>
+              <td>How much repair behavior is explained by repeated constraint definitions?</td>
             </tr>
           </tbody>
         </table>
@@ -874,7 +965,12 @@
           measure what <code>Delta</code> does to the symbolic constraint state after it is applied.
           The project shows that those two evaluations do not necessarily agree.
         </p>
-        <table>
+        <div class="sort-controls" data-sort-controls="evaluation-metrics-table" aria-label="Sort evaluation metric definitions">
+          <span>Sort:</span>
+          <button type="button" class="active" data-sort-key="narrative" aria-pressed="true">Narrative</button>
+          <button type="button" data-sort-key="metricName">Metric A-Z</button>
+        </div>
+        <table id="evaluation-metrics-table" data-sort-table>
           <thead>
             <tr>
               <th>Metric</th>
@@ -883,33 +979,33 @@
             </tr>
           </thead>
           <tbody>
-            <tr>
-              <td>Micro-F1</td>
+            <tr data-metric-name="Micro-F1">
+              <td>Micro-F1 &uarr;</td>
               <td>Historical edit-slot fidelity.</td>
               <td>Higher means better imitation of curator edits.</td>
             </tr>
-            <tr>
-              <td>Primary fix rate</td>
+            <tr data-metric-name="Primary fix rate">
+              <td>Primary fix rate &uarr;</td>
               <td>Whether the predicted edit fixes the original violation.</td>
               <td>Higher means better intent fulfillment.</td>
             </tr>
-            <tr>
-              <td>GFR</td>
+            <tr data-metric-name="GFR">
+              <td>GFR &uarr;</td>
               <td>Global fix rate over the local constraint set after applying the edit.</td>
               <td>Higher means better local symbolic satisfaction.</td>
             </tr>
-            <tr>
-              <td>SRR</td>
-              <td>Secondary regression rate.</td>
-              <td>Lower means fewer previously satisfied secondary constraints are broken.</td>
-            </tr>
-            <tr>
-              <td>SIR</td>
+            <tr data-metric-name="SIR">
+              <td>SIR &uarr;</td>
               <td>Secondary improvement rate.</td>
               <td>Higher means more previously unsatisfied secondary constraints become satisfied.</td>
             </tr>
-            <tr>
-              <td>Disruption</td>
+            <tr data-metric-name="SRR">
+              <td>SRR &darr;</td>
+              <td>Secondary regression rate.</td>
+              <td>Lower means fewer previously satisfied secondary constraints are broken.</td>
+            </tr>
+            <tr data-metric-name="Disruption">
+              <td>Disruption &darr;</td>
               <td>Mean number of edit operations or changed triples.</td>
               <td>Lower usually means more edit-minimal repairs.</td>
             </tr>
@@ -929,97 +1025,107 @@
           supports: historical imitation, primary repair, secondary no-regression, or global local
           consistency.
         </p>
-        <table>
+        <div class="sort-controls" data-sort-controls="current-results-table" aria-label="Sort current results">
+          <span>Sort:</span>
+          <button type="button" class="active" data-sort-key="narrative" aria-pressed="true">Narrative</button>
+          <button type="button" data-sort-key="primary">Primary Fix</button>
+          <button type="button" data-sort-key="microF1">Micro-F1</button>
+          <button type="button" data-sort-key="gfr">GFR</button>
+          <button type="button" data-sort-key="sir">SIR</button>
+          <button type="button" data-sort-key="srr" data-sort-direction="asc">SRR</button>
+          <button type="button" data-sort-key="disruption" data-sort-direction="asc">Disruption</button>
+        </div>
+        <table id="current-results-table" data-sort-table>
           <thead>
             <tr>
               <th>Model</th>
-              <th class="num">Primary Fix</th>
-              <th class="num">Micro-F1</th>
-              <th class="num">GFR</th>
-              <th class="num">SRR</th>
-              <th class="num">SIR</th>
-              <th class="num">Disruption</th>
+              <th class="num">Primary Fix &uarr;</th>
+              <th class="num">Micro-F1 &uarr;</th>
+              <th class="num">GFR &uarr;</th>
+              <th class="num">SIR &uarr;</th>
+              <th class="num">SRR &darr;</th>
+              <th class="num">Disruption &darr;</th>
               <th>Interpretation</th>
             </tr>
           </thead>
           <tbody>
-            <tr>
+            <tr data-primary="0.8603" data-micro-f1="0.5434" data-gfr="0.8705" data-sir="0.1925" data-srr="0.0097" data-disruption="1.0036">
               <td><code>B0</code></td>
               <td class="num">0.8603</td>
               <td class="num">0.5434</td>
               <td class="num">0.8705</td>
-              <td class="num">0.0097</td>
               <td class="num">0.1925</td>
+              <td class="num">0.0097</td>
               <td class="num">1.0036</td>
               <td>Weakest learned fidelity, unexpectedly strong aggregate safety baseline.</td>
             </tr>
-            <tr>
+            <tr data-primary="0.8589" data-micro-f1="0.6785" data-gfr="0.8638" data-sir="0.1397" data-srr="0.0128" data-disruption="1.0330">
               <td><code>A1</code></td>
               <td class="num">0.8589</td>
               <td class="num">0.6785</td>
               <td class="num">0.8638</td>
-              <td class="num">0.0128</td>
               <td class="num">0.1397</td>
+              <td class="num">0.0128</td>
               <td class="num">1.0330</td>
               <td>Strong representation win for imitation, but worse symbolic safety than <code>B0</code>.</td>
             </tr>
-            <tr>
+            <tr data-primary="0.8155" data-micro-f1="0.6198" data-gfr="0.8629" data-sir="0.1158" data-srr="0.0132" data-disruption="1.0663">
               <td><code>M1C</code></td>
               <td class="num">0.8155</td>
               <td class="num">0.6198</td>
               <td class="num">0.8629</td>
-              <td class="num">0.0132</td>
               <td class="num">0.1158</td>
+              <td class="num">0.0132</td>
               <td class="num">1.0663</td>
               <td>Non-zero-primary chooser follow-up; slight <code>SRR</code> improvement over the earlier chooser, but no aggregate safety win.</td>
             </tr>
-            <tr>
+            <tr data-primary="0.8588" data-micro-f1="0.6772" data-gfr="0.8661" data-sir="0.1396" data-srr="0.0103" data-disruption="1.0274">
               <td><code>M1D</code> reference</td>
               <td class="num">0.8588</td>
               <td class="num">0.6772</td>
               <td class="num">0.8661</td>
-              <td class="num">0.0103</td>
               <td class="num">0.1396</td>
+              <td class="num">0.0103</td>
               <td class="num">1.0274</td>
               <td>Closest practical safety variant, but not a decisive aggregate win over <code>B0</code>.</td>
             </tr>
-            <tr>
+            <tr data-primary="0.7174" data-micro-f1="0.2804" data-gfr="0.9098" data-sir="0.2441" data-srr="0.0091" data-disruption="1.0000">
               <td><code>G0</code></td>
               <td class="num">0.7174</td>
               <td class="num">0.2804</td>
               <td class="num">0.9098</td>
-              <td class="num">0.0091</td>
               <td class="num">0.2441</td>
+              <td class="num">0.0091</td>
               <td class="num">1.0000</td>
               <td>High-consistency reference: best <code>GFR</code>, but fidelity collapses.</td>
             </tr>
-            <tr>
+            <tr data-primary="0.7174" data-micro-f1="0.2804" data-gfr="0.9098" data-sir="0.2441" data-srr="0.0091" data-disruption="1.0000">
               <td><code>H1</code> DeleteFocusBaseline</td>
               <td class="num">0.7174</td>
               <td class="num">0.2804</td>
               <td class="num">0.9098</td>
-              <td class="num">0.0091</td>
               <td class="num">0.2441</td>
+              <td class="num">0.0091</td>
               <td class="num">1.0000</td>
               <td>Deletion-focused heuristic; strong global satisfaction but low historical fidelity.</td>
             </tr>
-            <tr>
+            <tr data-primary="0.5157" data-micro-f1="0.0503" data-gfr="0.8544" data-sir="0.0001" data-srr="0.0043" data-disruption="0.1047">
               <td><code>H2</code> AddMirrorBaseline</td>
               <td class="num">0.5157</td>
               <td class="num">0.0503</td>
               <td class="num">0.8544</td>
-              <td class="num">0.0043</td>
               <td class="num">0.0001</td>
+              <td class="num">0.0043</td>
               <td class="num">0.1047</td>
               <td>Very conservative mirror-add rule; low disruption and low regression, but weak fidelity.</td>
             </tr>
-            <tr>
-              <td><code>H3</code> ConstraintShapeMajority</td>
+            <tr data-primary="0.9037" data-micro-f1="0.6482" data-gfr="0.8700" data-sir="0.1916" data-srr="0.0103" data-disruption="1.0404">
+              <td><code>H4</code> ConstraintDefinitionMajority</td>
               <td class="num">0.9037</td>
               <td class="num">0.6482</td>
               <td class="num">0.8700</td>
-              <td class="num">0.0103</td>
               <td class="num">0.1916</td>
+              <td class="num">0.0103</td>
               <td class="num">1.0404</td>
               <td>Strong heuristic anchor; high primary-fix behavior with fidelity below the best factorized models.
               </td>
