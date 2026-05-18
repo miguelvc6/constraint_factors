@@ -2,7 +2,7 @@
 
 Executable constraint factors for neuro-symbolic knowledge graph repair.
 
-This repository studies whether local KG repair models can reduce collateral constraint damage by representing constraints as first-class executable factor nodes inside per-violation subgraphs. The codebase includes the full research pipeline: dataset preparation, constraint metadata construction, factor labeling, graph materialization, baseline evaluation, learned models, and paper-facing experiment scheduling.
+This repository studies the fidelity-safety gap in local KG repair: executable constraint factors improve historical repair imitation, but symbolic repair safety and non-vacuous evidence preservation must be evaluated as separate objectives. The codebase includes the full research pipeline: dataset preparation, constraint metadata construction, factor labeling, graph materialization, baseline evaluation, learned models, and paper-facing experiment scheduling.
 
 ## Research Scope
 
@@ -10,9 +10,9 @@ The project focuses on local repair in collaborative knowledge graphs, with Wiki
 
 Core questions:
 
-- Can executable local constraint factors improve repair quality beyond passive constraint context?
-- Can models preserve historical curator fidelity while reducing secondary regressions?
-- How do factorized proposal models compare with chooser-based and direct-loss safe repair objectives?
+- Can executable local constraint factors improve historical repair imitation beyond passive constraint context?
+- Does better curator-edit imitation imply safer post-edit symbolic graph state?
+- How do factorized proposal models compare with chooser-based, direct-loss, global-satisfaction, and delete-focus references?
 
 The canonical paper-facing model surface is:
 
@@ -210,7 +210,6 @@ Documentation is intentionally split into two areas:
 Recommended entry points:
 
 - [docs-conceptual/00-constraint_factors.md](docs-conceptual/00-constraint_factors.md)
-- [docs-conceptual/00-results_aligned_constraint_factors.md](docs-conceptual/00-results_aligned_constraint_factors.md)
 - [docs-conceptual/constraint_factors_research_overview.html](docs-conceptual/constraint_factors_research_overview.html)
 - [docs-conceptual/constraint_types.md](docs-conceptual/constraint_types.md)
 - [docs-technical/00_models_and_evaluation_matrix.md](docs-technical/00_models_and_evaluation_matrix.md)

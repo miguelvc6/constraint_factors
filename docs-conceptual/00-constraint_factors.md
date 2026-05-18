@@ -1,511 +1,609 @@
-# Executable Constraint Factors for Neuro-Symbolic KG Repair
+# Executable Constraint Factors and the Fidelity-Safety Gap
 
-This document is the conceptual research framing for executable constraint factors. Current implementation details, code-level boundaries, and paper-surface model status belong in [docs-technical/00-constraint_factors.md](/home/mvazquez/constraint_factors/docs-technical/00-constraint_factors.md).
+This document is the canonical conceptual framing for the constraint-factors
+project. It records the current paper narrative: executable constraint factors
+are valuable because they improve historical repair imitation and reveal where
+imitation, symbolic safety, and non-vacuous repair quality diverge.
 
-## 1) Research Idea, Main Hypothesis, Scientific Contribution
+Current implementation details, code-level boundaries, and run status belong in
+[docs-technical/00-constraint_factors.md](/home/mvazquez/constraint_factors/docs-technical/00-constraint_factors.md).
+A browser-readable paper overview is available at
+[constraint_factors_research_overview.html](/home/mvazquez/constraint_factors/docs-conceptual/constraint_factors_research_overview.html).
+Earlier hypothesis documents have been moved to
+[docs-conceptual/deprecated/](/home/mvazquez/constraint_factors/docs-conceptual/deprecated/).
+
+## 1) Research Idea, Main Thesis, Scientific Contribution
 
 ### Core idea
-Extend *structure-aware neural repair* for collaborative Knowledge Graphs (KGs) by representing **constraints as first-class executable factor nodes** inside the per-violation subgraph. These factors are not passive context nodes; they perform **typed, reusable constraint evaluation** and inject **constraint pressure signals** into message passing.
 
-This builds on the previous ESWC work where:
-- the violated constraint appeared in the subgraph as a **simple node** (mostly as a connector),
-- and the model predicted **historical edit actions** (add/delete) for a single repair step.
+Extend structure-aware neural repair for collaborative knowledge graphs by
+representing Wikidata constraints as first-class executable factor nodes inside
+each violation-centered subgraph.
 
-### Main hypothesis
-**H1 (Executable constraints reduce collateral damage):**  
-By internalizing constraint semantics as executable factors, a repair model can preserve historical fidelity and primary-fix performance while **reducing regressions on secondary locally-applicable constraints**.
+These factors are not passive context labels. Each local constraint instance is
+represented as a typed factor with:
 
-**H2 (Constraint semantics become compositional):**  
-Constraint-type–specific factor functions can learn reusable validation operators that transfer across constraint instances and enable principled reasoning over multiple constraints simultaneously.
+- a constraint family, such as `single`, `conflictWith`, or `valueType`;
+- a scope over subject, predicate, object, or value nodes;
+- a learned satisfaction head;
+- role-conditioned pressure messages back to the variables in its scope.
+
+The factors are learned neural approximations of local constraint behavior. The
+grounded post-edit evaluation still uses symbolic validators.
+
+### Current thesis
+
+**Historical repair fidelity and symbolic repair safety are distinct objectives.**
+Executable constraint factors improve historical edit imitation, and diagnostic
+experiments show that their pressure signals affect predictions. However, better
+imitation does not automatically produce safer post-edit graphs. Conversely,
+directly optimizing local post-edit satisfaction can collapse into deleting the
+violating statement.
+
+The paper should therefore argue for a multi-axis evaluation framework for KG
+repair rather than claim that the current architecture has solved safe repair.
 
 ### Scientific contribution
-1. **Subgraph formulation upgrade:** from passive constraint nodes to **factor-graph constraint operators**.
-2. **Intent-aware training objective:** enforce primary repair while regularizing secondary constraints via **no-regression** rather than hard satisfaction.
-3. **Evaluation beyond single-constraint repair:** introduce metrics for secondary regressions and global consistency to measure collateral effects.
-4. **Trade-off analysis:** demonstrate a Pareto frontier between curator fidelity and global constraint satisfaction.
 
-We do not assume that all applicable constraints should be satisfied after every repair. In collaborative knowledge graphs, constraints are soft and repairs are intent-driven: editors typically address one violation at a time, even if other constraints remain unsatisfied. Our goal is therefore not global consistency, but locally improving the graph state without introducing unnecessary regressions.
+1. **Representation result:** executable constraint factors improve historical
+   repair prediction over a passive constraint-context baseline.
+2. **Evaluation result:** higher historical fidelity does not imply better
+   local symbolic safety.
+3. **Degeneracy result:** local satisfaction alone is an unsafe repair objective
+   because it can reward deleting the evidence that made the violation visible.
+4. **Diagnostic result:** factor satisfaction heads learn useful signals, and
+   pressure masking shows that factor messages are causally used, but mostly for
+   imitation and primary repair behavior rather than secondary no-regression.
+5. **Benchmark contribution:** the project separates historical fidelity,
+   primary repair, local satisfaction, secondary improvement/regression, edit
+   disruption, and non-vacuity.
+
+We do not assume that every applicable constraint should be satisfied after a
+local repair. Wikidata constraints are soft, evolving, and sometimes incomplete.
+The goal is to understand when a local edit imitates historical repair behavior,
+when it improves the symbolic graph state, and when it merely removes evidence.
 
 ---
 
 ## 2) Paper Narrative Summary
 
 ### Problem
-Collaborative KGs (e.g., Wikidata) rely on soft, evolving constraints. Existing neural repair systems learn from historical edits but are **myopic**: they optimize repairing one violated constraint at a time and can unintentionally **break other constraints** in the local context.
 
-### Limitation of prior work
-Prior structure-aware repair models:
-- condition on one violated constraint instance,
-- produce edits that match human behavior,
-- do not explicitly model other constraints that might be impacted by the edit,
-- thus do not control collateral violations.
+Collaborative KGs such as Wikidata use property constraints to flag suspicious
+statements. Historical curator edits are useful supervision, but they are not a
+complete proxy for repair quality. A curator-like edit can preserve or introduce
+secondary violations, while a highly satisfying symbolic edit can be vacuous if
+it deletes the statement under repair.
 
-### Proposed solution
-Introduce **Executable Constraint Factors**:
-- expand the per-instance subgraph to include all **locally applicable constraints** as **factor nodes**,
-- learn **one shared factor function per constraint type** that evaluates constraint satisfaction,
-- incorporate factor-to-variable feedback during message passing,
-- train with an **intent-aware loss** that prioritizes fixing the primary constraint while discouraging secondary constraint regressions.
+### Limitation of prior framing
 
-Crucially, this research direction does **not** require a fully neural candidate-level safety estimator for arbitrary predicted edits. The core paper story is already complete if executable factors shape the proposal model while primary and secondary repair effects are measured with a shared symbolic evaluator.
+The original project framing expected executable factors to directly reduce
+collateral damage while preserving curator fidelity. The evaluated results are
+more interesting and more cautious:
+
+- factorized models improve historical edit-slot prediction;
+- aggregate symbolic safety does not automatically improve;
+- direct safety objectives are promising but not yet decisive;
+- global/local satisfaction optimization is vulnerable to a delete-focus
+  degeneracy.
+
+### Revised solution framing
+
+The method is best presented as a constraint-aware representation and diagnostic
+instrument:
+
+- it makes local constraint state available to the neural repair model;
+- it tests whether learned constraint pressure improves edit decisions;
+- it exposes a measurable fidelity-safety gap;
+- it motivates future decision-level repair objectives with explicit
+  non-vacuity and secondary no-regression controls.
 
 ### Key claims to validate
-- The proposed model improves **secondary regression rate** and **global satisfaction** without sacrificing primary fix rate.
-- A "Global Fix Model" provides an upper bound on global satisfaction but sacrifices fidelity.
+
+- Executable factors improve historical repair modeling.
+- Better historical repair modeling does not imply safer post-edit local graphs.
+- Local satisfaction must be evaluated separately from repair usefulness.
+- Secondary no-regression requires decision-level control beyond representation
+  learning.
 
 ---
 
 ## 3) Dataset Construction
 
 ### Starting point
-Use the historical Wikidata constraint repair corpus (violation instances paired with human repairs).
+
+Use the historical Wikidata constraint repair corpus: violation instances paired
+with human repair edits.
 
 Each instance includes:
-- a violating triple `(s, p, o)` (focus triple),
-- an optional conflicting triple `(s', p', o')`,
-- a constraint identifier/type and definition metadata,
-- a local neighborhood context around involved entities,
-- the ground-truth historical repair edit `Δ*` as add/delete operations.
+
+- a violating focus triple `(s, p, o)`;
+- an optional conflicting triple `(s', p', o')`;
+- a constraint identifier, family, and definition metadata;
+- a local neighborhood around the involved entities;
+- the historical repair edit `Delta*` as add/delete operations.
 
 ### Paper benchmark slice
+
 The preprocessing pipeline can produce roughly 1.91M local repair instances for
-the full min-occurrence-100 corpus. For the paper experiments, the benchmark is
-defined as a fixed stratified slice of this produced corpus rather than as the
-entire produced corpus.
+the full min-occurrence-100 corpus. The paper-facing benchmark is a deterministic
+stratified slice of roughly 1M instances rather than the full produced corpus.
 
-The paper slice keeps about half of each stratum, yielding an approximately
-1M-instance benchmark. Strata combine:
-- the train/validation/test split,
-- the primary constraint family,
-- and the number of executable constraints attached to the local subgraph.
+The strata combine:
 
-This design keeps the benchmark computationally tractable while preserving the
-factor most directly tied to the paper's hypothesis: local constraint density.
-The benchmark should therefore be described as a deterministic stratified
-benchmark slice sampled from the full produced corpus, not as the full produced
-corpus itself.
+- train/validation/test split;
+- primary constraint family;
+- local executable-constraint density.
 
-### Extensions needed for this work
-1. **Constraint retrieval** (schema-level):
-   - Query Wikidata (or cached constraint registry) for constraint instances associated with:
-     - properties in the focus/conflicting triples,
-     - optionally properties in the 1-hop neighborhood.
-2. **Constraint validation labels**:
-   - For each applicable constraint instance `c` in the subgraph, compute satisfaction on:
-     - pre-repair state `G^-`,
-     - post-repair state `G^+` (after applying the historical edit `Δ*`).
-   - These become binary labels `s_c^-` and `s_c^+`.
+This keeps the benchmark computationally tractable while preserving the factor
+most directly tied to the paper's hypothesis: how local constraint density
+changes repair behavior.
 
-### Locally applicable constraint set `C_local`
-Two viable definitions:
+### Locally applicable constraint set
 
-**(A) Predicate-scope constraints:**  
-Include constraint instances attached to the properties appearing in the focus/conflicting triples.
-This is the narrowest option and matches a repair view in which only the focus/conflict predicates are considered actionable.
+For each instance, define a local constraint set:
 
-**(B) Local closure (broader):**  
-Include constraint instances attached to any property within 1-hop of the shared entities involved in the violation.
-This broader option is motivated by the fact that repairs are not always limited to deleting the focus/conflict triple: some constraint families repair a violation by adding or deleting a different statement on one of the same local entities (for example type-, inverse-, or required-statement-style repairs). Local closure therefore aims to capture constraints that may be affected by such local but off-predicate edits.
+$$
+C_{\mathrm{local}} = \{c^*, c_1, \ldots, c_m\}
+$$
 
-### Repository instantiation for the current paper line
+where `c*` is the primary violated constraint and the remaining constraints are
+locally applicable secondary constraints.
 
-In the current repository, the paper-facing pipeline uses the bounded local-closure version through the technical setting `constraint_scope=local` in `05_constraint_labeler.py` and `06_graph.py`.
+The current paper-facing pipeline uses the bounded local-closure version through
+`constraint_scope=local`. A narrower focus-scoped alternative is exposed through
+the technical `focus` scope.
 
-The narrower predicate/focus-scoped alternative is exposed separately through the technical `focus` scope. Accordingly, `local` should be read as bounded local closure, not as the conservative predicate-only definition and not as an unbounded neighborhood expansion.
+### Constraint labels
+
+For every local constraint `c`, symbolic validators compute satisfaction on:
+
+- the pre-repair local graph `G^-`;
+- the post-gold graph after applying the historical edit `Delta*`;
+- the post-predicted graph after applying a model edit `Delta`.
+
+These labels support both auxiliary factor supervision and post-edit symbolic
+evaluation.
 
 ---
 
 ## 4) Per-Instance Subgraph Model
 
-Each violation instance yields a directed heterogeneous graph:
-
-### Variable nodes (data graph)
-- Entity nodes (items)
-- Predicate nodes (properties) *(optional as nodes; needed if factors connect via predicates)*
-- Literal nodes (values)
-- Optional: role-specific nodes for focus triple elements
-
-### Factor nodes (constraint graph)
-For each constraint instance `c ∈ C_local`, add a constraint factor node:
-- typed by constraint family `t(c)` (e.g., `conflictWith`, `single`, `valueType`, ...),
-- parameterized by a shared function `f_{t(c)}`.
-
-### Edges
-**Variable → Variable edges**
-- Standard KG edges from neighborhood triples, using either:
-  - flattened form (`s → p → o`) or
-  - multi-relational form (`s → o` with `p` as edge attribute).
-  (This work prefers multi-relational representation for topology fidelity.)
-
-**Variable → Factor edges**
-- Define the **scope** of each constraint factor:
-  - e.g., for `conflictWith(p,q)` connect `{p,q}` (and optionally the subject `s`),
-  - for `single(p)` connect `{p, s}` (and all values connected to `(s,p,*)` in subgraph).
-
-**Factor → Variable edges**
-- Enables factor feedback (“constraint pressure”) into message passing.
-- Can be represented explicitly, or implicitly applied as directed messages.
-
----
-
-## 5) Per-Instance Prediction Objective and Labels
-
-### Primary prediction task (Main model and ESWC-style models)
-Predict a repair edit operation `Δ` in the **six-slot add/delete format**:
-$$
-\hat{\Delta} = (\hat{y}_{s+},\hat{y}_{p+},\hat{y}_{o+},\hat{y}_{s-},\hat{y}_{p-},\hat{y}_{o-})
-$$
-Labels:
-- `Δ*` from historical edit logs.
-
-### Auxiliary prediction task (factor satisfaction)
-For each constraint factor node `c`, predict satisfaction probability:
-$$
-\hat{s}_c(G) \in [0,1]
-$$
-Labels:
-- `s_c^-` from symbolic validation on `G^-`
-- `s_c^+` from symbolic validation on `G^+` (historical fix applied)
-
-**Primary constraint:** the violated one, `c*`, has `s_{c*}^- = 0` by construction.
-
----
-
-## 6) Variables and Factor Nodes
+Each repair instance becomes a heterogeneous graph.
 
 ### Variable nodes
-Hold embeddings for:
-- entities / literals,
-- predicates (if modeled as nodes),
-- optional role embeddings (subject/predicate/object role flags).
+
+- entity nodes;
+- predicate/property nodes;
+- literal/value nodes;
+- optional role-specific nodes for focus triple elements.
 
 ### Factor nodes
-Each factor node is a constraint instance with:
-- a **type** `t ∈ {conflictWith, single, ...}`,
-- a **scope** over variable nodes,
-- a learned executable evaluation function `f_t(...)` producing:
-  - satisfaction estimate `\hat{s}_c`,
-  - and a message `m_{c→v}` to affected variables.
 
-**Key property:**  
-All factor instances of the same type share parameters → one function per type.
+For each `c in C_local`, add a typed constraint factor node:
 
-**Behavioral approximiations:**
-Constraint factor functions are not intended to reproduce the exact symbolic semantics of constraints. Instead, they learn a differentiable approximation of how constraint violations manifest in historical repair behavior, enabling the model to reason about constraint pressure during inference.
+- type or family `t(c)`;
+- scope `Scope(c)` over variable nodes;
+- learned satisfaction estimator;
+- learned role-conditioned pressure messages.
+
+All factors of the same family share parameters. This is what makes the factor
+representation reusable across concrete constraint instances.
+
+### Edges
+
+Variable-to-variable edges encode the local KG context. Variable-to-factor edges
+connect scoped variables to each constraint factor. Factor-to-variable messages
+send constraint pressure back to subjects, predicates, objects, or values.
 
 ---
 
-## 7) GNN Message Passing and Constraint Execution
+## 5) Prediction Task and Factor Semantics
 
-### Variable-to-variable message passing (base encoder)
-Use a GNN backbone (e.g., GIN on multi-relational topology):
+### Edit prediction
+
+The primary task predicts a local six-slot add/delete edit:
+
 $$
-h_v^{(k+1)} = \mathrm{GNN}\left(h_v^{(k)}, \{(h_u^{(k)}, e_{u\to v}) : u \in \mathcal{N}(v)\}\right)
+\hat{\Delta} =
+(\hat{y}_{s+}, \hat{y}_{p+}, \hat{y}_{o+},
+ \hat{y}_{s-}, \hat{y}_{p-}, \hat{y}_{o-})
 $$
 
-### Constraint evaluation (factor execution)
-For each factor node `c` with scope `S(c)`:
-1. Aggregate scope embeddings:
+The supervision target is the historical curator edit `Delta*`.
+
+### Factor satisfaction prediction
+
+Each factor predicts satisfaction:
+
 $$
-z_c^{(k)} = \mathrm{AGG}_c\left(\{h_v^{(k)} : v \in S(c)\}\right)
+\hat{s}_c(G) \in [0, 1]
 $$
-2. Compute satisfaction probability:
+
+Labels come from symbolic validation on pre-repair and post-gold local graph
+states. These heads test whether the model learns meaningful local constraint
+signals, but they are not themselves proof of safe repair decisions.
+
+### Important interpretation
+
+The term "executable" should be used precisely. The factor is executable in the
+sense that it computes a learned, typed constraint-satisfaction signal and emits
+pressure messages during neural inference. It is not a replacement for the
+symbolic Wikidata validator used in evaluation.
+
+---
+
+## 6) Message Passing and Constraint Pressure
+
+### Variable-to-variable message passing
+
+Use a standard GNN backbone over the local KG graph:
+
 $$
-\hat{s}_c^{(k)} = \sigma\left(f_{t(c)}(z_c^{(k)})\right)
+h_v^{(k+1)}
+= \mathrm{GNN}\left(h_v^{(k)}, \mathcal{N}(v)\right)
 $$
-3. Emit feedback messages to scoped variables:
+
+### Factor execution
+
+For each factor node `c`:
+
 $$
-m_{c\to v}^{(k)} =
+z_c^{(k)}
+= \operatorname{AGG}_{t(c)}
+\left(\{h_v^{(k)} : v \in \operatorname{Scope}(c)\}\right)
+$$
+
+$$
+\hat{s}_c^{(k)}
+= \sigma\left(f_{t(c)}(z_c^{(k)})\right)
+$$
+
+$$
+m_{c \to v}^{(k)}
+=
 g_{t(c), r(v,c)}
-\left(
-z_c^{(k)},
-h_v^{(k)},
-\mathrm{viol}_c^{(k)}
-\right)
-$$
-where `r(v,c)` is the role of variable `v` in factor `c` (for example predicate, subject, or object/value). The violation signal `viol_c` may be passed explicitly, or represented implicitly inside the learned factor state produced by the factor executor.
-
-### Constraint-to-variable integration (factor feedback)
-Variables incorporate constraint pressure:
-$$
-h_v^{(k+1)} \leftarrow h_v^{(k+1)} + \sum_{c: v\in S(c)} m_{c\to v}^{(k)}
+\left(z_c^{(k)}, h_v^{(k)}, 1 - \hat{s}_c^{(k)}\right)
 $$
 
-### Weight updates
-Standard backpropagation updates:
-- GNN encoder parameters,
-- decoder parameters (for edit prediction),
-- factor-type networks `f_t` and message networks `g_t`.
+where `r(v,c)` is the role of variable `v` in constraint `c`.
+
+### Constraint pressure integration
+
+Variables incorporate pressure messages through a residual update:
+
+$$
+h_v^{(k+1)}
+\leftarrow
+h_v^{(k+1)}
++
+\lambda
+\sum_{c: v \in \operatorname{Scope}(c)}
+m_{c \to v}^{(k)}
+$$
+
+Pressure-masking diagnostics test whether these messages are actually used by
+the model and whether secondary constraints influence decisions.
 
 ---
 
-## 8) Loss Function (Fix 1: Intent-aware, no-regression)
-
-### Components
-
-#### (1) Edit imitation loss (historical fidelity)
-$$
-\mathcal{L}_{edit} = \frac{1}{6}\sum_{k} CE(\hat{y}_k, y_k^*)
-$$
-
-#### (2) Primary constraint satisfaction (must fix triggering constraint)
-Compute predicted satisfaction of primary constraint after predicted edit:
-- Canonically, via candidate-based application and shared symbolic evaluation.
-- Optionally, in later exploratory work, via a learned post-edit factor-state approximation.
-
-Loss:
-$$
-\mathcal{L}_{primary} = BCE(\hat{s}_{c^*}^{+}, 1)
-$$
-
-#### (3) Secondary no-regression loss (guardrails, not global satisfaction)
-For secondary constraints `c ≠ c*`:
-$$
-\mathcal{L}_{secondary} =
-\frac{1}{|\mathcal{C}_{sec}|}
-\sum_{c \neq c^*}
-\max\left(0, \hat{s}_c^{-} - \hat{s}_c^{+}\right)
-$$
-This penalizes **making secondary constraints worse** than pre-state.
-
-In the intended paper plan, the primary and secondary terms can remain grounded in symbolic candidate evaluation. A fully neural post-edit rollout mechanism is a possible later extension, but it is not necessary to validate the executable-factor hypothesis.
-
-### Total loss (Main model)
-$$
-\boxed{
-\mathcal{L} = \mathcal{L}_{edit} + \alpha \mathcal{L}_{primary} + \beta \mathcal{L}_{secondary}
-}
-$$
-with:
-- `α` large (primary must be fixed),
-- `β` small (avoid collateral regressions but keep curator fidelity).
-
----
-
-## 9) Models and Baselines
+## 7) Model Suite and Baseline Roles
 
 ### Learned models
 
-#### M0) ESWC model (previous work)
-- Standard graph encoding + GNN encoder
-- Six-slot decoder
-- Trained primarily on `L_edit`
-- Constraints are passive nodes (only violated constraint included)
+#### B0) Passive constraint-context baseline
 
-#### M1) Main model (Fix 1)
-- Variable + factor nodes (locally applicable constraints)
-- Factor execution and feedback during message passing
-- Loss = `L_edit + α L_primary + β L_secondary`
+`B0` is the prior-work-style learned baseline. It uses passive constraint
+context and historical edit imitation. It is weaker on Micro-F1 than the
+factorized model but surprisingly strong on some symbolic safety metrics.
 
-#### M2) Global Fix Model (constraint-maximizing)
-Goal: maximize global satisfaction, regardless of curator edits.
+#### A1) Factorized imitation model
 
-**Recommended training method (stable): candidate-based planner**
-- Generate candidate edits `{Δ_1,...,Δ_K}` from:
-  - heuristics (DFB, AMB),
-  - ESWC-like model proposals,
-  - small enumerations for common constraints.
-- Model outputs a distribution `p(Δ_k)`.
-- Reward candidate by global satisfaction after applying it:
-  - `Sat(G^{Δ_k}) = mean_c s_c(G^{Δ_k})` over all `C_local`.
+`A1` isolates the representation effect. It uses executable factors and
+auxiliary factor supervision, but no explicit candidate-level safety objective.
 
-Loss:
-$$
-\mathcal{L}_{global} = -\sum_k p(Δ_k)\cdot Sat(G^{Δ_k})
-$$
-(No edit imitation term.)
+Current role:
 
-Expected to optimize Global Fix Rate, sacrifice fidelity.
+- main positive representation result;
+- improves historical edit imitation;
+- does not improve aggregate symbolic safety over `B0`.
 
-The Global Fix Model is included as a reference point rather than a practical repair system. It illustrates the trade-off between curator fidelity and global constraint satisfaction and serves as an approximate upper bound on achievable global fix rates.
+#### M1C) Chooser-style safety attempt
+
+`M1C` tests whether a symbolic candidate chooser can improve the safety side of
+the trade-off while retaining the factorized proposal model.
+
+Current role:
+
+- useful safety-objective attempt;
+- not the main positive result;
+- current aggregate results do not show a broad safety win.
+
+#### M1D) Direct safety-loss attempt
+
+`M1D` adds direct primary and secondary safety pressure to the factorized model.
+
+Current role:
+
+- closest practical compromise among factorized variants;
+- improves some safety trade-offs relative to `A1`;
+- not a decisive aggregate symbolic-safety win over `B0`.
+
+#### G0) Global/local satisfaction endpoint
+
+`G0` optimizes local post-edit satisfaction over candidate repairs.
+
+Current role:
+
+- diagnostic endpoint, not a practical repair system;
+- achieves the best local satisfaction metrics;
+- matches `H1` on aggregate evaluation metrics and is dominated by delete-focus
+  behavior, exposing satisfaction-by-deletion.
 
 ### Heuristic baselines
 
-#### H1) DeleteFocusBaseline (DFB)
-Always delete the violating triple.
+#### H1) DeleteFocusBaseline
 
-#### H2) AddMirrorBaseline (AMB)
-For inverse/symmetric constraints, add mirrored triple.
+Always delete the violating focus triple. This is the key control for detecting
+whether a satisfaction objective is rewarding evidence removal rather than
+meaningful repair.
 
-#### H3) ConstraintFamilyMajority (CFM)
-Memorize the most common repair for each coarse constraint family, such as `single`, `inverse`, or `valueType`.
+#### H2) Conservative add heuristic
 
-#### H4) ConstraintDefinitionMajority (CDM)
-Memorize the most common repair for each concrete constraint definition. This is an IID/memorization reference, not a weak shape heuristic.
+Adds mirrored triples for inverse/symmetric cases. It is conservative, low
+disruption, and weak on broad repair intent.
+
+#### H3) ConstraintFamilyMajority
+
+Memorizes the most common historical repair pattern by coarse constraint family.
+It tests how much behavior is explained by repair priors without learned
+factorized reasoning.
 
 ---
 
-## 10) Evaluation Metrics
+## 8) Evaluation Metrics
 
-### Primary metrics (from ESWC)
-#### (A) Historical Fidelity (Micro F1)
-Compare predicted edits `T_pred` vs historical edits `T_gold`:
-- Precision / Recall / F1 using strict triple+operation match.
+The evaluation applies each predicted edit to the pre-repair local graph and
+then rechecks symbolic constraints.
 
-#### (B) Primary Fix Rate
-Apply predicted edit to `G^-` → `G^{Δ}` and validate **primary constraint** `c*`.
-Report fraction of instances where `c*` is fixed.
+### Historical fidelity
 
-### New global/secondary metrics
-#### (C) Global Fix Rate (GFR)
-After applying predicted edit, compute satisfaction fraction over all locally applicable constraints:
-$$
-GFR = \frac{1}{|\mathcal{C}_{local}|}\sum_{c \in \mathcal{C}_{local}} s_c(G^{Δ})
-$$
+Micro-F1 compares predicted add/delete edit slots against the historical curator
+edit. It measures imitation, not repair quality.
 
-#### (D) Secondary Regression Rate (SRR)
-Fraction of secondary constraints that were satisfied pre-edit but violated post-edit:
-$$
-SRR = \frac{|\{c \neq c^*: s_c(G^{-})=1 \land s_c(G^{Δ})=0\}|}{|\{c \neq c^*: s_c(G^{-})=1\}|}
-$$
+### Primary Fix
 
-#### (E) Secondary Improvement Rate (SIR)
-Fraction of secondary violated constraints that become satisfied:
+Primary Fix checks whether the originally violated constraint becomes satisfied:
+
 $$
-SIR = \frac{|\{c \neq c^*: s_c(G^{-})=0 \land s_c(G^{Δ})=1\}|}{|\{c \neq c^*: s_c(G^{-})=0\}|}
+\operatorname{PrimaryFix}
+= S_{c^*}(G^\Delta)
 $$
 
-#### (F) Disruption / Edit Minimality
-Measures how invasive the predicted edit is:
-- `#changed_triples`
-- `delete/add ratio`
-- optional graph-edit distance proxy.
+### GFR / Local Satisfaction
 
-### H2 semantic/compositional diagnostics
-H2 should be evaluated with lightweight diagnostics in addition to final repair metrics:
-- factor satisfaction prediction on existing test factors,
-- existing-split transfer slices by constraint-instance exposure,
-- local constraint-density and shared-variable composition slices,
-- inference-time masking of factor pressure to test whether simultaneous factors affect predictions.
+The old label `GFR` should be read as local post-edit satisfaction over
+`C_local`, not as global Wikidata consistency:
 
----
+$$
+\operatorname{LocalSatisfaction}
+=
+\frac{1}{|C_{\mathrm{local}}|}
+\sum_{c \in C_{\mathrm{local}}}
+S_c(G^\Delta)
+$$
 
-## 11) Expected Behaviors and Evaluation Outcomes
+This metric is useful but dangerous as a standalone objective because deleting
+the focus statement can raise satisfaction without producing a semantically
+useful repair.
 
-| Model      |   Fidelity | Primary Fix | Global Fix |    SRR | Disruption |
-| ---------- | ---------: | ----------: | ---------: | -----: | ---------: |
-| ESWC       |       High |        High |     Medium | Medium |        Low |
-| Main       | Slightly ↓ |      Same/↑ |          ↑ |     ↓↓ |        Low |
-| Global Fix |         ↓↓ |        High |         ↑↑ |      ↓ |         ↑↑ |
-| DFB        |        Low | High (some) |   Unstable |   High |       High |
-| CFM        |        Low |      Medium |     Medium | Medium |        Low |
-| CDM        |     Medium |        High |     Medium | Medium |        Low |
+### Secondary Improvement Rate
 
-### Heuristics
-#### DFB
-- High Primary Fix Rate for constraints solvable by deletion
-- Low Historical Fidelity (unless humans often delete focus)
-- Poor Global Fix / high SRR due to blunt deletions and collateral removals
+`SIR` is higher when the edit fixes secondary constraints that were violated
+before the edit:
 
-#### AMB
-- Very high Fix Rate on inverse constraints
-- Low coverage elsewhere → poor overall performance
+$$
+\operatorname{SIR}
+=
+\frac{
+|\{c \ne c^*: S_c(G^-) = 0 \land S_c(G^\Delta) = 1\}|
+}{
+|\{c \ne c^*: S_c(G^-) = 0\}|
+}
+$$
 
-#### CFM
-- Low to moderate Historical Fidelity from coarse family priors
-- Useful sanity check for how much is explained without concrete constraint IDs
-- Better generalization story than CDM, but intentionally weak
+### Secondary Regression Rate
 
-#### CDM
-- Moderate to high Historical Fidelity by memorizing repeated concrete constraint definitions
-- Good Primary Fix Rate when repair patterns are stable
-- IID reference only; limited evidence of generalization to unseen constraints
+`SRR` is lower when the edit avoids breaking secondary constraints that were
+satisfied before the edit:
 
----
+$$
+\operatorname{SRR}
+=
+\frac{
+|\{c \ne c^*: S_c(G^-) = 1 \land S_c(G^\Delta) = 0\}|
+}{
+|\{c \ne c^*: S_c(G^-) = 1\}|
+}
+$$
 
-### Learned models
+### Disruption
 
-#### M0 ESWC model
-**Behavior**
-- Strong imitation of curator repairs
-- Fixes primary constraint well
-- No control over collateral constraints
+Disruption approximates edit invasiveness. It is useful for detecting
+over-editing, but it does not by itself measure semantic usefulness.
 
-**Expected metrics**
-- High Fidelity
-- High Primary Fix
-- Medium Global Fix Rate
-- Higher SRR than Main model
+### Deferred non-vacuity metric
+
+The current results reveal that evidence preservation needs an explicit metric.
+Future reporting should distinguish repairs that improve constraint state from
+edits that improve metrics by deleting the focus evidence.
 
 ---
 
-#### M1 Main model (Fix 1)
-**Behavior**
-- Mostly curator-aligned repairs
-- When multiple repairs are plausible, prefer those with fewer secondary regressions
-- Factor nodes learn validation semantics and guide decisions
+## 9) Current Empirical Pattern
 
-**Expected metrics**
-- Fidelity: slightly lower than ESWC (small drop)
-- Primary Fix: same or slightly higher
-- Global Fix Rate: higher than ESWC
-- SRR: significantly lower than ESWC
-- SIR: moderate improvement
+The current paper-facing result table should be narrated as evidence for a
+fidelity-safety gap, not as a single leaderboard.
 
-**Narrative**
-- Best trade-off point: curator-like but safer.
+| Model | Primary Fix | Micro-F1 | GFR / Local Satisfaction | SIR | SRR | Disruption | Interpretation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `B0` | 0.8603 | 0.5434 | 0.8705 | 0.1925 | 0.0097 | 1.0036 | Lower learned fidelity, surprisingly strong symbolic-safety baseline. |
+| `A1` | 0.8589 | 0.6785 | 0.8638 | 0.1397 | 0.0128 | 1.0330 | Main representation win: better imitation, not safer symbolic repair. |
+| `M1C` | 0.8155 | 0.6198 | 0.8629 | 0.1158 | 0.0132 | 1.0663 | Chooser-style safety objective does not improve the aggregate trade-off. |
+| `M1D` | 0.8588 | 0.6772 | 0.8661 | 0.1396 | 0.0103 | 1.0274 | Closest practical compromise, but not a decisive aggregate safety win over `B0`. |
+| `G0` | 0.7174 | 0.2804 | 0.9098 | 0.2441 | 0.0091 | 1.0000 | Best local satisfaction, but degenerates toward delete-focus behavior. |
+| `H1` | 0.7174 | 0.2804 | 0.9098 | 0.2441 | 0.0091 | 1.0000 | Delete-focus control; aggregate match with `G0` exposes the degeneracy. |
+| `H2` | 0.5157 | 0.0503 | 0.8544 | 0.0001 | 0.0043 | 0.1047 | Conservative and low disruption, but weak repair intent and fidelity. |
+| `H3` | 0.7731 | 0.2654 | 0.8689 | 0.1917 | 0.0103 | 1.0072 | Coarse repair-prior baseline; much weaker fidelity than learned factorized models. |
 
----
+### Main findings
 
-#### M2 Global Fix Model
-**Behavior**
-- Prioritizes maximizing satisfaction across `C_local`
-- May over-edit or prefer aggressive deletions/additions
-- Will diverge from curator norms
-
-**Expected metrics**
-- Fidelity: low
-- Primary Fix: high
-- Global Fix Rate: highest
-- SRR: low (if truly optimizing)
-- Disruption: high
-
-**Narrative**
-- Establishes the “global optimality” extreme; illustrates fidelity–validity frontier.
+1. `A1` improves Micro-F1 from `0.5434` to `0.6785`, validating executable
+   factors as a representation for historical repair imitation.
+2. `A1` is worse than `B0` on local satisfaction, SIR, SRR, and disruption,
+   showing that imitation is not safety.
+3. `M1D` is the strongest practical factorized compromise, but the aggregate
+   evidence is not strong enough to claim broad safety dominance.
+4. `G0` and `H1` expose a satisfaction-by-deletion endpoint: local satisfaction
+   can be maximized by removing the focus evidence.
 
 ---
 
-#### M3 Policy Choice Model
-**Behavior**
-- Predicts coarse repair strategy reliably
-- Depends on executor quality for concrete edit
-- More robust to ambiguity in specific object choice
+## 10) H2 Diagnostics: What the Factors Actually Do
 
-**Expected metrics**
-- Policy accuracy: high on common constraint types
-- Fidelity: medium (executor loses detail)
-- Primary Fix: medium-to-high depending on executor
-- Global Fix: moderate
-- SRR: moderate
+### Factor semantics are learned
 
-**Narrative**
-- Demonstrates that repair can be modular: planner + executor, enabling interpretable repair pipelines.
+Factor heads achieve high weighted F1 and strong AUROC on pre-repair and
+post-gold satisfaction labels. This supports the claim that executable factors
+learn meaningful local constraint signals.
 
----
+However, many factor labels are imbalanced. The paper should report AUROC,
+AUPRC, and calibration where possible, not only weighted F1.
 
-## 12) Recommended Presentation of Results (Narrative-First)
+### Factor pressure is causally used
 
-### Main tables/figures to include
-1. **Core comparison table** (Fidelity, Primary Fix, Global Fix, SRR, Disruption)
-2. **Per-constraint breakdown** (as in ESWC) + show SRR per constraint family
-3. **Pareto plot**: Fidelity (x) vs Global Fix or SRR (y)
-   - Show ESWC vs Main vs Global Fix
-4. **Qualitative examples** of repairs where:
-   - ESWC matches curator but introduces secondary violation,
-   - Main deviates minimally to avoid regression,
-   - Global Fix chooses a non-human but globally consistent repair.
+Inference-time masking shows large drops in Micro-F1 and Primary Fix when factor
+pressure is removed. The factor pathway is not decorative; it materially affects
+predictions.
+
+### Secondary pressure is weak
+
+Secondary-only pressure masking changes few predictions and produces small
+metric shifts. This explains the main result: the model uses constraint pressure,
+but the learned pressure is mostly aligned with historical imitation and primary
+repair behavior rather than secondary no-regression.
 
 ---
 
-## 13) Summary of the Full Specification
+## 11) Revised Research Questions
 
-- Input: violation-centered subgraph `G^-` enriched with locally applicable constraint factor nodes.
-- Output: repair edit `Δ` (six-slot format) and factor satisfaction signals.
-- Main model learns curator-like repairs with constraint-aware guardrails:
-  - fix primary constraint,
-  - avoid worsening secondary constraints.
-- Evaluation extends beyond single-constraint repair with global consistency and regression metrics.
-- Additional models illustrate extremes:
-  - Global Fix (maximize constraint satisfaction),
-  - Policy Choice (strategy-level planning),
-  - plus symbolic heuristics for coverage and sanity baselines.
+### RQ1: Do executable factors improve historical repair modeling?
+
+Expected answer from current results: yes.
+
+Evidence:
+
+- `A1` improves Micro-F1 over `B0`.
+- factor heads learn satisfaction signals;
+- pressure masking shows factor messages affect decisions.
+
+### RQ2: Does better imitation imply safer post-edit graphs?
+
+Expected answer from current results: no.
+
+Evidence:
+
+- `A1` improves fidelity but worsens aggregate symbolic safety metrics relative
+  to `B0`.
+
+### RQ3: Can local safety objectives move the trade-off?
+
+Expected answer from current results: partially, but not conclusively.
+
+Evidence:
+
+- `M1D` is the best practical factorized compromise;
+- `M1C` does not recover a broad aggregate safety win;
+- sliced results and candidate-oracle analysis are needed to determine where
+  the bottleneck lies.
+
+### RQ4: What happens when local satisfaction is optimized directly?
+
+Expected answer from current results: it can become degenerate.
+
+Evidence:
+
+- `G0` has the best local satisfaction;
+- `G0` matches `H1` on aggregate metrics and is dominated by delete-focus
+  behavior;
+- high local satisfaction is therefore not equivalent to meaningful repair.
+
+---
+
+## 12) Recommended Paper Presentation
+
+### Introduction
+
+Frame the project around the fidelity-safety gap:
+
+- historical edit logs are useful but incomplete supervision;
+- symbolic satisfaction is useful but can be vacuous;
+- repair systems need multi-axis evaluation.
+
+### Method
+
+Present executable constraint factors as a representation that makes local
+constraint state available to the model and supports diagnostic pressure tests.
+
+### Evaluation
+
+Separate:
+
+- historical fidelity;
+- primary fix;
+- local satisfaction;
+- secondary improvement;
+- secondary regression;
+- disruption;
+- non-vacuous evidence preservation.
+
+### Results
+
+Lead with the trade-off:
+
+- factors improve imitation;
+- imitation is not safety;
+- local satisfaction can be degenerate;
+- secondary no-regression remains an open decision-level problem.
+
+### Discussion
+
+The project is not a failed safe-repair system. It is evidence that KG repair
+needs separate objectives and metrics for imitation, symbolic safety, and
+non-vacuity.
+
+---
+
+## 13) Future Work and Success Criteria
+
+### Near-term analyses
+
+1. Candidate-oracle analysis: determine whether safe candidates exist but are
+   not selected, or whether candidate generation is the bottleneck.
+2. Density and family slices: identify regimes where factorized safety pressure
+   helps or fails.
+3. Calibration of factor semantics: report AUROC, AUPRC, and calibration for
+   imbalanced constraint families.
+4. Non-vacuity metrics: explicitly distinguish meaningful repair from deleting
+   the problem away.
+
+### Revised success criteria
+
+The project succeeds if it establishes:
+
+1. executable factors improve historical repair imitation;
+2. factor semantics and pressure are learned and causally used;
+3. historical fidelity and symbolic safety are empirically separable;
+4. local satisfaction alone is shown to be an unsafe optimization target;
+5. future safe-repair objectives are motivated by concrete failure modes rather
+   than by aggregate leaderboard claims.
