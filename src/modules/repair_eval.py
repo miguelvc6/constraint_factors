@@ -684,6 +684,11 @@ class GlobalMetricsAccumulator:
     del_sum: int = 0
     total_ops_sum: int = 0
     changed_sum: int = 0
+    focus_preserved: int = 0
+    focus_deleted: int = 0
+    candidate_deletes_focus: int = 0
+    non_vacuous_primary_fix: int = 0
+    vacuous_satisfaction_improvement: int = 0
 
     def update(
         self,
@@ -697,6 +702,11 @@ class GlobalMetricsAccumulator:
         sir_denom: int,
         add_count: int,
         del_count: int,
+        focus_preserved: int = 0,
+        focus_deleted: int = 0,
+        candidate_deletes_focus: int = 0,
+        non_vacuous_primary_fix: int = 0,
+        vacuous_satisfaction_improvement: int = 0,
     ) -> None:
         self.support += 1
         self.gfr_sum += gfr
@@ -711,6 +721,11 @@ class GlobalMetricsAccumulator:
         ops = add_count + del_count
         self.total_ops_sum += ops
         self.changed_sum += ops
+        self.focus_preserved += int(focus_preserved)
+        self.focus_deleted += int(focus_deleted)
+        self.candidate_deletes_focus += int(candidate_deletes_focus)
+        self.non_vacuous_primary_fix += int(non_vacuous_primary_fix)
+        self.vacuous_satisfaction_improvement += int(vacuous_satisfaction_improvement)
 
     def as_dict(self) -> dict[str, object]:
         support = self.support or 1
@@ -723,6 +738,11 @@ class GlobalMetricsAccumulator:
             "srr_denom_total": self.srr_denom,
             "sir_total": self.sir_num,
             "sir_denom_total": self.sir_denom,
+            "focus_preserved_rate": self.focus_preserved / support,
+            "focus_deleted_rate": self.focus_deleted / support,
+            "candidate_deletes_focus_rate": self.candidate_deletes_focus / support,
+            "non_vacuous_primary_fix_rate": self.non_vacuous_primary_fix / support,
+            "vacuous_satisfaction_improvement_rate": self.vacuous_satisfaction_improvement / support,
             "disruption": {
                 "added_triples_mean": self.add_sum / support,
                 "deleted_triples_mean": self.del_sum / support,
@@ -807,6 +827,7 @@ def evaluate_global_repair_samples(
     per_sample_srr: list[float] = []
     per_sample_sir: list[float] = []
     per_sample_disruption: list[dict[str, int]] = []
+    per_sample_evidence: list[dict[str, int | float]] = []
 
     overall = GlobalMetricsAccumulator()
     per_constraint: dict[str, GlobalMetricsAccumulator] = {}
@@ -895,10 +916,22 @@ def evaluate_global_repair_samples(
 
         add_count = 1 if sample.predicted.get("add") is not None else 0
         del_count = 1 if sample.predicted.get("del") is not None else 0
+        evidence = {
+            "pre_global_satisfied_fraction": float(details.get("pre_global_satisfied_fraction", 0.0)),
+            "post_global_satisfied_fraction": float(details.get("post_global_satisfied_fraction", gfr)),
+            "pre_focus_present": int(details.get("pre_focus_present", 0)),
+            "post_focus_present": int(details.get("post_focus_present", 0)),
+            "focus_preserved": int(details.get("focus_preserved", 0)),
+            "focus_deleted": int(details.get("focus_deleted", 0)),
+            "candidate_deletes_focus": int(details.get("candidate_deletes_focus", 0)),
+            "non_vacuous_primary_fix": int(details.get("non_vacuous_primary_fix", 0)),
+            "vacuous_satisfaction_improvement": int(details.get("vacuous_satisfaction_improvement", 0)),
+        }
 
         per_sample_gfr.append(gfr)
         per_sample_srr.append(srr)
         per_sample_sir.append(sir)
+        per_sample_evidence.append(evidence)
         per_sample_disruption.append(
             {
                 "added_triples": add_count,
@@ -918,6 +951,11 @@ def evaluate_global_repair_samples(
             sir_denom=sir_denom,
             add_count=add_count,
             del_count=del_count,
+            focus_preserved=int(evidence["focus_preserved"]),
+            focus_deleted=int(evidence["focus_deleted"]),
+            candidate_deletes_focus=int(evidence["candidate_deletes_focus"]),
+            non_vacuous_primary_fix=int(evidence["non_vacuous_primary_fix"]),
+            vacuous_satisfaction_improvement=int(evidence["vacuous_satisfaction_improvement"]),
         )
 
         bucket = per_constraint.setdefault(sample.constraint_type, GlobalMetricsAccumulator())
@@ -931,6 +969,11 @@ def evaluate_global_repair_samples(
             sir_denom=sir_denom,
             add_count=add_count,
             del_count=del_count,
+            focus_preserved=int(evidence["focus_preserved"]),
+            focus_deleted=int(evidence["focus_deleted"]),
+            candidate_deletes_focus=int(evidence["candidate_deletes_focus"]),
+            non_vacuous_primary_fix=int(evidence["non_vacuous_primary_fix"]),
+            vacuous_satisfaction_improvement=int(evidence["vacuous_satisfaction_improvement"]),
         )
 
     return {
@@ -941,6 +984,7 @@ def evaluate_global_repair_samples(
             "srr": per_sample_srr,
             "sir": per_sample_sir,
             "disruption": per_sample_disruption,
+            "evidence_preservation": per_sample_evidence,
         },
     }
 

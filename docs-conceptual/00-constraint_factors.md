@@ -141,7 +141,30 @@ changes repair behavior.
 
 ### Locally applicable constraint set
 
-For each instance, define a local constraint set:
+For each instance, define the locally applicable constraint set as the primary
+violated constraint plus the constraints attached to predicates visible in the
+instance's bounded local neighborhood.
+
+Let `N(i)` be the local neighborhood materialized for repair instance `i`. It
+contains the focus triple, the optional conflicting triple, and cached
+one-hop statements for the focus subject, focus object, and conflicting entity
+when available. Let:
+
+$$
+P_{\mathrm{local}}(i)
+$$
+
+be the set of predicates appearing in that materialized neighborhood. If
+`A(p)` denotes the constraint instances attached to property `p`, then:
+
+$$
+C_{\mathrm{local}}(i)
+= \{c^*(i)\}
+  \cup
+  \bigcup_{p \in P_{\mathrm{local}}(i)} A(p)
+$$
+
+Equivalently:
 
 $$
 C_{\mathrm{local}} = \{c^*, c_1, \ldots, c_m\}
@@ -150,9 +173,27 @@ $$
 where `c*` is the primary violated constraint and the remaining constraints are
 locally applicable secondary constraints.
 
+This is a bounded local-closure definition. It is broader than using only the
+property of the focus triple, because historical repairs may add or delete a
+different nearby statement to fix a violation. For example, type-, value-type-,
+inverse-, required-statement-, or conflict-style repairs can involve predicates
+on the same local entities rather than only the originally flagged predicate.
+Including those attached constraints gives the model and evaluator visibility
+into secondary constraints that the candidate edit may improve or regress.
+
+The definition is still local. It does not attempt to enumerate all Wikidata
+constraints that could become relevant after arbitrary graph expansion, and it
+does not assert that every secondary constraint should be satisfied by the
+repair. Secondary constraints are included because they are locally visible and
+potentially affected, not because they are all repair objectives.
+
 The current paper-facing pipeline uses the bounded local-closure version through
 `constraint_scope=local`. A narrower focus-scoped alternative is exposed through
-the technical `focus` scope.
+the technical `focus` scope; that alternative restricts the constraint set to
+the primary constraint and constraints attached to the focus/conflict predicates
+plus the constrained property of the violated constraint. Thus, in the paper
+line, `local` means bounded local closure, not an unbounded KG neighborhood and
+not the predicate-only focus scope.
 
 ### Constraint labels
 

@@ -614,6 +614,66 @@ def _build_post_state_for_candidate(
     return post_facts, post_predicates, missing_edits if missing_edits is not None else _EMPTY_MISSING_EDITS
 
 
+def _local_satisfied_fraction(checkable: Sequence[bool], satisfied: Sequence[int]) -> float:
+    denom = sum(1 for flag in checkable if flag)
+    if not denom:
+        return 0.0
+    return float(sum(int(value) for value, flag in zip(satisfied, checkable) if flag)) / float(denom)
+
+
+def _resolved_candidate_triples(
+    candidate_slots: Sequence[int],
+    placeholder_map: Dict[Any, Any],
+) -> Dict[str, Tuple[Any, Any, Any] | None]:
+    if len(candidate_slots) < 6:
+        return {"add": None, "del": None}
+
+    def _triple(base_idx: int) -> Tuple[Any, Any, Any] | None:
+        subj = _resolve_placeholder(int(candidate_slots[base_idx]), placeholder_map)
+        pred = _resolve_placeholder(int(candidate_slots[base_idx + 1]), placeholder_map)
+        obj = _resolve_placeholder(int(candidate_slots[base_idx + 2]), placeholder_map)
+        if subj in (None, "", 0) or pred in (None, "", 0) or obj in (None, "", 0):
+            return None
+        return subj, pred, obj
+
+    return {"add": _triple(0), "del": _triple(3)}
+
+
+def _evidence_preservation_details(
+    *,
+    pre_state: EvidenceState,
+    post_state: EvidenceState,
+    candidate_slots: Sequence[int],
+    placeholder_map: Dict[Any, Any],
+    primary_satisfied: int,
+    pre_global_satisfied_fraction: float,
+    post_global_satisfied_fraction: float,
+) -> Dict[str, Any]:
+    pre_focus_present = bool(pre_state.focus_statement_present())
+    post_focus_present = bool(post_state.focus_statement_present())
+    focus_preserved = pre_focus_present and post_focus_present
+    focus_deleted = pre_focus_present and not post_focus_present
+    resolved = _resolved_candidate_triples(candidate_slots, placeholder_map)
+    candidate_deletes_focus = resolved.get("del") == (
+        pre_state.focus_subject,
+        pre_state.focus_predicate,
+        pre_state.focus_object,
+    )
+    return {
+        "pre_global_satisfied_fraction": pre_global_satisfied_fraction,
+        "post_global_satisfied_fraction": post_global_satisfied_fraction,
+        "pre_focus_present": int(pre_focus_present),
+        "post_focus_present": int(post_focus_present),
+        "focus_preserved": int(focus_preserved),
+        "focus_deleted": int(focus_deleted),
+        "candidate_deletes_focus": int(candidate_deletes_focus),
+        "non_vacuous_primary_fix": int(int(primary_satisfied) == 1 and focus_preserved),
+        "vacuous_satisfaction_improvement": int(
+            focus_deleted and post_global_satisfied_fraction > pre_global_satisfied_fraction
+        ),
+    }
+
+
 def _resolve_default_relations(encoder: GlobalIntEncoder | None) -> List[int]:
     if encoder is None:
         return []
@@ -1022,6 +1082,17 @@ class CandidateConstraintEvaluator:
             constraint_ids_raw = getattr(row, "local_constraint_ids", None)
         local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=self._use_encoded_ids)
         if not local_constraint_ids:
+            pre_global_satisfied_fraction = 0.0
+            post_global_satisfied_fraction = 0.0
+            evidence_details = _evidence_preservation_details(
+                pre_state=pre_state,
+                post_state=post_state,
+                candidate_slots=candidate_slots,
+                placeholder_map=placeholder_map,
+                primary_satisfied=0,
+                pre_global_satisfied_fraction=pre_global_satisfied_fraction,
+                post_global_satisfied_fraction=post_global_satisfied_fraction,
+            )
             return {
                 "local_constraint_ids": [],
                 "primary_factor_index": -1,
@@ -1039,6 +1110,7 @@ class CandidateConstraintEvaluator:
                 "sir": 0.0,
                 "add_count": 0,
                 "del_count": 0,
+                **evidence_details,
             }
 
         pre_checkable: List[bool] = []
@@ -1075,11 +1147,8 @@ class CandidateConstraintEvaluator:
         if 0 <= resolved_primary_index < len(post_satisfied):
             primary_satisfied = post_satisfied[resolved_primary_index]
 
-        checkable_total = sum(1 for flag in post_checkable if flag)
-        if checkable_total:
-            global_satisfied_fraction = sum(post_satisfied) / float(checkable_total)
-        else:
-            global_satisfied_fraction = 0.0
+        pre_global_satisfied_fraction = _local_satisfied_fraction(pre_checkable, pre_satisfied)
+        global_satisfied_fraction = _local_satisfied_fraction(post_checkable, post_satisfied)
 
         secondary_regressions = 0
         secondary_improvements = 0
@@ -1112,6 +1181,16 @@ class CandidateConstraintEvaluator:
             if all(int(v) != 0 for v in candidate_slots[3:6]):
                 del_count = 1
 
+        evidence_details = _evidence_preservation_details(
+            pre_state=pre_state,
+            post_state=post_state,
+            candidate_slots=candidate_slots,
+            placeholder_map=placeholder_map,
+            primary_satisfied=primary_satisfied,
+            pre_global_satisfied_fraction=pre_global_satisfied_fraction,
+            post_global_satisfied_fraction=global_satisfied_fraction,
+        )
+
         return {
             "local_constraint_ids": local_constraint_ids,
             "primary_factor_index": resolved_primary_index,
@@ -1129,6 +1208,7 @@ class CandidateConstraintEvaluator:
             "sir": sir,
             "add_count": add_count,
             "del_count": del_count,
+            **evidence_details,
         }
 
     def evaluate_candidates(
@@ -1175,28 +1255,61 @@ class CandidateConstraintEvaluator:
         else:
             constraint_ids_raw = getattr(row, "local_constraint_ids", None)
         local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=self._use_encoded_ids)
+        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
         if not local_constraint_ids:
-            return [
-                {
-                    "local_constraint_ids": [],
-                    "primary_factor_index": -1,
-                    "pre_checkable": [],
-                    "pre_satisfied": [],
-                    "post_checkable": [],
-                    "post_satisfied": [],
-                    "primary_satisfied": 0,
-                    "global_satisfied_fraction": 0.0,
-                    "secondary_regressions": 0,
-                    "secondary_improvements": 0,
-                    "secondary_regressions_denom": 0,
-                    "secondary_improvements_denom": 0,
-                    "srr": 0.0,
-                    "sir": 0.0,
-                    "add_count": 0,
-                    "del_count": 0,
-                }
-                for _ in candidates
-            ]
+            results: List[Dict[str, Any]] = []
+            for candidate_slots in candidates:
+                post_facts, post_predicates, missing_edits = _build_post_state_for_candidate(
+                    facts_by_entity,
+                    predicates_present,
+                    p_local,
+                    candidate_slots=candidate_slots,
+                    placeholder_map=placeholder_map,
+                    assume_complete=self._assume_complete,
+                )
+                post_state = EvidenceState(
+                    facts_by_entity=post_facts,
+                    predicates_present=post_predicates,
+                    assume_complete=self._assume_complete,
+                    missing_edits=missing_edits,
+                    focus_subject=subject,
+                    focus_predicate=predicate,
+                    focus_object=obj,
+                    other_subject=other_subject,
+                    other_predicate=other_predicate,
+                    other_object=other_object,
+                )
+                evidence_details = _evidence_preservation_details(
+                    pre_state=pre_state,
+                    post_state=post_state,
+                    candidate_slots=candidate_slots,
+                    placeholder_map=placeholder_map,
+                    primary_satisfied=0,
+                    pre_global_satisfied_fraction=0.0,
+                    post_global_satisfied_fraction=0.0,
+                )
+                results.append(
+                    {
+                        "local_constraint_ids": [],
+                        "primary_factor_index": -1,
+                        "pre_checkable": [],
+                        "pre_satisfied": [],
+                        "post_checkable": [],
+                        "post_satisfied": [],
+                        "primary_satisfied": 0,
+                        "global_satisfied_fraction": 0.0,
+                        "secondary_regressions": 0,
+                        "secondary_improvements": 0,
+                        "secondary_regressions_denom": 0,
+                        "secondary_improvements_denom": 0,
+                        "srr": 0.0,
+                        "sir": 0.0,
+                        "add_count": 0,
+                        "del_count": 0,
+                        **evidence_details,
+                    }
+                )
+            return results
 
         constraint_instances: List[ConstraintInstance | None] = [
             self._get_constraint_instance(cid) for cid in local_constraint_ids
@@ -1222,7 +1335,6 @@ class CandidateConstraintEvaluator:
             except ValueError:
                 resolved_primary_index = -1
 
-        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
         results: List[Dict[str, Any]] = []
 
         for candidate_slots in candidates:
@@ -1262,11 +1374,8 @@ class CandidateConstraintEvaluator:
             if 0 <= resolved_primary_index < len(post_satisfied):
                 primary_satisfied = post_satisfied[resolved_primary_index]
 
-            checkable_total = sum(1 for flag in post_checkable if flag)
-            if checkable_total:
-                global_satisfied_fraction = sum(post_satisfied) / float(checkable_total)
-            else:
-                global_satisfied_fraction = 0.0
+            pre_global_satisfied_fraction = _local_satisfied_fraction(pre_checkable, pre_satisfied)
+            global_satisfied_fraction = _local_satisfied_fraction(post_checkable, post_satisfied)
 
             secondary_regressions = 0
             secondary_improvements = 0
@@ -1299,6 +1408,16 @@ class CandidateConstraintEvaluator:
                 if all(int(v) != 0 for v in candidate_slots[3:6]):
                     del_count = 1
 
+            evidence_details = _evidence_preservation_details(
+                pre_state=pre_state,
+                post_state=post_state,
+                candidate_slots=candidate_slots,
+                placeholder_map=placeholder_map,
+                primary_satisfied=primary_satisfied,
+                pre_global_satisfied_fraction=pre_global_satisfied_fraction,
+                post_global_satisfied_fraction=global_satisfied_fraction,
+            )
+
             results.append(
                 {
                     "local_constraint_ids": local_constraint_ids,
@@ -1317,6 +1436,7 @@ class CandidateConstraintEvaluator:
                     "sir": sir,
                     "add_count": add_count,
                     "del_count": del_count,
+                    **evidence_details,
                 }
             )
 
