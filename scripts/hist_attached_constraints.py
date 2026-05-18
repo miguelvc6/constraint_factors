@@ -29,6 +29,25 @@ def _default_outputs(interim_root: Path, column: str) -> tuple[Path, Path]:
     return interim_root / f"{stem}.csv", interim_root / f"{stem}.png"
 
 
+def _available_dataframe_variants(interim_root: Path) -> list[str]:
+    if not interim_root.exists():
+        return []
+    variants: list[str] = []
+    for candidate in sorted(interim_root.iterdir()):
+        if candidate.is_dir() and any(candidate.glob("df_*.parquet")):
+            variants.append(candidate.name)
+    return variants
+
+
+def _missing_dataframe_message(dataframe_root: Path, interim_root: Path) -> str:
+    variants = _available_dataframe_variants(interim_root)
+    message = f"Interim dataframe directory not found: {dataframe_root}"
+    if variants:
+        available = ", ".join(variants)
+        message += f"\nAvailable dataframe variants under {interim_root}: {available}"
+    return message
+
+
 def _lengths_for_array(array: pa.Array) -> np.ndarray:
     """Return list lengths for an Arrow list-like array without materializing values."""
     if pa.types.is_list(array.type) or pa.types.is_large_list(array.type) or pa.types.is_fixed_size_list(array.type):
@@ -100,12 +119,12 @@ def _write_split_csv(split_counts: dict[str, Counter[int]], output: Path) -> Non
     pd.DataFrame(rows).to_csv(output, index=False)
 
 
-def _write_histogram_plot(df: pd.DataFrame, output: Path, *, title: str) -> None:
+def _write_histogram_plot(df: pd.DataFrame, output: Path, *, title: str, column: str) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     fig_width = max(8.0, min(22.0, len(df) * 0.28))
     fig, ax = plt.subplots(figsize=(fig_width, 5.5))
     ax.bar(df["num_attached_constraints"], df["count"], width=0.9, color="#2f6f8f")
-    ax.set_xlabel("num_attached_constraints = len(local_constraint_ids)")
+    ax.set_xlabel(f"num_attached_constraints = len({column})")
     ax.set_ylabel("Number of instances")
     ax.set_title(title)
     ax.grid(axis="y", alpha=0.25)
@@ -141,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stream parquet splits and histogram len(local_constraint_ids)."
     )
-    parser.add_argument("--dataset", default="full", help="Dataset variant to scan, e.g. full or full_strat1m.")
+    parser.add_argument("--dataset", default="full_strat1m", help="Dataset variant to scan, e.g. full or full_strat1m.")
     parser.add_argument(
         "--min-occurrence",
         type=int,
@@ -212,7 +231,7 @@ def main() -> None:
     dataset_variant = dataset_variant_name(args.dataset, max(1, min_occurrence))
     dataframe_root = args.interim_root / dataset_variant
     if not dataframe_root.exists():
-        raise FileNotFoundError(f"Interim dataframe directory not found: {dataframe_root}")
+        raise FileNotFoundError(_missing_dataframe_message(dataframe_root, args.interim_root))
 
     column = args.column or ("local_constraint_ids_focus" if args.scope == "focus" else "local_constraint_ids")
     default_csv, default_png = _default_outputs(dataframe_root, column)
@@ -249,6 +268,7 @@ def main() -> None:
             df,
             output_png,
             title=f"Attached constraints per instance ({dataset_variant}, {column})",
+            column=column,
         )
 
     _print_summary(histogram, total_rows, output_csv, output_png)

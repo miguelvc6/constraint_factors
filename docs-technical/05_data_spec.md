@@ -194,7 +194,7 @@ Use the streaming histogram script to summarize this count without loading the
 full parquet dataset into RAM:
 ```bash
 uv run scripts/hist_attached_constraints.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100
 ```
 
