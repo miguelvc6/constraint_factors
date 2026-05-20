@@ -12,4 +12,4 @@ models/*/*.pth
 logs/*
 models/baselines/full_strat1m/parquet/baselines_all.json
 models/baselines/full_strat1m_minocc100/parquet/baselines_all.json
-models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id/evaluations/model.json
+models/*/*/model.json
