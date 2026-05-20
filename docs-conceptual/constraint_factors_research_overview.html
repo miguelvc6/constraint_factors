@@ -502,8 +502,9 @@
           <a href="#method">5. Method: Executable Constraint Factors</a>
           <a href="#metrics">6. Evaluation: Separate Fidelity from Safety</a>
           <a href="#results">7. Empirical Findings</a>
-          <a href="#diagnostics">8. Diagnostics: What the Factors Actually Do</a>
-          <a href="#positioning">9. Scientific Value and Positioning</a>
+          <a href="#examples">8. Representative Test Instances</a>
+          <a href="#diagnostics">9. Diagnostics: What the Factors Actually Do</a>
+          <a href="#positioning">10. Scientific Value and Positioning</a>
         </nav>
       </header>
 
@@ -1043,8 +1044,158 @@
         </div>
       </section>
 
+      <section id="examples">
+        <h2>8. Representative Test Instances</h2>
+        <p>
+          The examples below are real held-out instances from
+          <code>data/interim/full_strat1m_minocc100_labeled/df_test.parquet</code>. Row positions are zero-based positions in the test split. Entity,
+          property, and value labels are decoded through the project encoder and Wikidata text cache. The examples are selected from common constraint
+          families and stay close to typical local-constraint density for their family.
+        </p>
+        <p>
+          These cases make the evaluation setting concrete: each row starts with a violated focus triple, optionally includes a conflicting local triple,
+          applies a historical curator edit, and exposes many secondary constraints that may be preserved, fixed, or regressed after the edit.
+        </p>
+        <table class="tight-table">
+          <thead>
+            <tr>
+              <th>Family and row</th>
+              <th>Focus / conflict</th>
+              <th>Historical edit</th>
+              <th>Local factor context</th>
+              <th>What the example shows</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>
+                <code>conflictWith</code><br>
+                test row <code>120922</code>
+              </td>
+              <td>
+                Focus: 2016-17 Cypriot Second Division, <code>sports season of league or competition</code>, Cypriot Second Division.<br>
+                Conflict: same subject, <code>instance of</code>, sports season of a sports club.
+              </td>
+              <td>
+                Add: same subject, <code>instance of</code>, sports season.<br>
+                Delete: same subject, <code>instance of</code>, sports season of a sports club.
+              </td>
+              <td>
+                96 attached constraints; 53 executable factors; 41 checkable factors in both states.<br>
+                Satisfaction <code>pre -> post_gold</code>: <code>40/41 -> 37/41</code>; fixed 0, regressed 3.
+              </td>
+              <td>
+                A curator-like edit can fix the primary conflict while worsening some secondary local constraints.
+              </td>
+            </tr>
+            <tr>
+              <td>
+                <code>inverse</code><br>
+                test row <code>133446</code>
+              </td>
+              <td>
+                Focus: <code>Q1803004</code>, <code>replaced by</code>, Landherrenschaft.
+              </td>
+              <td>
+                Add: Landherrenschaft, <code>replaces</code>, <code>Q1803004</code>.<br>
+                Delete: none.
+              </td>
+              <td>
+                39 attached constraints; 25 executable factors; 6 checkable factors in both states.<br>
+                Satisfaction <code>pre -> post_gold</code>: <code>5/6 -> 5/6</code>; fixed 0, regressed 0.
+              </td>
+              <td>
+                Some repairs are structurally local and non-destructive: the inverse statement is added without collateral regression.
+              </td>
+            </tr>
+            <tr>
+              <td>
+                <code>single</code><br>
+                test row <code>108502</code>
+              </td>
+              <td>
+                Focus: A Boy Called H, <code>ISBN-10</code>, <code>"4-06-264591-2"</code>.<br>
+                Conflict: same subject, <code>ISBN-10</code>, <code>"4061485903"</code>.
+              </td>
+              <td>
+                Add: same subject, <code>ISBN-10</code>, <code>"4-06-148590-3"</code>.<br>
+                Delete: same subject, <code>ISBN-10</code>, <code>"4061485903"</code>.
+              </td>
+              <td>
+                100 attached constraints; 65 executable factors; 57 checkable factors in both states.<br>
+                Satisfaction <code>pre -> post_gold</code>: <code>57/57 -> 57/57</code>; fixed 0, regressed 0.
+              </td>
+              <td>
+                The historical edit looks like a value correction under a single-value constraint while preserving all checkable local factors.
+              </td>
+            </tr>
+            <tr>
+              <td>
+                <code>valueRequiresStatement</code><br>
+                test row <code>28648</code>
+              </td>
+              <td>
+                Focus: Dwight H. Johnson, <code>award received</code>, Medal of Honor.
+              </td>
+              <td>
+                Add: Medal of Honor, <code>instance of</code>, courage award.<br>
+                Delete: none.
+              </td>
+              <td>
+                108 attached constraints; 60 executable factors; 43 checkable factors in both states.<br>
+                Satisfaction <code>pre -> post_gold</code>: <code>25/43 -> 25/43</code>; fixed 0, regressed 0.
+              </td>
+              <td>
+                A repair may add missing supporting type evidence without changing the aggregate number of satisfied local factors.
+              </td>
+            </tr>
+            <tr>
+              <td>
+                <code>type</code><br>
+                test row <code>9019</code>
+              </td>
+              <td>
+                Focus: French, <code>has grammatical mood</code>, indicative.
+              </td>
+              <td>
+                Add: French, <code>instance of</code>, language.<br>
+                Delete: none.
+              </td>
+              <td>
+                35 attached constraints; 14 executable factors; 11 checkable factors in both states.<br>
+                Satisfaction <code>pre -> post_gold</code>: <code>11/11 -> 11/11</code>; fixed 0, regressed 0.
+              </td>
+              <td>
+                Type-style repairs often add missing context around the subject rather than deleting the focus statement.
+              </td>
+            </tr>
+            <tr>
+              <td>
+                <code>distinct</code><br>
+                test row <code>44306</code>
+              </td>
+              <td>
+                Focus: <code>Q14778038</code>, <code>OKATO ID</code>, <code>"-"</code>.<br>
+                Conflict: Zelenogradsky District, <code>OKATO ID</code>, <code>"-"</code>.
+              </td>
+              <td>
+                Add: focus subject, <code>OKATO ID</code>, <code>"27206816016"</code>.<br>
+                Delete: focus subject, <code>OKATO ID</code>, <code>"-"</code>.
+              </td>
+              <td>
+                120 attached constraints; 67 executable factors; 41 checkable factors in both states.<br>
+                Satisfaction <code>pre -> post_gold</code>: <code>28/41 -> 29/41</code>; fixed 1, regressed 0.
+              </td>
+              <td>
+                The edit replaces a non-informative duplicate value with a specific identifier and improves one secondary factor.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
       <section id="diagnostics">
-        <h2>8. Diagnostics: What the Factors Actually Do</h2>
+        <h2>9. Diagnostics: What the Factors Actually Do</h2>
         <p>
           The diagnostics explain the mechanism behind the headline results. They are not additional leaderboard metrics. They are tests of whether the
           factor pathway learns meaningful constraint information, whether that information changes repair predictions, and whether the change is driven
@@ -1197,7 +1348,7 @@
       </section>
 
       <section id="positioning">
-        <h2>9. Scientific Value and Positioning</h2>
+        <h2>10. Scientific Value and Positioning</h2>
         <p>
           The scientific value is not that the proposed model wins every metric. The value is that the project reveals a structural evaluation problem in
           learned KG repair. Historical edit logs are attractive supervision, but they are incomplete proxies for repair quality. Symbolic satisfaction is
