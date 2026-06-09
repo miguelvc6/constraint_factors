@@ -6,7 +6,8 @@ are valuable because they improve historical repair imitation and reveal where
 imitation, symbolic safety, and non-vacuous repair quality diverge.
 
 Current implementation details, code-level boundaries, and run status belong in
-[docs-technical/00-constraint_factors.md](/home/mvazquez/constraint_factors/docs-technical/00-constraint_factors.md).
+[docs-technical/00_models_and_evaluation_matrix.md](/home/mvazquez/constraint_factors/docs-technical/00_models_and_evaluation_matrix.md)
+and [docs-technical/00_training_and_evaluation_execution_plan.md](/home/mvazquez/constraint_factors/docs-technical/00_training_and_evaluation_execution_plan.md).
 A browser-readable paper overview is available at
 [constraint_factors_research_overview.html](/home/mvazquez/constraint_factors/docs-conceptual/constraint_factors_research_overview.html).
 Earlier hypothesis documents have been moved to
@@ -281,46 +282,166 @@ symbolic Wikidata validator used in evaluation.
 Use a standard GNN backbone over the local KG graph:
 
 $$
-h_v^{(k+1)}
-= \mathrm{GNN}\left(h_v^{(k)}, \mathcal{N}(v)\right)
+\tilde{h}_v^{(k+1)}
+=
+\mathrm{GNN}_k
+\left(
+h_v^{(k)},
+\{(h_u^{(k)}, e_{u\to v}) : u \in \mathcal{N}(v)\}
+\right)
 $$
 
 ### Factor execution
 
-For each factor node `c`:
+The current `per_type_v1` implementation does not execute factors over a fixed
+tuple such as `(p, q, s)`. For each factor node `c`, graph construction creates
+role-specific scope sets:
 
 $$
-z_c^{(k)}
-= \operatorname{AGG}_{t(c)}
-\left(\{h_v^{(k)} : v \in \operatorname{Scope}(c)\}\right)
-$$
-
-$$
-\hat{s}_c^{(k)}
-= \sigma\left(f_{t(c)}(z_c^{(k)})\right)
+\mathcal{P}(c) = \{v : c \to v \text{ has predicate role}\}
 $$
 
 $$
-m_{c \to v}^{(k)}
+\mathcal{S}(c) = \{v : c \to v \text{ has subject role}\}
+$$
+
+$$
+\mathcal{O}(c) = \{v : c \to v \text{ has object role}\}
+$$
+
+with:
+
+$$
+\mathcal{R}_P(c)=\mathcal{P}(c),\quad
+\mathcal{R}_S(c)=\mathcal{S}(c),\quad
+\mathcal{R}_O(c)=\mathcal{O}(c)
+$$
+
+For each role `r in {P,S,O}`, the executor uses a mean role summary and a count:
+
+$$
+\bar{h}_{c,r}^{(k)}
 =
-g_{t(c), r(v,c)}
-\left(z_c^{(k)}, h_v^{(k)}, 1 - \hat{s}_c^{(k)}\right)
+\frac{1}{\max(1,n_{c,r})}
+\sum_{v \in \mathcal{R}_r(c)} h_v^{(k)}
 $$
 
-where `r(v,c)` is the role of variable `v` in constraint `c`.
+$$
+n_{c,r} = |\mathcal{R}_r(c)|
+$$
+
+The factor input is:
+
+$$
+\phi_c^{(k)}
+=
+\left[
+h_c^{(k)}
+\;\Vert\;
+\bar{h}_{c,P}^{(k)}
+\;\Vert\;
+\bar{h}_{c,S}^{(k)}
+\;\Vert\;
+\bar{h}_{c,O}^{(k)}
+\;\Vert\;
+\log(1+n_{c,P})
+\;\Vert\;
+\log(1+n_{c,S})
+\;\Vert\;
+\log(1+n_{c,O})
+\right]
+$$
+
+$$
+(\,a_c^{(k)}, \ell_c^{\mathrm{pre},(k)}\,)
+=
+F_{t(c)}(\phi_c^{(k)})
+$$
+
+$$
+\hat{s}_c^{\mathrm{pre},(k)}
+=
+\sigma\left(\ell_c^{\mathrm{pre},(k)}\right)
+$$
+
+where `a_c` is the learned factor state and `ell_c^pre` is the pre-edit
+satisfaction logit. Positive logits predict satisfaction; negative logits
+predict violation. A violation score can be derived as
+`1 - hat{s}_c^pre`, but the current pressure path does not pass that scalar
+directly into the pressure MLP.
+
+During training, the post-gold auxiliary head conditions on the factor state and
+the mean embedding of the six gold edit targets:
+
+$$
+\ell_c^{\mathrm{post},(k)}
+=
+Q_{t(c)}(a_c^{(k)}, e_y)
+$$
+
+$$
+\hat{s}_c^{\mathrm{post},(k)}
+=
+\sigma\left(\ell_c^{\mathrm{post},(k)}\right)
+$$
 
 ### Constraint pressure integration
 
-Variables incorporate pressure messages through a residual update:
+In the pressure-enabled model, factor pressure is applied after each backbone
+message-passing layer. The implementation rebuilds the factor features from the
+post-GNN states, reruns the type-specific executor, and emits role-conditioned
+messages:
+
+$$
+\tilde{\phi}_c^{(k+1)}
+=
+\Phi_c(\tilde{h}^{(k+1)})
+$$
+
+$$
+(\tilde{a}_c^{(k+1)}, \tilde{\ell}_c^{(k+1)})
+=
+F_{t(c)}(\tilde{\phi}_c^{(k+1)})
+$$
+
+$$
+m_{c \to v,r}^{(k)}
+=
+G_{t(c),r}
+\left(
+\left[
+\tilde{a}_c^{(k+1)}
+\;\Vert\;
+\tilde{h}_v^{(k+1)}
+\right]
+\right)
+$$
+
+For each variable, messages are aggregated and normalized by the number of
+incoming pressure edges:
+
+$$
+p_v^{(k)}
+=
+\frac{1}{\max(1,d_v)}
+\sum_{(c,r): v \in \mathcal{R}_r(c)}
+m_{c \to v,r}^{(k)}
+$$
+
+$$
+d_v =
+\sum_{(c,r)}
+\mathbf{1}\{v \in \mathcal{R}_r(c)\}
+$$
+
+The residual pressure update is:
 
 $$
 h_v^{(k+1)}
-\leftarrow
-h_v^{(k+1)}
+=
+\tilde{h}_v^{(k+1)}
 +
-\lambda
-\sum_{c: v \in \operatorname{Scope}(c)}
-m_{c \to v}^{(k)}
+\lambda p_v^{(k)}
 $$
 
 Pressure-masking diagnostics test whether these messages are actually used by
