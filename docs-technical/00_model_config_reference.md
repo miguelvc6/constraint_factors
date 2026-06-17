@@ -36,6 +36,7 @@ Core fields:
 - `pressure_type_conditioning`
 - `pressure_module_sharing`
 - `pressure_residual_scale`
+- `pressure_oracle_input`
 - `enable_policy_choice`
 - `policy_num_classes`
 
@@ -51,6 +52,11 @@ Paper-facing additions:
   - default: `per_type`
   - `per_type` preserves the current typed-pressure behavior
   - `shared` keeps factor pressure enabled but shares the role pressure modules across factor types; use this for the H2 untyped-pressure ablation only
+
+- `pressure_oracle_input`
+  - allowed values: `none`, `gold_pre_scalar`
+  - default: `none`
+  - `gold_pre_scalar` appends the gold pre-repair factor violation scalar to per-type pressure messages; use this only for the H2 gold-scalar oracle ablation
 
 ## `training_config` for proposal runs
 
@@ -156,5 +162,6 @@ Paper use:
 - Config loading is strict: unknown keys raise an error.
 - `pressure_type_conditioning` must be one of `none`, `concat`, `gate`.
 - `pressure_module_sharing` must be one of `per_type`, `shared`.
+- `pressure_oracle_input` must be one of `none`, `gold_pre_scalar`.
 - `constraint_representation` must be one of `factorized`, `eswc_passive`.
 - `chooser` and `direct_safety` should not both be enabled in the same proposal config.

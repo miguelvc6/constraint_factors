@@ -1,4 +1,5 @@
 import torch
+import pytest
 from torch_geometric.data import Data
 
 from modules.config import ModelConfig
@@ -80,3 +81,52 @@ def test_pressure_forward_and_backward():
     grads = [p.grad for p in model.parameters() if p.requires_grad]
     assert any(g is not None for g in grads)
     print("test_pressure_forward_and_backward passed")
+
+
+def test_gold_pre_scalar_pressure_forward_and_missing_label_error():
+    cfg = ModelConfig(
+        num_embedding_size=8,
+        num_layers=2,
+        hidden_channels=8,
+        head_hidden=8,
+        dropout=0.1,
+        use_node_embeddings=True,
+        use_edge_attributes=False,
+        entity_class_ids=(0, 1, 2, 3, 4),
+        predicate_class_ids=(0, 1, 2, 3),
+        num_factor_types=3,
+        factor_type_embedding_dim=4,
+        factor_executor_impl="per_type_v1",
+        pressure_enabled=True,
+        pressure_oracle_input="gold_pre_scalar",
+    )
+    model = RepairGINFactorPressure(
+        num_input_graph_nodes=10,
+        num_embedding_size=cfg.num_embedding_size,
+        num_layers=cfg.num_layers,
+        hidden=cfg.hidden_channels,
+        head_hidden=cfg.head_hidden,
+        dropout=cfg.dropout,
+        use_node_embeddings=cfg.use_node_embeddings,
+        use_role_embeddings=cfg.use_role_embeddings,
+        num_role_types=cfg.num_role_types,
+        role_embedding_dim=cfg.role_embedding_dim,
+        use_edge_attributes=cfg.use_edge_attributes,
+        use_edge_subtraction=cfg.use_edge_subtraction,
+        entity_class_ids=cfg.entity_class_ids,
+        predicate_class_ids=cfg.predicate_class_ids,
+        num_factor_types=cfg.num_factor_types,
+        factor_type_embedding_dim=cfg.factor_type_embedding_dim,
+        factor_executor_impl=cfg.factor_executor_impl,
+        pressure_enabled=cfg.pressure_enabled,
+        pressure_oracle_input=cfg.pressure_oracle_input,
+    )
+
+    data = _make_sample_graph()
+    outputs = model(data)
+    assert outputs["edit_logits"].shape == (1, 6, model.num_target_ids)
+
+    missing = _make_sample_graph()
+    delattr(missing, "factor_satisfied_pre")
+    with pytest.raises(ValueError, match="factor_satisfied_pre"):
+        model(missing)

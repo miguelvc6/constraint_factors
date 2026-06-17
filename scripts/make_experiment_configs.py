@@ -177,6 +177,7 @@ class ProposalExperiment:
     dynamic_reweighting_enabled: bool = False
     pressure_module_sharing: str = "per_type"
     factor_executor_impl: str = "per_type_v1"
+    pressure_oracle_input: str = "none"
     factor_loss_enabled: bool | None = None
 
 
@@ -211,6 +212,7 @@ def _proposal_config_payload(
         "pressure_type_conditioning": exp.pressure_type_conditioning,
         "pressure_module_sharing": exp.pressure_module_sharing,
         "pressure_residual_scale": LOCKED_PRESSURE_RESIDUAL_SCALE,
+        "pressure_oracle_input": exp.pressure_oracle_input,
         "num_factor_types": int(num_factor_types),
         "enable_policy_choice": exp.enable_policy_choice,
         "policy_num_classes": 6,
@@ -428,6 +430,15 @@ def main() -> None:
             pressure_enabled=True,
             pressure_type_conditioning="concat",
             factor_executor_impl="legacy_shared",
+            validate_factor_labels=True,
+        ),
+        ProposalExperiment(
+            name="h2_a1_gold_scalar_pressure",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            pressure_oracle_input="gold_pre_scalar",
             validate_factor_labels=True,
         ),
     ]

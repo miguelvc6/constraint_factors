@@ -16,6 +16,7 @@ from modules.config import ModelConfig
 from modules.h2_eval import (
     aggregate_semantic_records,
     clone_with_factor_pressure_mask,
+    clone_with_gold_pre_factor_pressure_mask,
     count_train_factor_exposure,
     density_bucket,
     exposure_bucket,
@@ -49,6 +50,8 @@ def _factor_graph() -> Data:
     graph.factor_node_index = torch.tensor([3, 4], dtype=torch.long)
     graph.factor_constraint_ids = torch.tensor([101, 202], dtype=torch.long)
     graph.factor_types = torch.tensor([0, 1], dtype=torch.long)
+    graph.factor_checkable_pre = torch.tensor([True, True], dtype=torch.bool)
+    graph.factor_satisfied_pre = torch.tensor([1, 0], dtype=torch.long)
     graph.primary_factor_index = 0
     return graph
 
@@ -107,9 +110,22 @@ def test_counterfactual_masking_removes_expected_edges_without_mutation() -> Non
     assert overlap["shared_pressure_target_nodes"] == 1
 
 
+def test_gold_pre_factor_pressure_mask_keeps_only_unsatisfied_factor_edges() -> None:
+    graph = _factor_graph()
+    original_edge_count = int(graph.edge_index.size(1))
+
+    masked = clone_with_gold_pre_factor_pressure_mask(graph)
+
+    assert int(graph.edge_index.size(1)) == original_edge_count
+    assert masked.edge_type.tolist() == [0, 1, 4, 6]
+    assert masked.edge_index.tolist() == [[0, 1, 4, 4], [1, 2, 0, 2]]
+
+
 def test_model_config_accepts_pressure_module_sharing() -> None:
     cfg = ModelConfig.from_mapping({"pressure_module_sharing": "shared"})
     assert cfg.pressure_module_sharing == "shared"
+    oracle_cfg = ModelConfig.from_mapping({"pressure_oracle_input": "gold_pre_scalar"})
+    assert oracle_cfg.pressure_oracle_input == "gold_pre_scalar"
 
     model_cfg = ModelConfig.from_mapping(
         {
@@ -167,10 +183,13 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
 
         h2_dirs = sorted(path.name for path in models.iterdir() if path.name.startswith("h2_"))
         assert h2_dirs == [
+            "h2_a1_gold_scalar_pressure__toy_minocc100__node_id",
             "h2_a1_legacy_shared_executor__toy_minocc100__node_id",
             "h2_a1_no_factor_loss__toy_minocc100__node_id",
             "h2_a1_shared_pressure__toy_minocc100__node_id",
         ]
+        cfg = json.loads((models / "h2_a1_gold_scalar_pressure__toy_minocc100__node_id" / "config.json").read_text())
+        assert cfg["model_config"]["pressure_oracle_input"] == "gold_pre_scalar"
         cfg = json.loads((models / "h2_a1_shared_pressure__toy_minocc100__node_id" / "config.json").read_text())
         assert cfg["model_config"]["pressure_module_sharing"] == "shared"
         cfg = json.loads((models / "h2_a1_no_factor_loss__toy_minocc100__node_id" / "config.json").read_text())

@@ -182,6 +182,70 @@ def clone_with_factor_pressure_mask(graph: Data, mode: str) -> Data:
     return cloned
 
 
+def clone_with_gold_pre_factor_pressure_mask(graph: Data) -> Data:
+    """Keep factor-pressure edges only for gold pre-repair unsatisfied factors."""
+
+    cloned = graph.clone()
+    edge_index = getattr(cloned, "edge_index", None)
+    edge_type = getattr(cloned, "edge_type", None)
+    factor_node_index = getattr(cloned, "factor_node_index", None)
+    factor_satisfied = getattr(cloned, "factor_satisfied_pre", None)
+    if edge_index is None or edge_type is None or factor_node_index is None or factor_satisfied is None:
+        return cloned
+
+    edge_type = torch.as_tensor(edge_type).view(-1)
+    if edge_index.numel() == 0 or edge_type.numel() == 0:
+        return cloned
+
+    pressure_mask = torch.zeros(edge_type.numel(), dtype=torch.bool, device=edge_type.device)
+    for etype in FACTOR_TO_LOCAL_EDGE_TYPES:
+        pressure_mask |= edge_type == etype
+    if not bool(pressure_mask.any()):
+        return cloned
+
+    factor_nodes = torch.as_tensor(
+        factor_node_index,
+        dtype=torch.long,
+        device=edge_index.device,
+    ).view(-1)
+    labels = torch.as_tensor(
+        factor_satisfied,
+        dtype=torch.long,
+        device=edge_index.device,
+    ).view(-1)
+    if labels.numel() != factor_nodes.numel():
+        return cloned
+
+    checkable_raw = getattr(cloned, "factor_checkable_pre", None)
+    if checkable_raw is not None:
+        checkable = torch.as_tensor(
+            checkable_raw,
+            dtype=torch.bool,
+            device=edge_index.device,
+        ).view(-1)
+        if checkable.numel() != factor_nodes.numel():
+            checkable = torch.zeros_like(labels, dtype=torch.bool)
+    else:
+        checkable = torch.ones_like(labels, dtype=torch.bool)
+
+    src_to_factor_pos = {int(node): idx for idx, node in enumerate(factor_nodes.tolist())}
+    keep = torch.ones(edge_type.numel(), dtype=torch.bool, device=edge_type.device)
+    src = edge_index[0]
+    pressure_edge_positions = torch.nonzero(pressure_mask, as_tuple=False).view(-1)
+    for edge_pos in pressure_edge_positions.tolist():
+        factor_pos = src_to_factor_pos.get(int(src[edge_pos].item()))
+        if factor_pos is None:
+            continue
+        if not bool(checkable[factor_pos].item()):
+            continue
+        if int(labels[factor_pos].item()) == 1:
+            keep[edge_pos] = False
+
+    cloned.edge_index = edge_index[:, keep]
+    cloned.edge_type = edge_type[keep]
+    return cloned
+
+
 def count_train_factor_exposure(train_data: Iterable[Data]) -> Counter[int]:
     counts: Counter[int] = Counter()
     for graph in train_data:
@@ -739,6 +803,7 @@ def write_h2_report(
     output_dir: Path,
     support: H2RunSupport,
     batch_size: int,
+    include_gold_pressure_mask: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     exposure_counts = count_train_factor_exposure(train_data)
@@ -755,6 +820,11 @@ def write_h2_report(
             test_data, lambda graph: clone_with_factor_pressure_mask(graph, "secondary_only_pressure")
         ),
     }
+    if include_gold_pressure_mask:
+        variants["oracle_gold_unsatisfied_pressure"] = TransformedGraphDataset(
+            test_data,
+            clone_with_gold_pre_factor_pressure_mask,
+        )
 
     variant_outputs = []
     for variant_name, dataset in variants.items():
@@ -884,6 +954,7 @@ __all__ = [
     "H2RunSupport",
     "aggregate_semantic_records",
     "clone_with_factor_pressure_mask",
+    "clone_with_gold_pre_factor_pressure_mask",
     "count_train_factor_exposure",
     "density_bucket",
     "exposure_bucket",

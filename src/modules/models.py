@@ -322,6 +322,7 @@ class BaseGraphModel(nn.Module, ABC):
         pressure_type_conditioning: str = "none",
         pressure_module_sharing: str = "per_type",
         pressure_residual_scale: float = 0.1,
+        pressure_oracle_input: str = "none",
         enable_policy_choice: bool = False,
         policy_num_classes: int = 6,
     ):
@@ -445,8 +446,11 @@ class BaseGraphModel(nn.Module, ABC):
             raise ValueError("constraint_representation must be 'factorized' or 'eswc_passive'")
         self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
         self._pressure_module_sharing = str(pressure_module_sharing).lower()
+        self._pressure_oracle_input = str(pressure_oracle_input).lower()
         if self._pressure_module_sharing not in {"per_type", "shared"}:
             raise ValueError("pressure_module_sharing must be 'per_type' or 'shared'")
+        if self._pressure_oracle_input not in {"none", "gold_pre_scalar"}:
+            raise ValueError("pressure_oracle_input must be 'none' or 'gold_pre_scalar'")
         self._pressure_residual_scale = float(pressure_residual_scale)
         self._factor_state_dim = head_hidden
         self._factor_scope_feature_dim = (hidden_mp * 4) + 3
@@ -996,6 +1000,7 @@ class RepairGINFactorPressure(BaseGraphModel):
         pressure_type_conditioning: str = "none",
         pressure_module_sharing: str = "per_type",
         pressure_residual_scale: float = 0.1,
+        pressure_oracle_input: str = "none",
         **kwargs,
     ):
         super().__init__(
@@ -1003,18 +1008,24 @@ class RepairGINFactorPressure(BaseGraphModel):
             pressure_type_conditioning=pressure_type_conditioning,
             pressure_module_sharing=pressure_module_sharing,
             pressure_residual_scale=pressure_residual_scale,
+            pressure_oracle_input=pressure_oracle_input,
             **kwargs,
         )
         self._pressure_enabled = bool(pressure_enabled)
         self._pressure_type_conditioning = str(pressure_type_conditioning).lower()
         self._pressure_module_sharing = str(pressure_module_sharing).lower()
         self._pressure_residual_scale = float(pressure_residual_scale)
+        self._pressure_oracle_input = str(pressure_oracle_input).lower()
         if self._pressure_type_conditioning not in {"none", "concat", "gate"}:
             raise ValueError(
                 "pressure_type_conditioning must be 'none', 'concat', or 'gate'"
             )
         if self._pressure_module_sharing not in {"per_type", "shared"}:
             raise ValueError("pressure_module_sharing must be 'per_type' or 'shared'")
+        if self._pressure_oracle_input not in {"none", "gold_pre_scalar"}:
+            raise ValueError("pressure_oracle_input must be 'none' or 'gold_pre_scalar'")
+        if self._pressure_oracle_input != "none" and self._factor_executor_impl != "per_type_v1":
+            raise ValueError("pressure_oracle_input is only supported with factor_executor_impl='per_type_v1'")
         self._pressure_role_dim = 8
         self._pressure_role_embeddings = nn.Embedding(3, self._pressure_role_dim)
         self._pressure_violation_head = nn.Linear(self.hidden_channels, 1)
@@ -1046,7 +1057,12 @@ class RepairGINFactorPressure(BaseGraphModel):
                     str(role_id): nn.ModuleList(
                         [
                             nn.Sequential(
-                                nn.Linear(self._factor_state_dim + self.hidden_channels, self.hidden_channels),
+                            nn.Linear(
+                                self._factor_state_dim
+                                + self.hidden_channels
+                                + (1 if self._pressure_oracle_input == "gold_pre_scalar" else 0),
+                                self.hidden_channels,
+                            ),
                                 nn.ReLU(),
                                 nn.Linear(self.hidden_channels, self.hidden_channels),
                             )
@@ -1086,6 +1102,9 @@ class RepairGINFactorPressure(BaseGraphModel):
             if runtime is None:
                 return x
             factor_states, _ = self._run_per_type_factor_executors(runtime)
+            oracle_scalar = None
+            if self._pressure_oracle_input == "gold_pre_scalar":
+                oracle_scalar = self._gold_pre_violation_scalar(runtime, data, dtype=x.dtype)
             aggregated = torch.zeros_like(x)
 
             def _apply_role(
@@ -1103,11 +1122,19 @@ class RepairGINFactorPressure(BaseGraphModel):
                 type_ids = runtime.factor_type_ids.index_select(0, factor_pos)
                 dst_emb = x.index_select(0, dst_index)
                 factor_state = factor_states.index_select(0, factor_pos)
+                gold_input = (
+                    oracle_scalar.index_select(0, factor_pos)
+                    if oracle_scalar is not None
+                    else None
+                )
                 for type_id in torch.unique(type_ids).tolist():
                     mask = type_ids == int(type_id)
                     if not mask.any():
                         continue
-                    message_input = torch.cat([factor_state[mask], dst_emb[mask]], dim=-1)
+                    message_parts = [factor_state[mask], dst_emb[mask]]
+                    if gold_input is not None:
+                        message_parts.append(gold_input[mask])
+                    message_input = torch.cat(message_parts, dim=-1)
                     module_index = int(type_id) if self._pressure_module_sharing == "per_type" else 0
                     per_edge_messages[mask] = role_modules[role_key][module_index](message_input)
                 aggregated.index_add_(0, dst_index, per_edge_messages)
@@ -1236,6 +1263,42 @@ class RepairGINFactorPressure(BaseGraphModel):
         aggregated = aggregated / degree.clamp(min=1.0).unsqueeze(-1)
         x = x + (self._pressure_residual_scale * aggregated)
         return x
+
+    def _gold_pre_violation_scalar(
+        self,
+        runtime: FactorScopeRuntime,
+        data,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        labels = getattr(data, "factor_satisfied_pre", None)
+        if labels is None:
+            raise ValueError(
+                "pressure_oracle_input='gold_pre_scalar' requires factor_satisfied_pre on factorized graphs."
+            )
+        labels_t = torch.as_tensor(labels, device=runtime.factor_node_emb.device).view(-1)
+        if labels_t.numel() != runtime.factor_node_index.numel():
+            raise ValueError(
+                "factor_satisfied_pre length must match factor count when pressure_oracle_input='gold_pre_scalar'."
+            )
+        labels_t = labels_t.to(dtype=dtype).clamp(min=0.0, max=1.0)
+        violation = 1.0 - labels_t
+
+        checkable = getattr(data, "factor_checkable_pre", None)
+        if checkable is not None:
+            checkable_t = torch.as_tensor(
+                checkable,
+                dtype=torch.bool,
+                device=runtime.factor_node_emb.device,
+            ).view(-1)
+            if checkable_t.numel() != labels_t.numel():
+                raise ValueError(
+                    "factor_checkable_pre length must match factor count when pressure_oracle_input='gold_pre_scalar'."
+                )
+            neutral = torch.full_like(violation, 0.5)
+            violation = torch.where(checkable_t, violation, neutral)
+
+        return violation.unsqueeze(-1)
 
     def forward(self, data):
         x, batch = data.x, data.batch
@@ -1398,6 +1461,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         pressure_type_conditioning=getattr(config, "pressure_type_conditioning", "none"),
         pressure_module_sharing=getattr(config, "pressure_module_sharing", "per_type"),
         pressure_residual_scale=getattr(config, "pressure_residual_scale", 0.1),
+        pressure_oracle_input=getattr(config, "pressure_oracle_input", "none"),
         enable_policy_choice=getattr(config, "enable_policy_choice", False),
         policy_num_classes=getattr(config, "policy_num_classes", 6),
     )

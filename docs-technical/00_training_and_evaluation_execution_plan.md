@@ -596,14 +596,16 @@ For the current paper artifact stack, this emits:
 - `models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id/config.json`
 - `models/h2_a1_shared_pressure__full_strat1m_minocc100__node_id/config.json`
 - `models/h2_a1_legacy_shared_executor__full_strat1m_minocc100__node_id/config.json`
+- `models/h2_a1_gold_scalar_pressure__full_strat1m_minocc100__node_id/config.json`
 
 These are supporting ablations only. They use the existing processed graphs, the locked A1-style proposal setup, no chooser, and no direct-safety objective:
 
 - `h2_a1_no_factor_loss`: tests whether the auxiliary factor satisfaction loss contributes to H2 factor semantics.
 - `h2_a1_shared_pressure`: keeps pressure enabled but shares role pressure modules across factor types, testing typed pressure specifically.
 - `h2_a1_legacy_shared_executor`: uses the legacy shared factor executor, testing the newer per-type executor path.
+- `h2_a1_gold_scalar_pressure`: appends the gold pre-repair factor violation scalar to pressure messages, testing whether perfect factor-satisfaction information would improve downstream predictions.
 
-Train and evaluate the three runs with:
+Train and evaluate the H2 appendix runs with:
 
 ```bash
 uv run src/10_scheduler.py \
@@ -629,9 +631,26 @@ uv run src/09_eval.py \
   --run-directory models/h2_a1_legacy_shared_executor__full_strat1m_minocc100__node_id \
   --strict-global-metrics \
   --h2-eval
+
+uv run src/09_eval.py \
+  --run-directory models/h2_a1_gold_scalar_pressure__full_strat1m_minocc100__node_id \
+  --strict-global-metrics \
+  --h2-eval
 ```
 
 The H2 outputs are written under each run's `evaluations/h2/` directory. These ablations should be reported as appendix diagnostics for H2, not as replacements for the canonical `B0`, `A1`, `M1C`, `M1D`, or `G0` results.
+
+To reuse the already trained `A1` checkpoint for the read-only oracle mask, run:
+
+```bash
+uv run src/09_eval.py \
+  --run-directory models/a1_factorized_imitation__full_strat1m_minocc100__node_id \
+  --strict-global-metrics \
+  --h2-eval \
+  --h2-include-gold-pressure-mask
+```
+
+This adds `oracle_gold_unsatisfied_pressure` to the A1 H2 counterfactual variants. It does not train a new checkpoint and does not modify graph artifacts.
 
 ## 9. Candidate-oracle analysis
 

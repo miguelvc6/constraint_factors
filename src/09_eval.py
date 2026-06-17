@@ -1419,6 +1419,14 @@ def parse_args():
         help="Batch size for --h2-eval forward passes.",
     )
     parser.add_argument(
+        "--h2-include-gold-pressure-mask",
+        action="store_true",
+        help=(
+            "Include the read-only H2 oracle variant that keeps factor pressure "
+            "only from gold pre-repair unsatisfied factors."
+        ),
+    )
+    parser.add_argument(
         "--strict-global-metrics",
         action="store_true",
         help="Fail fast unless global metrics (GFR/SRR/SIR/disruption) can be computed.",
@@ -1483,6 +1491,8 @@ def parse_args():
             raise ValueError("--reranker-predictions is only supported for trained model evaluation.")
         if args.h2_eval:
             raise ValueError("--h2-eval is only supported for trained factorized model evaluation.")
+        if args.h2_include_gold_pressure_mask:
+            raise ValueError("--h2-include-gold-pressure-mask is only supported with --h2-eval.")
         return args
 
     if args.run_directory is None:
@@ -1501,6 +1511,8 @@ def parse_args():
         raise NotADirectoryError(f"Run directory path is not a directory: {run_directory}")
     if args.h2_eval and args.reranker_predictions:
         raise RuntimeError("--h2-eval cannot be combined with --reranker-predictions.")
+    if args.h2_include_gold_pressure_mask and not args.h2_eval:
+        raise ValueError("--h2-include-gold-pressure-mask requires --h2-eval.")
     if args.h2_batch_size <= 0:
         raise ValueError("--h2-batch-size must be positive.")
 
@@ -1762,6 +1774,7 @@ def main():
                     global_support=global_support,
                 ),
                 batch_size=args.h2_batch_size,
+                include_gold_pressure_mask=args.h2_include_gold_pressure_mask,
             )
             logging.info("Wrote H2 report to %s (status=%s)", h2_dir / "h2_report.json", report.get("status"))
             return

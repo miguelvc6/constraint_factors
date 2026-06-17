@@ -527,6 +527,13 @@ Inference-time masking shows large drops in Micro-F1 and Primary Fix when factor
 pressure is removed. The factor pathway is not decorative; it materially affects
 predictions.
 
+Gold-pressure oracle diagnostics separate factor semantic error from pressure
+routing error. If reusing `A1` with gold unsatisfied-factor pressure, or training
+an A1-style model with a gold pre-repair factor violation scalar, materially
+improves repair metrics, then imperfect factor satisfaction prediction is part
+of the bottleneck. If not, the bottleneck is more likely the pressure routing,
+edit objective, or candidate-selection interface.
+
 ### Secondary pressure is weak
 
 Secondary-only pressure masking changes few predictions and produces small

@@ -44,6 +44,7 @@
 - Chooser training supports streamed datasets via per-graph `context_index` assignment; contexts/parquet sidecars must align with graph ordering/counts.
 - CUDA batch prefetch (`TRAIN_CUDA_PREFETCH`) is available and enabled by default; on some hardware/data combinations it may not improve throughput, so treat it as a tunable runtime flag.
 - H2 ablation configs are appendix runs. Train them only into their generated `h2_a1_*` run directories; they should not replace the current canonical or hyperparameter-search checkpoints.
+- The H2 gold-scalar pressure ablation uses `model_config.pressure_oracle_input="gold_pre_scalar"` and requires `factor_satisfied_pre` / `factor_checkable_pre` graph fields. It is an oracle appendix run, not a deployable training configuration.
 
 ## Profiling & Throughput Controls
 

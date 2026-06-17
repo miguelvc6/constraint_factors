@@ -106,7 +106,7 @@ The H2 report includes:
 - factor semantic metrics for `factor_logits_pre` and `factor_logits_post_gold` against existing factor satisfaction labels, grouped by factor state, family, and compact type
 - transfer slices by train-set factor exposure bucket (`unseen`, `low_1_10`, `medium_11_100`, `high_gt100`), primary vs secondary role, and family
 - density/composition slices by local factor count bucket (`1`, `2_4`, `5_16`, `17_64`, `65_plus`) plus shared pressure-overlap summaries
-- inference-time pressure masking variants: `normal`, `no_factor_pressure`, `primary_only_pressure`, and `secondary_only_pressure`
+- inference-time pressure masking variants: `normal`, `no_factor_pressure`, `primary_only_pressure`, and `secondary_only_pressure`; when requested, `oracle_gold_unsatisfied_pressure` reuses the trained checkpoint but keeps pressure edges only from gold pre-repair unsatisfied factors
 - counterfactual prediction-change rates and repair/global metric deltas relative to `normal`
 
 Factor semantic rows report support, positive rate, accuracy, precision, recall, F1, AUROC, AUPRC, and ECE. If a model checkpoint does not emit factor logits, the H2 report is marked partial and records the unsupported section instead of failing the whole evaluation.
@@ -118,5 +118,6 @@ The H2 ablations are appendix/supporting runs. They are not canonical main-suite
 - `h2_a1_no_factor_loss__<variant>__<encoding>`: A1-style factorized graph and pressure, but disables auxiliary factor satisfaction loss.
 - `h2_a1_shared_pressure__<variant>__<encoding>`: keeps factor pressure enabled but shares role pressure modules across factor types through `pressure_module_sharing="shared"`.
 - `h2_a1_legacy_shared_executor__<variant>__<encoding>`: uses the older shared factor executor path through `factor_executor_impl="legacy_shared"`.
+- `h2_a1_gold_scalar_pressure__<variant>__<encoding>`: A1-style factorized graph and pressure, but appends the gold pre-repair factor violation scalar to pressure messages through `pressure_oracle_input="gold_pre_scalar"`.
 
-All three use current processed factorized graphs, A1-style slot inference, no chooser, and no direct safety objective.
+All four use current processed factorized graphs, A1-style slot inference, no chooser, and no direct safety objective. The gold-scalar run is an oracle diagnostic only, not a deployable model.

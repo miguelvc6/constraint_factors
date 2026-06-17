@@ -365,6 +365,8 @@ class ModelConfig:
     """Share factor pressure modules: per_type|shared."""
     pressure_residual_scale: float = 0.1
     """Scale applied to degree-normalized pressure residual messages."""
+    pressure_oracle_input: str = "none"
+    """Oracle pressure input mode for diagnostics: none|gold_pre_scalar."""
     enable_policy_choice: bool = False
     """Enable policy choice head over graph embeddings."""
     policy_num_classes: int = 6
@@ -423,6 +425,11 @@ class ModelConfig:
             if value < 0.0:
                 raise ValueError("pressure_residual_scale must be non-negative")
             filtered["pressure_residual_scale"] = value
+        if "pressure_oracle_input" in filtered and filtered["pressure_oracle_input"] is not None:
+            value = str(filtered["pressure_oracle_input"]).lower()
+            if value not in {"none", "gold_pre_scalar"}:
+                raise ValueError("pressure_oracle_input must be 'none' or 'gold_pre_scalar'")
+            filtered["pressure_oracle_input"] = value
         if "enable_policy_choice" in filtered and filtered["enable_policy_choice"] is not None:
             filtered["enable_policy_choice"] = bool(filtered["enable_policy_choice"])
         if "policy_num_classes" in filtered and filtered["policy_num_classes"] is not None:
