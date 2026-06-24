@@ -605,6 +605,8 @@ These are supporting ablations only. They use the existing processed graphs, the
 - `h2_a1_legacy_shared_executor`: uses the legacy shared factor executor, testing the newer per-type executor path.
 - `h2_a1_gold_scalar_pressure`: appends the gold pre-repair factor violation scalar to pressure messages, testing whether perfect factor-satisfaction information would improve downstream predictions.
 
+The gold-scalar oracle ablation keeps the same dataset, architecture, optimizer, and epoch schedule as the generated proposal configs, but uses `training_config.batch_size: 64` for the current full artifact run. The oracle pressure input makes dense batches substantially more expensive than the other H2 ablations at the generic `batch_size: 256`; the smaller batch avoids multi-minute dense-batch stalls while preserving the diagnostic comparison.
+
 Train and evaluate the H2 appendix runs with:
 
 ```bash

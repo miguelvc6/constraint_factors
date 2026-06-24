@@ -4787,7 +4787,7 @@
     "use_role_embeddings": true
   },
   "training_config": {
-    "batch_size": 256,
+    "batch_size": 64,
     "chooser": {
       "beta_no_regression": 0.5,
       "enabled": false,
