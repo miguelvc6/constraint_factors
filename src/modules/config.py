@@ -1,7 +1,23 @@
 import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Literal, Mapping
+
+
+PrimaryConstraintMode = Literal[
+    "executable_factor",
+    "query_definition",
+    "query_family",
+    "passive_node",
+    "none",
+]
+PRIMARY_CONSTRAINT_MODES: tuple[str, ...] = (
+    "executable_factor",
+    "query_definition",
+    "query_family",
+    "passive_node",
+    "none",
+)
 
 
 def _filter_fields(cls, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -373,6 +389,8 @@ class ModelConfig:
     """Number of policy classes for policy choice head."""
     constraint_representation: str = "factorized"
     """Graph representation regime: factorized or eswc_passive."""
+    primary_constraint_mode: PrimaryConstraintMode = "executable_factor"
+    """How the primary violated constraint is exposed to factorized models."""
     factor_executor_impl: str = "per_type_v1"
     """Factor executor implementation: per_type_v1 or legacy_shared."""
 
@@ -441,6 +459,14 @@ class ModelConfig:
                     "constraint_representation must be 'factorized' or 'eswc_passive'"
                 )
             filtered["constraint_representation"] = value
+        if "primary_constraint_mode" in filtered and filtered["primary_constraint_mode"] is not None:
+            value = str(filtered["primary_constraint_mode"]).lower()
+            if value not in PRIMARY_CONSTRAINT_MODES:
+                raise ValueError(
+                    "primary_constraint_mode must be one of "
+                    + ", ".join(PRIMARY_CONSTRAINT_MODES)
+                )
+            filtered["primary_constraint_mode"] = value
         if "factor_executor_impl" in filtered and filtered["factor_executor_impl"] is not None:
             value = str(filtered["factor_executor_impl"]).lower()
             if value not in {"per_type_v1", "legacy_shared"}:
@@ -472,6 +498,7 @@ class TrainingConfig:
     num_workers: int = 0  # Worker processes used by DataLoader.
     pin_memory: bool | None = None  # Override DataLoader pin_memory behaviour (None keeps the default).
     validate_factor_labels: bool = False  # Enable strict factor label assertions per batch.
+    train_subset_size: int | None = None  # Optional cap on training graphs per epoch.
     validation_subset_size: int | None = None  # Optional cap on validation graphs per epoch.
     constraint_loss: ConstraintLossConfig = field(default_factory=ConstraintLossConfig)
     fix_probability_loss: FixProbabilityLossConfig = field(default_factory=FixProbabilityLossConfig)
@@ -510,6 +537,11 @@ class TrainingConfig:
             if subset_size <= 0:
                 raise ValueError("TrainingConfig.validation_subset_size must be positive when set")
             filtered["validation_subset_size"] = subset_size
+        if "train_subset_size" in filtered and filtered["train_subset_size"] is not None:
+            subset_size = int(filtered["train_subset_size"])
+            if subset_size <= 0:
+                raise ValueError("TrainingConfig.train_subset_size must be positive when set")
+            filtered["train_subset_size"] = subset_size
 
         if dynamic_fallback is not None:
             if constraint_update is None:
@@ -569,6 +601,8 @@ class TrainingConfig:
 
 __all__ = [
     "ModelConfig",
+    "PrimaryConstraintMode",
+    "PRIMARY_CONSTRAINT_MODES",
     "TrainingConfig",
     "ConstraintLossConfig",
     "DynamicReweightingConfig",

@@ -325,6 +325,7 @@ class BaseGraphModel(nn.Module, ABC):
         pressure_oracle_input: str = "none",
         enable_policy_choice: bool = False,
         policy_num_classes: int = 6,
+        primary_constraint_mode: str = "executable_factor",
     ):
         super().__init__()
         self._num_input_graph_nodes = int(num_input_graph_nodes)
@@ -385,6 +386,34 @@ class BaseGraphModel(nn.Module, ABC):
         self.mp_layers = nn.ModuleList([self.create_conv_layer(hidden_mp, hidden_mp) for _ in range(num_layers - 1)])
 
         self.shared_projection = nn.Linear(hidden_mp, head_hidden)
+        self._primary_constraint_mode = str(primary_constraint_mode).lower()
+        if self._primary_constraint_mode not in {
+            "executable_factor",
+            "query_definition",
+            "query_family",
+            "passive_node",
+            "none",
+        }:
+            raise ValueError("Unsupported primary_constraint_mode")
+        self._primary_query_enabled = self._primary_constraint_mode in {
+            "query_definition",
+            "query_family",
+        }
+        if self._primary_query_enabled:
+            family_count = max(1, int(num_factor_types))
+            self.primary_family_embeddings = nn.Embedding(family_count, self._node_embedding_dim)
+            self.primary_id_embeddings = nn.Embedding(self.num_input_graph_nodes, self._node_embedding_dim)
+            self.primary_query_family_projection = nn.Linear(self._node_embedding_dim, head_hidden)
+            self.primary_query_definition_mlp = nn.Sequential(
+                nn.Linear((self._node_embedding_dim * 4) + hidden_mp, head_hidden),
+                nn.ReLU(),
+                nn.Linear(head_hidden, head_hidden),
+            )
+        else:
+            self.primary_family_embeddings = None
+            self.primary_id_embeddings = None
+            self.primary_query_family_projection = None
+            self.primary_query_definition_mlp = None
 
         def make_branch() -> nn.Sequential:
             return nn.Sequential(
@@ -716,6 +745,15 @@ class BaseGraphModel(nn.Module, ABC):
         factor_logits_post_gold = None
 
         if factor_node_emb is None or factor_node_emb.numel() == 0 or factor_graph_index is None:
+            if factor_mask_pre is not None and factor_mask_pre.numel() == 0:
+                empty_logits = node_emb.new_empty((0,))
+                empty_index = torch.empty((0,), dtype=torch.long, device=node_emb.device)
+                return {
+                    "factor_logits_pre": empty_logits,
+                    "factor_logits_post_gold": empty_logits.clone(),
+                    "factor_mask_pre": factor_mask_pre,
+                    "factor_graph_index": empty_index,
+                }
             return {
                 "factor_logits_pre": factor_logits_pre,
                 "factor_logits_post_gold": factor_logits_post_gold,
@@ -784,6 +822,135 @@ class BaseGraphModel(nn.Module, ABC):
             "factor_mask_pre": factor_mask_pre,
             "factor_graph_index": runtime.factor_graph_index,
         }
+
+    def _primary_id_embedding(self, ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+        embeddings = self.primary_id_embeddings
+        if embeddings is None:
+            raise RuntimeError("Primary id embeddings are not initialized.")
+        ids = ids.to(device=device, dtype=torch.long).clamp(min=0, max=self.num_input_graph_nodes - 1)
+        return embeddings(ids)
+
+    def _pool_primary_params(
+        self,
+        param_ids: torch.Tensor | None,
+        counts: torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        pooled = torch.zeros((batch_size, self._node_embedding_dim), device=device, dtype=dtype)
+        if param_ids is None:
+            return pooled
+        param_ids = torch.as_tensor(param_ids, device=device, dtype=torch.long).view(-1)
+        counts = counts.to(device=device, dtype=torch.long).view(-1)
+        if counts.numel() != batch_size:
+            raise ValueError(
+                f"primary_param_count length {counts.numel()} does not match batch size {batch_size}"
+            )
+        total = int(counts.sum().item())
+        if total == 0:
+            return pooled
+        if param_ids.numel() != total:
+            raise ValueError(
+                "primary parameter id length does not match sum(primary_param_count): "
+                f"{param_ids.numel()} vs {total}"
+            )
+        graph_index = torch.repeat_interleave(
+            torch.arange(batch_size, device=device, dtype=torch.long),
+            counts,
+        )
+        embedded = self._primary_id_embedding(param_ids, device).to(dtype=dtype)
+        pooled.index_add_(0, graph_index, embedded)
+        denom = counts.clamp(min=1).to(device=device, dtype=dtype).unsqueeze(-1)
+        return pooled / denom
+
+    def _focus_summary(
+        self,
+        node_emb: torch.Tensor,
+        data,
+        *,
+        batch_size: int,
+    ) -> torch.Tensor:
+        batch = getattr(data, "batch", None)
+        role_flags = getattr(data, "role_flags", None)
+        if batch is None or role_flags is None:
+            return node_emb.new_zeros((batch_size, node_emb.size(-1)))
+        batch = torch.as_tensor(batch, device=node_emb.device, dtype=torch.long).view(-1)
+        role_flags = torch.as_tensor(role_flags, device=node_emb.device, dtype=torch.long).view(-1)
+        if batch.numel() != node_emb.size(0) or role_flags.numel() != node_emb.size(0):
+            return node_emb.new_zeros((batch_size, node_emb.size(-1)))
+        mask = role_flags != 0
+        if not mask.any():
+            return node_emb.new_zeros((batch_size, node_emb.size(-1)))
+        focus_batch = batch[mask]
+        summary = node_emb.new_zeros((batch_size, node_emb.size(-1)))
+        summary.index_add_(0, focus_batch, node_emb[mask])
+        counts = node_emb.new_zeros((batch_size, 1))
+        counts.index_add_(
+            0,
+            focus_batch,
+            torch.ones((int(mask.sum().item()), 1), device=node_emb.device, dtype=node_emb.dtype),
+        )
+        return summary / counts.clamp(min=1.0)
+
+    def _primary_query_bias(
+        self,
+        node_emb: torch.Tensor,
+        data,
+        *,
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        if not self._primary_query_enabled:
+            return None
+        type_ids = getattr(data, "primary_constraint_type_id", None)
+        if type_ids is None:
+            raise ValueError(
+                f"primary_constraint_type_id is required for primary_constraint_mode={self._primary_constraint_mode}"
+            )
+        family_embeddings = self.primary_family_embeddings
+        family_projection = self.primary_query_family_projection
+        definition_mlp = self.primary_query_definition_mlp
+        if family_embeddings is None or family_projection is None or definition_mlp is None:
+            raise RuntimeError("Primary query modules are not initialized.")
+        type_ids = torch.as_tensor(type_ids, device=node_emb.device, dtype=torch.long).view(-1)
+        if type_ids.numel() != batch_size:
+            raise ValueError(
+                f"primary_constraint_type_id length {type_ids.numel()} does not match batch size {batch_size}"
+            )
+        type_ids = type_ids.clamp(min=0, max=family_embeddings.num_embeddings - 1)
+        family = family_embeddings(type_ids)
+        if self._primary_constraint_mode == "query_family":
+            return family_projection(family)
+
+        property_ids = getattr(data, "primary_constrained_property_id", None)
+        counts = getattr(data, "primary_param_count", None)
+        if property_ids is None or counts is None:
+            raise ValueError("query_definition requires primary_constrained_property_id and primary_param_count")
+        property_ids = torch.as_tensor(property_ids, device=node_emb.device, dtype=torch.long).view(-1)
+        if property_ids.numel() != batch_size:
+            raise ValueError(
+                "primary_constrained_property_id length does not match batch size: "
+                f"{property_ids.numel()} vs {batch_size}"
+            )
+        counts = torch.as_tensor(counts, device=node_emb.device, dtype=torch.long).view(-1)
+        property_vec = self._primary_id_embedding(property_ids, node_emb.device).to(dtype=node_emb.dtype)
+        pred_vec = self._pool_primary_params(
+            getattr(data, "primary_param_predicate_ids", None),
+            counts,
+            batch_size=batch_size,
+            device=node_emb.device,
+            dtype=node_emb.dtype,
+        )
+        obj_vec = self._pool_primary_params(
+            getattr(data, "primary_param_object_ids", None),
+            counts,
+            batch_size=batch_size,
+            device=node_emb.device,
+            dtype=node_emb.dtype,
+        )
+        focus_vec = self._focus_summary(node_emb, data, batch_size=batch_size)
+        return definition_mlp(torch.cat([family, property_vec, pred_vec, obj_vec, focus_vec], dim=-1))
 
     @abstractmethod
     def create_conv_layer(self, in_channels: int, out_channels: int) -> nn.Module:
@@ -858,7 +1025,11 @@ class BaseGraphModel(nn.Module, ABC):
         graph_emb = global_mean_pool(x, batch)
 
         ## Classification Head
-        shared = F.leaky_relu(self.shared_projection(graph_emb), negative_slope=0.1)
+        shared_base = self.shared_projection(graph_emb)
+        query_bias = self._primary_query_bias(node_emb, data, batch_size=graph_emb.size(0))
+        if query_bias is not None:
+            shared_base = shared_base + query_bias
+        shared = F.leaky_relu(shared_base, negative_slope=0.1)
         shared = F.dropout(shared, p=self._dropout, training=self.training)
 
         # Role-specificic branches for subject, object, predicate predictions
@@ -1464,6 +1635,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         pressure_oracle_input=getattr(config, "pressure_oracle_input", "none"),
         enable_policy_choice=getattr(config, "enable_policy_choice", False),
         policy_num_classes=getattr(config, "policy_num_classes", 6),
+        primary_constraint_mode=getattr(config, "primary_constraint_mode", "executable_factor"),
     )
 
 

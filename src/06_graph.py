@@ -81,6 +81,13 @@ OVERWRITE_MODE_ATOMIC = "atomic"
 OVERWRITE_MODE_UNSAFE = "unsafe"
 OVERWRITE_MODE_SKIP = "skip"
 OVERWRITE_MODE_CHOICES = (OVERWRITE_MODE_ATOMIC, OVERWRITE_MODE_UNSAFE, OVERWRITE_MODE_SKIP)
+PRIMARY_CONSTRAINT_MODES = (
+    "executable_factor",
+    "query_definition",
+    "query_family",
+    "passive_node",
+    "none",
+)
 
 
 def _torch_load_trusted(path: Path) -> Any:
@@ -170,6 +177,13 @@ def create_graph(
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
     constraint_scope: Literal["local", "focus"] = "local",
     constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
+    primary_constraint_mode: Literal[
+        "executable_factor",
+        "query_definition",
+        "query_family",
+        "passive_node",
+        "none",
+    ] = "executable_factor",
     store_node_names: bool = False,
     include_debug_fields: bool = True,
     embedding_dtype: np.dtype | None = None,
@@ -244,6 +258,7 @@ def create_graph(
     factor_constraint_types: list[str] = []
     factor_local_ids: list[int] = []
     primary_factor_index: int = -1
+    passive_primary_node_index: int | None = None
     pred_global_to_local_triples: dict[int, list[tuple[int, int, int]]] = {}
     pred_global_to_pred_local_ids: dict[int, list[int]] = {}
     subj_local_to_pred_global_to_pred_local_ids: dict[int, dict[int, list[int]]] = {}
@@ -254,7 +269,22 @@ def create_graph(
     factor_checkable_post_gold_tensor: torch.Tensor | None = None
     factor_satisfied_post_gold_tensor: torch.Tensor | None = None
     factor_types_tensor: torch.Tensor | None = None
+    eval_factor_constraint_ids_tensor: torch.Tensor | None = None
+    eval_factor_checkable_pre_tensor: torch.Tensor | None = None
+    eval_factor_satisfied_pre_tensor: torch.Tensor | None = None
+    eval_factor_checkable_post_gold_tensor: torch.Tensor | None = None
+    eval_factor_satisfied_post_gold_tensor: torch.Tensor | None = None
+    eval_factor_types_tensor: torch.Tensor | None = None
+    eval_primary_factor_index: int = -1
     factorized_representation = constraint_representation == "factorized"
+    primary_constraint_mode = str(primary_constraint_mode).lower()
+    if primary_constraint_mode not in PRIMARY_CONSTRAINT_MODES:
+        raise ValueError(
+            "primary_constraint_mode must be one of "
+            + ", ".join(PRIMARY_CONSTRAINT_MODES)
+        )
+    if not factorized_representation:
+        primary_constraint_mode = "executable_factor"
 
     def _resolve_registry_id(raw_id: str) -> int | None:
         raw = raw_id.strip()
@@ -519,6 +549,35 @@ def create_graph(
         edges_non_flattened.append((factor_local_id, object_id))
         non_flattened_edge_attributes.append(predicate_id)
 
+    def _constraint_token_and_registry(constraint_id: int) -> tuple[str, dict[str, Any]]:
+        constraint_token = global_int_encoder._decoding.get(int(constraint_id))
+        if constraint_token in (None, "", "unknown") or int(constraint_id) == unknown_global_id:
+            raise AssertionError(
+                "Constraint id token is unknown; rebuild interim data with constraint ids preserved."
+            )
+        registry_entry = constraint_registry.get(constraint_token)
+        if registry_entry is None:
+            registry_entry = constraint_registry.get(str(constraint_token).strip("<>"))
+        assert registry_entry is not None, f"Missing constraint_id={constraint_token} in constraint registry."
+        return str(constraint_token), registry_entry
+
+    def _factor_global_id_for_token(constraint_token: str, constraint_id: int) -> int:
+        try:
+            factor_gid = global_int_encoder.encode(f"constraint_factor::{constraint_token}", add_new=False)
+        except Exception as exc:
+            raise AssertionError(f"Missing factor token for constraint_id={constraint_token} in encoder.") from exc
+        assert factor_gid != 0, f"Invalid factor global id for constraint_id={constraint_id}."
+        return int(factor_gid)
+
+    def _encode_registry_ids(values: Iterable[Any]) -> list[int]:
+        encoded: list[int] = []
+        for raw in values:
+            gid = _resolve_registry_id(str(raw))
+            if gid is None:
+                gid = _maybe_encode_registry_token(str(raw))
+            encoded.append(int(gid or 0))
+        return encoded
+
     # --- Node construction -------------------------------------------------
     add_edge(graph, "subject", "predicate", "object", assign_focus=True)
     add_edge(graph, "other_subject", "other_predicate", "other_object")
@@ -554,11 +613,30 @@ def create_graph(
         if gid is not None
     ]
 
+    primary_constraint_id = int(graph["constraint_id"])
+
     # add constraint factor branches
     if factorized_representation:
-        factor_ids = _factor_ids_for_graph(graph, constraint_scope)
+        all_factor_ids = _factor_ids_for_graph(graph, constraint_scope)
     else:
-        factor_ids = [int(graph["constraint_id"])]
+        all_factor_ids = [primary_constraint_id]
+
+    if factorized_representation and primary_constraint_id not in [int(cid) for cid in all_factor_ids]:
+        all_factor_ids = [primary_constraint_id, *all_factor_ids]
+
+    if primary_constraint_mode == "executable_factor":
+        exec_positions = list(range(len(all_factor_ids)))
+    else:
+        exec_positions = [
+            pos
+            for pos, cid in enumerate(all_factor_ids)
+            if int(cid) != primary_constraint_id
+        ]
+    factor_ids = [int(all_factor_ids[pos]) for pos in exec_positions]
+    try:
+        eval_primary_factor_index = [int(cid) for cid in all_factor_ids].index(primary_constraint_id)
+    except ValueError:
+        eval_primary_factor_index = -1
 
     required_factor_fields = (
         "factor_checkable_pre",
@@ -569,7 +647,7 @@ def create_graph(
         "factor_constraint_ids",
     )
     if factorized_representation and all(graph.get(field) is not None for field in required_factor_fields):
-        expected_len = len(factor_ids)
+        expected_len = len(all_factor_ids)
 
         def _normalize_factor_list(value: Any, name: str) -> list[Any]:
             if isinstance(value, list):
@@ -587,46 +665,47 @@ def create_graph(
             return items
 
         factor_ids_from_row = _normalize_factor_list(graph.get("factor_constraint_ids"), "factor_constraint_ids")
-        if factor_ids_from_row and [int(cid) for cid in factor_ids_from_row] != factor_ids:
+        if factor_ids_from_row and [int(cid) for cid in factor_ids_from_row] != [int(cid) for cid in all_factor_ids]:
             raise AssertionError("Factor constraint id order mismatch between labeled data and graph builder.")
 
-        factor_checkable_pre_tensor = torch.tensor(
+        eval_factor_constraint_ids_tensor = torch.tensor([int(cid) for cid in all_factor_ids], dtype=torch.long)
+        eval_factor_checkable_pre_tensor = torch.tensor(
             _normalize_factor_list(graph.get("factor_checkable_pre"), "factor_checkable_pre"),
             dtype=torch.bool,
         )
-        factor_satisfied_pre_tensor = torch.tensor(
+        eval_factor_satisfied_pre_tensor = torch.tensor(
             _normalize_factor_list(graph.get("factor_satisfied_pre"), "factor_satisfied_pre"),
             dtype=torch.long,
         )
-        factor_checkable_post_gold_tensor = torch.tensor(
+        eval_factor_checkable_post_gold_tensor = torch.tensor(
             _normalize_factor_list(graph.get("factor_checkable_post_gold"), "factor_checkable_post_gold"),
             dtype=torch.bool,
         )
-        factor_satisfied_post_gold_tensor = torch.tensor(
+        eval_factor_satisfied_post_gold_tensor = torch.tensor(
             _normalize_factor_list(graph.get("factor_satisfied_post_gold"), "factor_satisfied_post_gold"),
             dtype=torch.long,
         )
-        factor_types_tensor = torch.tensor(
+        eval_factor_types_tensor = torch.tensor(
             _normalize_factor_list(graph.get("factor_types"), "factor_types"),
             dtype=torch.long,
         )
 
-    for idx, constraint_id in enumerate(factor_ids):
-        constraint_token = global_int_encoder._decoding.get(constraint_id)
-        if constraint_token in (None, "", "unknown") or constraint_id == unknown_global_id:
-            raise AssertionError(
-                "Constraint id token is unknown; rebuild interim data with constraint ids preserved."
-            )
-        registry_entry = constraint_registry.get(constraint_token)
-        if registry_entry is None:
-            registry_entry = constraint_registry.get(constraint_token.strip("<>"))
-        assert registry_entry is not None, f"Missing constraint_id={constraint_token} in constraint registry."
+        exec_positions_tensor = torch.tensor(exec_positions, dtype=torch.long)
+        factor_checkable_pre_tensor = eval_factor_checkable_pre_tensor.index_select(0, exec_positions_tensor)
+        factor_satisfied_pre_tensor = eval_factor_satisfied_pre_tensor.index_select(0, exec_positions_tensor)
+        factor_checkable_post_gold_tensor = eval_factor_checkable_post_gold_tensor.index_select(
+            0, exec_positions_tensor
+        )
+        factor_satisfied_post_gold_tensor = eval_factor_satisfied_post_gold_tensor.index_select(
+            0, exec_positions_tensor
+        )
+        factor_types_tensor = eval_factor_types_tensor.index_select(0, exec_positions_tensor)
+    elif factorized_representation:
+        eval_factor_constraint_ids_tensor = torch.tensor([int(cid) for cid in all_factor_ids], dtype=torch.long)
 
-        try:
-            factor_gid = global_int_encoder.encode(f"constraint_factor::{constraint_token}", add_new=False)
-        except Exception as exc:
-            raise AssertionError(f"Missing factor token for constraint_id={constraint_token} in encoder.") from exc
-        assert factor_gid != 0, f"Invalid factor global id for constraint_id={constraint_id}."
+    for idx, constraint_id in enumerate(factor_ids):
+        constraint_token, registry_entry = _constraint_token_and_registry(constraint_id)
+        factor_gid = _factor_global_id_for_token(constraint_token, constraint_id)
 
         factor_local_id = global_to_local_id_encoder.store(
             factor_gid,
@@ -639,7 +718,7 @@ def create_graph(
         factor_local_ids.append(factor_local_id)
         constraint_type = _constraint_family_from_registry_entry(registry_entry)
         factor_constraint_types.append(constraint_type)
-        if constraint_id == int(graph["constraint_id"]):
+        if constraint_id == primary_constraint_id:
             primary_factor_index = idx
 
         constrained_property = registry_entry.get("constrained_property")
@@ -823,8 +902,45 @@ def create_graph(
             if constraint_id == int(graph["constraint_id"]):
                 primary_factor_focus_scope_ok = matched_focus_predicate
 
-    assert primary_factor_index >= 0, "Primary constraint_id missing from factor list."
-    if factorized_representation and debug_factor_wiring and primary_factor_focus_scope_ok is not None:
+    primary_constraint_token, primary_registry_entry = _constraint_token_and_registry(primary_constraint_id)
+    if factorized_representation and primary_constraint_mode == "passive_node":
+        primary_factor_gid = _factor_global_id_for_token(primary_constraint_token, primary_constraint_id)
+        passive_primary_node_index = global_to_local_id_encoder.store(
+            primary_factor_gid,
+            get_node_attribute(primary_factor_gid, None),
+            name=f"constraint_factor::{primary_constraint_token}" if store_node_names else None,
+            force_create=True,
+        )
+        primary_param_predicates = primary_registry_entry.get("param_predicates") or []
+        primary_param_objects = primary_registry_entry.get("param_objects") or []
+        assert len(primary_param_predicates) == len(primary_param_objects), (
+            f"Constraint registry param list length mismatch for constraint_id={primary_constraint_id}."
+        )
+        for predicate_id_raw, object_id_raw in zip(primary_param_predicates, primary_param_objects):
+            try:
+                predicate_gid = global_int_encoder.encode(predicate_id_raw, add_new=False)
+            except Exception as exc:
+                raise AssertionError(f"Missing predicate token '{predicate_id_raw}' in encoder.") from exc
+            try:
+                object_gid = global_int_encoder.encode(object_id_raw, add_new=False)
+            except Exception as exc:
+                raise AssertionError(f"Missing object token '{object_id_raw}' in encoder.") from exc
+            add_factor_definition_edge(
+                factor_local_id=passive_primary_node_index,
+                predicate_global_id=predicate_gid,
+                object_global_id=object_gid,
+            )
+
+    if primary_constraint_mode == "executable_factor":
+        assert primary_factor_index >= 0, "Primary constraint_id missing from factor list."
+    else:
+        primary_factor_index = -1
+    if (
+        factorized_representation
+        and primary_constraint_mode == "executable_factor"
+        and debug_factor_wiring
+        and primary_factor_focus_scope_ok is not None
+    ):
         assert primary_factor_focus_scope_ok, "Primary factor missing scope edge to focus predicate."
         if factor_local_ids:
             factor_set = set(factor_local_ids)
@@ -892,9 +1008,46 @@ def create_graph(
     # Standardize on `constraint_type` across the pipeline
     data_graph.constraint_type = str(graph["constraint_type"])
     data_graph.constraint_representation = constraint_representation
+    data_graph.primary_constraint_mode = primary_constraint_mode
     data_graph.factor_constraint_ids = torch.tensor(factor_constraint_ids, dtype=torch.long)
     data_graph.factor_node_index = torch.tensor(factor_local_ids, dtype=torch.long)
     data_graph.primary_factor_index = int(primary_factor_index)
+    if eval_factor_constraint_ids_tensor is not None:
+        data_graph.eval_factor_constraint_ids = eval_factor_constraint_ids_tensor
+        data_graph.eval_primary_factor_index = int(eval_primary_factor_index)
+    if eval_factor_types_tensor is not None:
+        data_graph.eval_factor_types = eval_factor_types_tensor
+    if eval_factor_checkable_pre_tensor is not None:
+        data_graph.eval_factor_checkable_pre = eval_factor_checkable_pre_tensor
+        data_graph.eval_factor_satisfied_pre = eval_factor_satisfied_pre_tensor
+        data_graph.eval_factor_checkable_post_gold = eval_factor_checkable_post_gold_tensor
+        data_graph.eval_factor_satisfied_post_gold = eval_factor_satisfied_post_gold_tensor
+    constrained_property_gid = _resolve_registry_id(str(primary_registry_entry.get("constrained_property") or ""))
+    primary_param_predicates = primary_registry_entry.get("param_predicates") or []
+    primary_param_objects = primary_registry_entry.get("param_objects") or []
+    data_graph.primary_constraint_id = torch.tensor([primary_constraint_id], dtype=torch.long)
+    primary_type_id = 0
+    if eval_factor_types_tensor is not None and 0 <= eval_primary_factor_index < int(eval_factor_types_tensor.numel()):
+        primary_type_id = int(eval_factor_types_tensor[eval_primary_factor_index].item())
+    else:
+        for key in ("constraint_type_index", "constraint_type_id"):
+            value = primary_registry_entry.get(key)
+            if value is not None:
+                primary_type_id = int(value)
+                break
+    data_graph.primary_constraint_type_id = torch.tensor([primary_type_id], dtype=torch.long)
+    data_graph.primary_constrained_property_id = torch.tensor(
+        [int(constrained_property_gid or 0)], dtype=torch.long
+    )
+    data_graph.primary_param_predicate_ids = torch.tensor(
+        _encode_registry_ids(primary_param_predicates), dtype=torch.long
+    )
+    data_graph.primary_param_object_ids = torch.tensor(
+        _encode_registry_ids(primary_param_objects), dtype=torch.long
+    )
+    data_graph.primary_param_count = torch.tensor([len(primary_param_predicates)], dtype=torch.long)
+    if passive_primary_node_index is not None:
+        data_graph.passive_primary_node_index = int(passive_primary_node_index)
     if include_debug_fields:
         data_graph.factor_constraint_types = factor_constraint_types
     if factor_checkable_pre_tensor is not None:
@@ -908,16 +1061,18 @@ def create_graph(
             "constraint_id": int(graph["constraint_id"]),
             "primary_constraint_id": int(graph["constraint_id"]),
             "primary_factor_index": int(primary_factor_index),
-            "local_constraint_count": int(len(factor_ids)),
+            "local_constraint_count": int(len(all_factor_ids)),
+            "executable_factor_count": int(len(factor_ids)),
             "focus_predicate_local_id": int(focus_local_nodes.get("predicate", -1)),
             "focus_predicate_global_id": int(graph.get("predicate") or 0),
             "other_predicate_global_id": int(graph.get("other_predicate") or 0),
             "factors": debug_entries,
         }
 
-    if factor_local_ids:
+    if factorized_representation:
         is_factor_node = torch.zeros(num_nodes, dtype=torch.bool)
-        is_factor_node[data_graph.factor_node_index] = True
+        if factor_local_ids:
+            is_factor_node[data_graph.factor_node_index] = True
         data_graph.is_factor_node = is_factor_node
 
     return data_graph
@@ -991,6 +1146,13 @@ def compute_torch_geometric_objects(
     encoding: Literal["node_id", "text_embedding"],
     constraint_scope: Literal["local", "focus"] = "local",
     constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
+    primary_constraint_mode: Literal[
+        "executable_factor",
+        "query_definition",
+        "query_family",
+        "passive_node",
+        "none",
+    ] = "executable_factor",
     store_node_names: bool = False,
     include_debug_fields: bool = True,
     embedding_dtype: np.dtype | None = None,
@@ -1016,6 +1178,7 @@ def compute_torch_geometric_objects(
             encoding=encoding,
             constraint_scope=constraint_scope,
             constraint_representation=constraint_representation,
+            primary_constraint_mode=primary_constraint_mode,
             store_node_names=store_node_names,
             include_debug_fields=include_debug_fields,
             embedding_dtype=embedding_dtype,
@@ -1123,6 +1286,21 @@ def _profile_kept_fields(persistence_profile: str) -> list[str]:
         "factor_checkable_post_gold",
         "factor_satisfied_post_gold",
         "factor_types",
+        "eval_factor_constraint_ids",
+        "eval_factor_types",
+        "eval_factor_checkable_pre",
+        "eval_factor_satisfied_pre",
+        "eval_factor_checkable_post_gold",
+        "eval_factor_satisfied_post_gold",
+        "eval_primary_factor_index",
+        "primary_constraint_mode",
+        "primary_constraint_id",
+        "primary_constraint_type_id",
+        "primary_constrained_property_id",
+        "primary_param_predicate_ids",
+        "primary_param_object_ids",
+        "primary_param_count",
+        "passive_primary_node_index",
         "is_factor_node",
     ]
     if _profile_debug_fields_enabled(persistence_profile):
@@ -1299,6 +1477,7 @@ def _write_split_manifest(
     dataset_variant: str,
     constraint_scope: str,
     constraint_representation: str,
+    primary_constraint_mode: str,
 ) -> None:
     manifest = {
         "split": split,
@@ -1306,6 +1485,7 @@ def _write_split_manifest(
         "encoding": encoding,
         "constraint_scope": constraint_scope,
         "constraint_representation": constraint_representation,
+        "primary_constraint_mode": primary_constraint_mode,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "graph_count": int(graph_count),
         "shard_count": int(shard_count),
@@ -1340,6 +1520,13 @@ def main(
     dataset_variant: str,
     constraint_scope: Literal["local", "focus"] = "local",
     constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
+    primary_constraint_mode: Literal[
+        "executable_factor",
+        "query_definition",
+        "query_family",
+        "passive_node",
+        "none",
+    ] = "executable_factor",
     store_node_names: bool = False,
     persistence_profile: str = PERSISTENCE_PROFILE_RESEARCH_SAFE,
     shard_size: int = 0,
@@ -1410,6 +1597,7 @@ def main(
             split,
             encoding,
             constraint_representation=constraint_representation,
+            primary_constraint_mode=primary_constraint_mode,
         )
         existing_artifacts = discover_graph_artifacts(output_path)
         if overwrite_mode == OVERWRITE_MODE_SKIP and existing_artifacts:
@@ -1481,6 +1669,7 @@ def main(
             encoding=encoding,
             constraint_scope=constraint_scope,
             constraint_representation=constraint_representation,
+            primary_constraint_mode=primary_constraint_mode,
             store_node_names=store_node_names,
             include_debug_fields=include_debug_fields,
             embedding_dtype=embedding_dtype,
@@ -1541,6 +1730,7 @@ def main(
             dataset_variant=dataset_variant,
             constraint_scope=constraint_scope,
             constraint_representation=constraint_representation,
+            primary_constraint_mode=primary_constraint_mode,
         )
 
         del generator
@@ -1749,6 +1939,15 @@ def parse_args():
         help="Graph representation regime: factorized (default) or eswc_passive.",
     )
     parser.add_argument(
+        "--primary-constraint-mode",
+        choices=PRIMARY_CONSTRAINT_MODES,
+        default="executable_factor",
+        help=(
+            "How factorized graphs expose the primary violated constraint. "
+            "The default preserves canonical executable-factor behavior."
+        ),
+    )
+    parser.add_argument(
         "--use-unlabeled-interim",
         action="store_true",
         help="Force using data/interim/<variant> even if a labeled interim dataset exists.",
@@ -1794,6 +1993,8 @@ def parse_args():
         parser.error("--resume-partial-shards is incompatible with --overwrite skip")
     if args.constraint_representation == "eswc_passive" and args.constraint_scope != "local":
         parser.error("--constraint-scope is only meaningful for factorized graphs")
+    if args.constraint_representation != "factorized" and args.primary_constraint_mode != "executable_factor":
+        parser.error("--primary-constraint-mode is only supported for factorized graphs")
 
     return args
 
@@ -1890,6 +2091,7 @@ if __name__ == "__main__":
         dataset_variant=dataset_variant,
         constraint_scope=args.constraint_scope,
         constraint_representation=args.constraint_representation,
+        primary_constraint_mode=args.primary_constraint_mode,
         persistence_profile=args.persistence_profile,
         shard_size=args.shard_size,
         use_torch_save=args.use_torch_save,

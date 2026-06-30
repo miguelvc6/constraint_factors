@@ -137,9 +137,16 @@ re-run.
 - `shape_id`: the encoded `constraint_id`
 - `constraint_type`: string (e.g., `conflictWith`)
 - `constraint_representation`: `factorized` or `eswc_passive`
-- `factor_constraint_ids`: list of constraint IDs included as factors
-- `factor_node_index`: local node indices of factor nodes
-- `primary_factor_index`: index of the violated constraint in `factor_constraint_ids`
+- `primary_constraint_mode`: `executable_factor`, `query_definition`, `query_family`, `passive_node`, or `none`
+- `factor_constraint_ids`: list of executable constraint IDs included as model factors
+- `factor_node_index`: local node indices of executable factor nodes
+- `primary_factor_index`: index of the violated constraint in `factor_constraint_ids`; `-1` when the primary is not executable
+- `eval_factor_constraint_ids`: full local constraint ID list used for strict symbolic evaluation
+- `eval_factor_types`, `eval_factor_checkable_*`, `eval_factor_satisfied_*`: eval-side mirrors aligned with `eval_factor_constraint_ids`
+- `eval_primary_factor_index`: index of the violated constraint in `eval_factor_constraint_ids`
+- `primary_constraint_id`, `primary_constraint_type_id`, `primary_constrained_property_id`: primary task-query metadata
+- `primary_param_predicate_ids`, `primary_param_object_ids`, `primary_param_count`: variable-length primary definition metadata used by query modes
+- `passive_primary_node_index`: local node index of the passive primary node when `primary_constraint_mode=passive_node`
 - `is_factor_node`: boolean mask over local nodes
 - `factor_constraint_types`: list of constraint family labels (debug)
 - `factor_wiring_debug` (optional): wiring diagnostics when `--debug-factor-wiring` is enabled
@@ -156,7 +163,8 @@ re-run.
 
 **Notes**
 - Factor label tensors (`factor_checkable_*`, `factor_satisfied_*`, `factor_types`) are 1-D and must align with
-  `factor_constraint_ids` length; `primary_factor_index` is an index into that list.
+  `factor_constraint_ids` length. In non-default primary modes, these executable factors exclude the primary.
+- Eval label tensors (`eval_factor_checkable_*`, `eval_factor_satisfied_*`, `eval_factor_types`) are 1-D and must align with `eval_factor_constraint_ids`; strict global metrics prefer these fields and fall back to `factor_*` for old artifacts.
 
 ## 7) Labeled Constraint Factors (`05_constraint_labeler.py`)
 **Location:** `data/interim/<variant>_labeled/`

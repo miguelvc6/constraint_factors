@@ -736,11 +736,13 @@ def main() -> None:
         "train",
         model_cfg.encoding,
         constraint_representation=model_cfg.constraint_representation,
+        primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
     )
     val_path = processed_root / graph_dataset_filename(
         "val",
         model_cfg.encoding,
         constraint_representation=model_cfg.constraint_representation,
+        primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
     )
 
     train_data = load_graph_dataset(train_path)
@@ -985,6 +987,7 @@ def main() -> None:
         "test",
         model_cfg.encoding,
         constraint_representation=model_cfg.constraint_representation,
+        primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
     )
     if discover_graph_artifacts(test_path):
         test_data = load_graph_dataset(test_path)

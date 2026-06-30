@@ -886,7 +886,9 @@ class CandidateConstraintEvaluator:
         other_predicate = _coerce_value(getattr(row, "other_predicate", 0), cast_int=self._use_encoded_ids)
         other_object = _coerce_value(getattr(row, "other_object", 0), cast_int=self._use_encoded_ids)
 
-        if self._constraint_scope == "focus":
+        if getattr(row, "eval_factor_constraint_ids", None) is not None:
+            constraint_ids_raw = getattr(row, "eval_factor_constraint_ids", None)
+        elif self._constraint_scope == "focus":
             constraint_ids_raw = getattr(row, "local_constraint_ids_focus", None)
             if constraint_ids_raw is None:
                 constraint_ids_raw = getattr(row, "local_constraint_ids", None)
@@ -906,6 +908,13 @@ class CandidateConstraintEvaluator:
         resolved_primary_index = -1
         if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
             resolved_primary_index = int(primary_factor_index)
+        elif getattr(row, "eval_primary_factor_index", None) is not None:
+            value = getattr(row, "eval_primary_factor_index")
+            try:
+                if 0 <= int(value) < len(local_constraint_ids):
+                    resolved_primary_index = int(value)
+            except (TypeError, ValueError):
+                resolved_primary_index = -1
         else:
             constraint_id = _coerce_value(getattr(row, "constraint_id", None), cast_int=self._use_encoded_ids)
             try:
@@ -1072,6 +1081,8 @@ class CandidateConstraintEvaluator:
 
         if factor_constraint_ids is not None:
             constraint_ids_raw = factor_constraint_ids
+        elif getattr(row, "eval_factor_constraint_ids", None) is not None:
+            constraint_ids_raw = getattr(row, "eval_factor_constraint_ids", None)
         elif getattr(row, "factor_constraint_ids", None) is not None:
             constraint_ids_raw = getattr(row, "factor_constraint_ids", None)
         elif self._constraint_scope == "focus":
@@ -1136,6 +1147,13 @@ class CandidateConstraintEvaluator:
         resolved_primary_index = -1
         if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
             resolved_primary_index = int(primary_factor_index)
+        elif getattr(row, "eval_primary_factor_index", None) is not None:
+            value = getattr(row, "eval_primary_factor_index")
+            try:
+                if 0 <= int(value) < len(local_constraint_ids):
+                    resolved_primary_index = int(value)
+            except (TypeError, ValueError):
+                resolved_primary_index = -1
         else:
             constraint_id = _coerce_value(getattr(row, "constraint_id", None), cast_int=self._use_encoded_ids)
             try:
@@ -1328,6 +1346,13 @@ class CandidateConstraintEvaluator:
         resolved_primary_index = -1
         if primary_factor_index is not None and 0 <= primary_factor_index < len(local_constraint_ids):
             resolved_primary_index = int(primary_factor_index)
+        elif getattr(row, "eval_primary_factor_index", None) is not None:
+            value = getattr(row, "eval_primary_factor_index")
+            try:
+                if 0 <= int(value) < len(local_constraint_ids):
+                    resolved_primary_index = int(value)
+            except (TypeError, ValueError):
+                resolved_primary_index = -1
         else:
             constraint_id = _coerce_value(getattr(row, "constraint_id", None), cast_int=self._use_encoded_ids)
             try:

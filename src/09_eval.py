@@ -133,10 +133,18 @@ class GlobalMetricsSupport:
             vectors: list[dict[str, object]] = []
             any_vectors = False
             for data in test_data:
-                pre_satisfied = getattr(data, "factor_satisfied_pre", None)
-                pre_checkable = getattr(data, "factor_checkable_pre", None)
-                primary_index = getattr(data, "primary_factor_index", None)
-                factor_constraint_ids = getattr(data, "factor_constraint_ids", None)
+                pre_satisfied = getattr(data, "eval_factor_satisfied_pre", None)
+                if pre_satisfied is None:
+                    pre_satisfied = getattr(data, "factor_satisfied_pre", None)
+                pre_checkable = getattr(data, "eval_factor_checkable_pre", None)
+                if pre_checkable is None:
+                    pre_checkable = getattr(data, "factor_checkable_pre", None)
+                primary_index = getattr(data, "eval_primary_factor_index", None)
+                if primary_index is None:
+                    primary_index = getattr(data, "primary_factor_index", None)
+                factor_constraint_ids = getattr(data, "eval_factor_constraint_ids", None)
+                if factor_constraint_ids is None:
+                    factor_constraint_ids = getattr(data, "factor_constraint_ids", None)
                 if pre_satisfied is None and pre_checkable is None:
                     vectors.append({})
                     continue
@@ -854,12 +862,14 @@ def load_split(
     split: str,
     *,
     constraint_representation: str = "factorized",
+    primary_constraint_mode: str = "executable_factor",
 ) -> list[Data] | GraphStreamDataset:
     """Load a dataset split saved as a monolithic file or shard collection."""
     path = base_path / graph_dataset_filename(
         split,
         encoding,
         constraint_representation=constraint_representation,
+        primary_constraint_mode=primary_constraint_mode,
     )
     return load_graph_dataset(path)
 
@@ -1204,6 +1214,38 @@ def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[
         if primary_factor_index is not None:
             if not (isinstance(primary_factor_index, float) and math.isnan(primary_factor_index)):
                 graph.primary_factor_index = int(primary_factor_index)
+        eval_factor_constraint_ids = getattr(row, "eval_factor_constraint_ids", None)
+        if eval_factor_constraint_ids is not None:
+            graph.eval_factor_constraint_ids = torch.tensor(
+                eval_factor_constraint_ids, dtype=torch.long
+            ).view(-1)
+        eval_factor_types = getattr(row, "eval_factor_types", None)
+        if eval_factor_types is not None:
+            graph.eval_factor_types = torch.tensor(eval_factor_types, dtype=torch.long).view(-1)
+        eval_factor_checkable_pre = getattr(row, "eval_factor_checkable_pre", None)
+        if eval_factor_checkable_pre is not None:
+            graph.eval_factor_checkable_pre = torch.tensor(
+                eval_factor_checkable_pre, dtype=torch.bool
+            ).view(-1)
+        eval_factor_satisfied_pre = getattr(row, "eval_factor_satisfied_pre", None)
+        if eval_factor_satisfied_pre is not None:
+            graph.eval_factor_satisfied_pre = torch.tensor(
+                eval_factor_satisfied_pre, dtype=torch.long
+            ).view(-1)
+        eval_factor_checkable_post_gold = getattr(row, "eval_factor_checkable_post_gold", None)
+        if eval_factor_checkable_post_gold is not None:
+            graph.eval_factor_checkable_post_gold = torch.tensor(
+                eval_factor_checkable_post_gold, dtype=torch.bool
+            ).view(-1)
+        eval_factor_satisfied_post_gold = getattr(row, "eval_factor_satisfied_post_gold", None)
+        if eval_factor_satisfied_post_gold is not None:
+            graph.eval_factor_satisfied_post_gold = torch.tensor(
+                eval_factor_satisfied_post_gold, dtype=torch.long
+            ).view(-1)
+        eval_primary_factor_index = getattr(row, "eval_primary_factor_index", None)
+        if eval_primary_factor_index is not None:
+            if not (isinstance(eval_primary_factor_index, float) and math.isnan(eval_primary_factor_index)):
+                graph.eval_primary_factor_index = int(eval_primary_factor_index)
 
         data_list.append(graph)
 
@@ -1575,12 +1617,14 @@ def main():
             "test",
             model_cfg.encoding,
             constraint_representation=model_cfg.constraint_representation,
+            primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
         )
         test_data = load_split(
             base_path,
             model_cfg.encoding,
             "test",
             constraint_representation=model_cfg.constraint_representation,
+            primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
         )
         test_graph_count = _dataset_graph_count(test_data, test_graph_path)
 
@@ -1755,6 +1799,7 @@ def main():
                 model_cfg.encoding,
                 "train",
                 constraint_representation=model_cfg.constraint_representation,
+                primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
             )
             model = load_trained_model_for_eval(
                 run_directory=run_directory,
@@ -1763,6 +1808,16 @@ def main():
                 chooser_support=chooser_support,
             )
             h2_dir = evaluations_dir(run_directory, create=True) / "h2"
+            primary_mode = getattr(model_cfg, "primary_constraint_mode", "executable_factor")
+            exposure_cache_mode = (
+                "secondary_factor_modes"
+                if primary_mode in {"query_definition", "query_family", "passive_node", "none"}
+                else primary_mode
+            )
+            exposure_cache_path = (
+                base_path
+                / f"train_factor_exposure-{model_cfg.encoding}-{model_cfg.constraint_representation}-{exposure_cache_mode}.json"
+            )
             report = write_h2_report(
                 model=model,
                 train_data=train_data,
@@ -1775,6 +1830,7 @@ def main():
                 ),
                 batch_size=args.h2_batch_size,
                 include_gold_pressure_mask=args.h2_include_gold_pressure_mask,
+                exposure_cache_path=exposure_cache_path,
             )
             logging.info("Wrote H2 report to %s (status=%s)", h2_dir / "h2_report.json", report.get("status"))
             return

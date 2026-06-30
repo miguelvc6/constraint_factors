@@ -201,6 +201,10 @@ def load_global_eval_rows(base_path: Path, split: str) -> list:
         "other_entity_objects",
         "local_constraint_ids",
         "local_constraint_ids_focus",
+        "eval_factor_constraint_ids",
+        "eval_factor_checkable_pre",
+        "eval_factor_satisfied_pre",
+        "eval_primary_factor_index",
         "factor_checkable_pre",
         "factor_satisfied_pre",
         "primary_factor_index",
@@ -791,6 +795,14 @@ def _candidate_slots_from_sample(sample: RepairSample, none_class: int) -> tuple
 
 
 def _resolve_primary_index_from_row(row: object, local_constraint_ids: Sequence[int]) -> int:
+    value = getattr(row, "eval_primary_factor_index", None)
+    if value is not None:
+        try:
+            idx = int(value)
+            if 0 <= idx < len(local_constraint_ids):
+                return idx
+        except (TypeError, ValueError):
+            pass
     value = getattr(row, "primary_factor_index", None)
     if value is not None:
         try:

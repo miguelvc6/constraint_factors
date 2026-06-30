@@ -9,19 +9,24 @@ For the paper-facing run, use:
 - `--constraint-scope local` for factorized graphs
 - `--constraint-representation factorized` for `A1`, `M1C`, `M1D`, and proposal graphs consumed by `G0`
 - `--constraint-representation eswc_passive` for `B0`
+- `--primary-constraint-mode executable_factor` for canonical runs
+- `--primary-constraint-mode query_definition`, `query_family`, or `passive_node` only for the A1 primary-query ablations
 
 `focus` scope remains supported as a non-paper exploratory option.
 
 When graph materialization runs out of memory, the paper pipeline can use sharded outputs, e.g.
 `--shard-size 200000 --use-torch-save`. The downstream proposal training, reranker training,
 config generators, and evaluation scripts all accept shard-only graph artifacts.
+For primary-query ablations, `scripts/convert_primary_query_graph_mode.py` can derive
+`query_definition` and `passive_node` artifacts from an already materialized `query_family`
+artifact set without rereading the raw parquet rows.
 
 ## Inputs & Outputs
 - **Inputs:** Interim parquet splits from `data/interim/<variant>/` or, when present, `data/interim/<variant>_labeled/` (unless `--use-unlabeled-interim` is passed), `globalintencoder.txt`, the constraint registry (`data/interim/constraint_registry_{dataset}.parquet`), the Wikidata cache (`data/interim/wikidata_text.parquet`), and CLI flags controlling encoding/sharding options.
-- **Outputs:** Graph artifacts in `data/processed/<variant>/` (`{split}_graph-<encoding>.pkl` for factorized runs, `{split}_graph_repr-eswc_passive-<encoding>.pkl` for passive runs, plus sharded `.pt/.pkl` variants), per-split manifests, `target_vocabs.json`, plus optional visualisations like `graph_visualization.png`.
+- **Outputs:** Graph artifacts in `data/processed/<variant>/` (`{split}_graph-<encoding>.pkl` for canonical factorized runs, `{split}_graph-<encoding>-primary_<mode>.pkl` for non-default primary-constraint modes, `{split}_graph_repr-eswc_passive-<encoding>.pkl` for passive ESWC-style runs, plus sharded `.pt/.pkl` variants), per-split manifests, `target_vocabs.json`, plus optional visualisations like `graph_visualization.png`.
 
 ## Workflow
-1. Parse CLI flags to select the dataset (`--dataset`), registry source for derived variants (`--registry-dataset`), node feature encoding (`--encoding {node_id,text_embedding}`), frequency variant (`--min-occurrence`), representation regime (`--constraint-representation {factorized,eswc_passive}`), optional Wikidata cache override (`--wikidata-cache-path`), sharding size, persistence format (`pickle` vs `torch.save`), persistence profile (`--persistence-profile {research_safe,full}`), overwrite policy (`--overwrite {atomic,unsafe,skip}`), optional visualization, constraint scope (`--constraint-scope`), and debugging (`--debug-factor-wiring`).
+1. Parse CLI flags to select the dataset (`--dataset`), registry source for derived variants (`--registry-dataset`), node feature encoding (`--encoding {node_id,text_embedding}`), frequency variant (`--min-occurrence`), representation regime (`--constraint-representation {factorized,eswc_passive}`), primary-constraint mode (`--primary-constraint-mode`), optional Wikidata cache override (`--wikidata-cache-path`), sharding size, persistence format (`pickle` vs `torch.save`), persistence profile (`--persistence-profile {research_safe,full}`), overwrite policy (`--overwrite {atomic,unsafe,skip}`), optional visualization, constraint scope (`--constraint-scope`), and debugging (`--debug-factor-wiring`).
 2. Resolve `INTERIM_DATA_PATH` and `PROCESSED_DATA_PATH`, preferring `data/interim/<variant>_labeled/` automatically when it exists, then load and freeze the `GlobalIntEncoder`. The constraint registry is loaded once from `data/interim/constraint_registry_{dataset}.parquet` and merged into a `constraint_registry` dict. If `--encoding text_embedding` is chosen the script also loads the `PrecomputedWikidataCache` (typically `data/interim/wikidata_text.parquet` but overrideable via `--wikidata-cache-path`).
 3. For each split (`train`, `val`, `test`):
    - Read the parquet file.
@@ -34,6 +39,34 @@ config generators, and evaluation scripts all accept shard-only graph artifacts.
    - A manifest is written for each split with graph counts, field profile, artifact sizes, and lightweight prefix checksums.
 4. After each split, the script records entity/predicate targets seen in the labels (`add_*` / `del_*`) so training can precompute class vocabularies and shard metadata.
 5. If `--show_graph` is enabled, `display_graph()` reads one of the stored graphs, converts it to NetworkX, and renders `graph_visualization.png` plus a non-flattened view to make edge labels inspectable.
+
+## Derived Primary-Query Artifacts
+`scripts/convert_primary_query_graph_mode.py` converts sharded factorized graph artifacts
+from one primary-query mode to another while preserving graph order and shard boundaries.
+The intended source is `query_family`, because that mode already stores the primary
+constraint ID, family/type ID, constrained property, and parameter-definition tensors.
+
+Example:
+
+```bash
+uv run scripts/convert_primary_query_graph_mode.py \
+  --dataset full_strat1m \
+  --min-occurrence 100 \
+  --encoding node_id \
+  --source-mode query_family \
+  --target-mode query_definition \
+  --link-identical-structure \
+  --overwrite
+```
+
+For `query_definition`, graph structure and query tensors are identical to `query_family`.
+With `--link-identical-structure`, the converter creates linked target shard names and
+updates the manifest without rewriting the large payloads; the payload-level
+`primary_constraint_mode` string remains the source mode, while training uses the mode from
+the experiment config. Without that flag, the converter rewrites the shards and updates the
+payload-level mode string too. For `passive_node`, it appends the passive primary constraint
+node and factor-definition parameter edges, sets `passive_primary_node_index`, and keeps the
+passive node out of `factor_node_index`, factor supervision, and pressure edges.
 
 ## Common Pitfalls / Gotchas
 - Selecting `--encoding text_embedding` without having run `04_wikidata_retriever.py` first will raise lookup errors because literal/URI embeddings are missing.
@@ -50,6 +83,10 @@ config generators, and evaluation scripts all accept shard-only graph artifacts.
 - The graph label `y` is a `(1, 6)` tensor ordered as `[add_subject, add_predicate, add_object, del_subject, del_predicate, del_object]`, matching the six-slot repair objective used by downstream training code.
 - Both the flattened (`edge_index`) and original predicate-aware edges (`edge_index_non_flattened` plus `edge_attr_non_flattened`) are stored so GNNs can either treat predicates as intermediate nodes or recover direct subject→object relations without recomputing.
 - Constraint factors are modeled explicitly: labeled instances use `factor_constraint_ids` from `05_constraint_labeler.py`; unlabeled instances fall back to `local_constraint_ids` or `local_constraint_ids_focus` depending on `--constraint-scope`. Each factor is represented by a node `constraint_factor::<id>` using the pre-seeded global ID from the encoder. For every factor, the registry supplies `param_predicates`/`param_objects`, yielding factor → predicate → object branches.
+- In the default `primary_constraint_mode=executable_factor`, `factor_*` fields retain the canonical behavior: the primary violated constraint is one executable factor and `primary_factor_index` points to it.
+- In `query_definition`, `query_family`, and `passive_node` modes, `factor_*` fields contain executable secondary/context factors only. The full local factor set is mirrored in `eval_factor_*` fields so strict symbolic evaluation still includes the primary constraint. In these modes `primary_factor_index` is `-1` and `eval_primary_factor_index` points to the primary inside `eval_factor_constraint_ids`.
+- Query modes store primary task metadata as tensors: `primary_constraint_id`, `primary_constraint_type_id`, `primary_constrained_property_id`, `primary_param_predicate_ids`, `primary_param_object_ids`, and `primary_param_count`.
+- `passive_node` mode adds `passive_primary_node_index`. That node receives only constraint-definition parameter edges and is excluded from `factor_node_index`, factor supervision, and factor-to-local pressure edges.
 - Factors also connect to the local data graph they constrain: for a factor’s `constrained_property`, every predicate node created for matching triples in the instance is linked from the factor, and the factor also links to the matching triples’ subject/object nodes. This uses per-triple predicate nodes (created with `force_create=True`) so factors “observe” the local statements they govern.
 - `edge_type` is emitted alongside `edge_index` to distinguish base statement edges, factor-definition edges, and factor-to-local-statement edges during message passing.
 - Factor metadata is stored on each graph: `factor_constraint_ids` (order preserved), `primary_factor_index` (which entry matches the row’s `constraint_id`), and optional debug fields (`factor_constraint_types`, `factor_wiring_debug`) when using `--persistence-profile full`. Factor wiring uses the registry's canonical `constraint_family`; `symmetric` constraints share the inverse-style mirror-property wiring.

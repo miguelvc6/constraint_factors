@@ -112,6 +112,7 @@ def _load_test_data(model_cfg: ModelConfig):
         "test",
         model_cfg.encoding,
         constraint_representation=model_cfg.constraint_representation,
+        primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
     )
     return load_graph_dataset(graph_path)
 

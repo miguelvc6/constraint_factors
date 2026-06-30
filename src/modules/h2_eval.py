@@ -246,7 +246,13 @@ def clone_with_gold_pre_factor_pressure_mask(graph: Data) -> Data:
     return cloned
 
 
-def count_train_factor_exposure(train_data: Iterable[Data]) -> Counter[int]:
+def count_train_factor_exposure(train_data: Iterable[Data], *, cache_path: Path | None = None) -> Counter[int]:
+    if cache_path is not None and cache_path.exists():
+        with cache_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        counts_payload = payload.get("counts", payload)
+        return Counter({int(key): int(value) for key, value in counts_payload.items()})
+
     counts: Counter[int] = Counter()
     for graph in train_data:
         ids = getattr(graph, "factor_constraint_ids", None)
@@ -254,6 +260,12 @@ def count_train_factor_exposure(train_data: Iterable[Data]) -> Counter[int]:
             continue
         for value in torch.as_tensor(ids).view(-1).tolist():
             counts[int(value)] += 1
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump({"counts": {str(key): int(value) for key, value in counts.items()}}, fh)
+        tmp_path.replace(cache_path)
     return counts
 
 
@@ -461,6 +473,7 @@ def collect_h2_variant_outputs(
     exposure_counts: Counter[int],
     family_lookup: Callable[[int, int | None], str],
     batch_size: int,
+    collect_factor_records: bool = True,
 ) -> dict[str, Any]:
     loader = DataLoader(dataset, batch_size=batch_size)
     predictions: list[torch.Tensor] = []
@@ -484,91 +497,94 @@ def collect_h2_variant_outputs(
         targets.append(batch.y.detach().cpu())
         kinds.extend(str(getattr(graph, "constraint_type", "UNKNOWN") or "UNKNOWN") for graph in batch_graphs)
 
-        factor_logits_pre = outputs.get("factor_logits_pre")
-        factor_logits_post = outputs.get("factor_logits_post_gold")
-        factor_graph_index = outputs.get("factor_graph_index")
-        if factor_logits_pre is None or factor_graph_index is None:
-            unsupported_reason = "model did not emit factor_logits_pre/factor_graph_index"
-        else:
-            factor_logits_pre_cpu = torch.as_tensor(factor_logits_pre).detach().cpu().view(-1)
-            factor_logits_post_cpu = (
-                torch.as_tensor(factor_logits_post).detach().cpu().view(-1)
-                if factor_logits_post is not None
-                else None
-            )
-            factor_graph_index_cpu = torch.as_tensor(factor_graph_index).detach().cpu().view(-1)
-            local_factor_offsets: Counter[int] = Counter()
-            for factor_pos in range(factor_graph_index_cpu.numel()):
-                local_graph_idx = int(factor_graph_index_cpu[factor_pos].item())
-                graph = batch_graphs[local_graph_idx]
-                local_factor_idx = local_factor_offsets[local_graph_idx]
-                local_factor_offsets[local_graph_idx] += 1
-                ids = getattr(graph, "factor_constraint_ids", None)
-                types = getattr(graph, "factor_types", None)
-                if ids is None:
-                    continue
-                ids_t = _as_flat_tensor(ids, dtype=torch.long)
-                if local_factor_idx >= ids_t.numel():
-                    continue
-                types_t = _as_flat_tensor(types, dtype=torch.long) if types is not None else torch.empty((0,), dtype=torch.long)
-                factor_type = int(types_t[local_factor_idx].item()) if local_factor_idx < types_t.numel() else -1
-                constraint_id = int(ids_t[local_factor_idx].item())
-                primary_idx = int(getattr(graph, "primary_factor_index", -1))
-                exposure = int(exposure_counts.get(constraint_id, 0))
-                common = {
-                    "variant": variant_name,
-                    "graph_index": graph_offset + local_graph_idx,
-                    "constraint_type": str(getattr(graph, "constraint_type", "UNKNOWN") or "UNKNOWN"),
-                    "factor_index": local_factor_idx,
-                    "constraint_id": constraint_id,
-                    "factor_type": factor_type,
-                    "factor_family": family_lookup(constraint_id, factor_type),
-                    "is_primary": local_factor_idx == primary_idx,
-                    "primary_or_secondary": "primary" if local_factor_idx == primary_idx else "secondary",
-                    "train_exposure": exposure,
-                    "exposure_bucket": exposure_bucket(exposure),
-                    "density_bucket": density_bucket(factor_count(graph)),
-                }
-
-                pre_checkable = getattr(graph, "factor_checkable_pre", None)
-                pre_labels = getattr(graph, "factor_satisfied_pre", None)
-                if pre_labels is not None:
-                    labels_t = _as_flat_tensor(pre_labels, dtype=torch.long)
-                    check_t = (
-                        _as_flat_tensor(pre_checkable, dtype=torch.bool)
-                        if pre_checkable is not None
-                        else torch.ones(labels_t.numel(), dtype=torch.bool)
+        if collect_factor_records:
+            factor_logits_pre = outputs.get("factor_logits_pre")
+            factor_logits_post = outputs.get("factor_logits_post_gold")
+            factor_graph_index = outputs.get("factor_graph_index")
+            if factor_logits_pre is None or factor_graph_index is None:
+                unsupported_reason = "model did not emit factor_logits_pre/factor_graph_index"
+            else:
+                factor_logits_pre_cpu = torch.as_tensor(factor_logits_pre).detach().cpu().view(-1)
+                factor_logits_post_cpu = (
+                    torch.as_tensor(factor_logits_post).detach().cpu().view(-1)
+                    if factor_logits_post is not None
+                    else None
+                )
+                factor_graph_index_cpu = torch.as_tensor(factor_graph_index).detach().cpu().view(-1)
+                local_factor_offsets: Counter[int] = Counter()
+                for factor_pos in range(factor_graph_index_cpu.numel()):
+                    local_graph_idx = int(factor_graph_index_cpu[factor_pos].item())
+                    graph = batch_graphs[local_graph_idx]
+                    local_factor_idx = local_factor_offsets[local_graph_idx]
+                    local_factor_offsets[local_graph_idx] += 1
+                    ids = getattr(graph, "factor_constraint_ids", None)
+                    types = getattr(graph, "factor_types", None)
+                    if ids is None:
+                        continue
+                    ids_t = _as_flat_tensor(ids, dtype=torch.long)
+                    if local_factor_idx >= ids_t.numel():
+                        continue
+                    types_t = (
+                        _as_flat_tensor(types, dtype=torch.long) if types is not None else torch.empty((0,), dtype=torch.long)
                     )
-                    if local_factor_idx < labels_t.numel() and local_factor_idx < check_t.numel():
-                        factor_records.append(
-                            {
-                                **common,
-                                "state": "pre",
-                                "checkable": bool(check_t[local_factor_idx].item()),
-                                "label": int(labels_t[local_factor_idx].item()),
-                                "score": float(torch.sigmoid(factor_logits_pre_cpu[factor_pos]).item()),
-                            }
-                        )
+                    factor_type = int(types_t[local_factor_idx].item()) if local_factor_idx < types_t.numel() else -1
+                    constraint_id = int(ids_t[local_factor_idx].item())
+                    primary_idx = int(getattr(graph, "primary_factor_index", -1))
+                    exposure = int(exposure_counts.get(constraint_id, 0))
+                    common = {
+                        "variant": variant_name,
+                        "graph_index": graph_offset + local_graph_idx,
+                        "constraint_type": str(getattr(graph, "constraint_type", "UNKNOWN") or "UNKNOWN"),
+                        "factor_index": local_factor_idx,
+                        "constraint_id": constraint_id,
+                        "factor_type": factor_type,
+                        "factor_family": family_lookup(constraint_id, factor_type),
+                        "is_primary": local_factor_idx == primary_idx,
+                        "primary_or_secondary": "primary" if local_factor_idx == primary_idx else "secondary",
+                        "train_exposure": exposure,
+                        "exposure_bucket": exposure_bucket(exposure),
+                        "density_bucket": density_bucket(factor_count(graph)),
+                    }
 
-                post_checkable = getattr(graph, "factor_checkable_post_gold", None)
-                post_labels = getattr(graph, "factor_satisfied_post_gold", None)
-                if factor_logits_post_cpu is not None and post_labels is not None:
-                    labels_t = _as_flat_tensor(post_labels, dtype=torch.long)
-                    check_t = (
-                        _as_flat_tensor(post_checkable, dtype=torch.bool)
-                        if post_checkable is not None
-                        else torch.ones(labels_t.numel(), dtype=torch.bool)
-                    )
-                    if local_factor_idx < labels_t.numel() and local_factor_idx < check_t.numel():
-                        factor_records.append(
-                            {
-                                **common,
-                                "state": "post_gold",
-                                "checkable": bool(check_t[local_factor_idx].item()),
-                                "label": int(labels_t[local_factor_idx].item()),
-                                "score": float(torch.sigmoid(factor_logits_post_cpu[factor_pos]).item()),
-                            }
+                    pre_checkable = getattr(graph, "factor_checkable_pre", None)
+                    pre_labels = getattr(graph, "factor_satisfied_pre", None)
+                    if pre_labels is not None:
+                        labels_t = _as_flat_tensor(pre_labels, dtype=torch.long)
+                        check_t = (
+                            _as_flat_tensor(pre_checkable, dtype=torch.bool)
+                            if pre_checkable is not None
+                            else torch.ones(labels_t.numel(), dtype=torch.bool)
                         )
+                        if local_factor_idx < labels_t.numel() and local_factor_idx < check_t.numel():
+                            factor_records.append(
+                                {
+                                    **common,
+                                    "state": "pre",
+                                    "checkable": bool(check_t[local_factor_idx].item()),
+                                    "label": int(labels_t[local_factor_idx].item()),
+                                    "score": float(torch.sigmoid(factor_logits_pre_cpu[factor_pos]).item()),
+                                }
+                            )
+
+                    post_checkable = getattr(graph, "factor_checkable_post_gold", None)
+                    post_labels = getattr(graph, "factor_satisfied_post_gold", None)
+                    if factor_logits_post_cpu is not None and post_labels is not None:
+                        labels_t = _as_flat_tensor(post_labels, dtype=torch.long)
+                        check_t = (
+                            _as_flat_tensor(post_checkable, dtype=torch.bool)
+                            if post_checkable is not None
+                            else torch.ones(labels_t.numel(), dtype=torch.bool)
+                        )
+                        if local_factor_idx < labels_t.numel() and local_factor_idx < check_t.numel():
+                            factor_records.append(
+                                {
+                                    **common,
+                                    "state": "post_gold",
+                                    "checkable": bool(check_t[local_factor_idx].item()),
+                                    "label": int(labels_t[local_factor_idx].item()),
+                                    "score": float(torch.sigmoid(factor_logits_post_cpu[factor_pos]).item()),
+                                }
+                            )
 
         for idx, graph in enumerate(batch_graphs):
             overlap = factor_pressure_overlap(graph)
@@ -804,9 +820,10 @@ def write_h2_report(
     support: H2RunSupport,
     batch_size: int,
     include_gold_pressure_mask: bool = False,
+    exposure_cache_path: Path | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    exposure_counts = count_train_factor_exposure(train_data)
+    exposure_counts = count_train_factor_exposure(train_data, cache_path=exposure_cache_path)
     family_lookup = _constraint_family_lookup(support.global_support)
     variants = {
         "normal": test_data,
@@ -838,6 +855,7 @@ def write_h2_report(
                 exposure_counts=exposure_counts,
                 family_lookup=family_lookup,
                 batch_size=batch_size,
+                collect_factor_records=variant_name == "normal",
             )
         )
 

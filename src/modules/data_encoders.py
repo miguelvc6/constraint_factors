@@ -195,11 +195,23 @@ def graph_dataset_filename(
     encoding: str,
     *,
     constraint_representation: str = "factorized",
+    primary_constraint_mode: str = "executable_factor",
 ) -> str:
     """Return the persisted graph filename for the given split/encoding/representation."""
     representation = str(constraint_representation).lower()
+    primary_mode = str(primary_constraint_mode).lower()
     if representation == "factorized":
-        return f"{split}_graph-{encoding}.pkl"
+        if primary_mode in {"", "executable_factor"}:
+            return f"{split}_graph-{encoding}.pkl"
+        primary_slug = {
+            "query_definition": "query_definition",
+            "query_family": "query_family",
+            "passive_node": "passive_node",
+            "none": "none",
+        }.get(primary_mode, primary_mode)
+        return f"{split}_graph-{encoding}-primary_{primary_slug}.pkl"
+    if primary_mode not in {"", "executable_factor"}:
+        raise ValueError("primary_constraint_mode is only supported for factorized graph artifacts")
     if representation == "eswc_passive":
         return f"{split}_graph_repr-eswc_passive-{encoding}.pkl"
     raise ValueError(

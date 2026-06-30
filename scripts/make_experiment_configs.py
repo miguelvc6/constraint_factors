@@ -29,6 +29,12 @@ from modules.data_encoders import base_dataset_name, graph_dataset_filename
 VARIANT_MINOCC_RE = re.compile(r"minocc(\d+)", re.IGNORECASE)
 FACTORIZED_RE = re.compile(r"^train_graph-(?P<encoding>.+)\.pkl$")
 FACTORIZED_SHARD_RE = re.compile(r"^train_graph-(?P<encoding>.+)-shard\d+\.(?:pkl|pt)$")
+PRIMARY_MODE_RE = re.compile(
+    r"^train_graph-(?P<encoding>.+)-primary_(?:query_definition|query_family|passive_node|none)\.pkl$"
+)
+PRIMARY_MODE_SHARD_RE = re.compile(
+    r"^train_graph-(?P<encoding>.+)-primary_(?:query_definition|query_family|passive_node|none)-shard\d+\.(?:pkl|pt)$"
+)
 PASSIVE_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)\.pkl$")
 PASSIVE_SHARD_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)-shard\d+\.(?:pkl|pt)$")
 SAFE_STREAMING_NUM_WORKERS = 2
@@ -137,7 +143,14 @@ def _iter_variant_encodings(processed_root: Path) -> Iterable[tuple[str, str]]:
         for candidate in sorted(variant_dir.iterdir()):
             if not candidate.is_file():
                 continue
-            for pattern in (FACTORIZED_RE, FACTORIZED_SHARD_RE, PASSIVE_RE, PASSIVE_SHARD_RE):
+            for pattern in (
+                FACTORIZED_RE,
+                FACTORIZED_SHARD_RE,
+                PRIMARY_MODE_RE,
+                PRIMARY_MODE_SHARD_RE,
+                PASSIVE_RE,
+                PASSIVE_SHARD_RE,
+            ):
                 match = pattern.match(candidate.name)
                 if match:
                     encodings.add(match.group("encoding"))
@@ -179,6 +192,7 @@ class ProposalExperiment:
     factor_executor_impl: str = "per_type_v1"
     pressure_oracle_input: str = "none"
     factor_loss_enabled: bool | None = None
+    primary_constraint_mode: str = "executable_factor"
 
 
 @dataclass(frozen=True)
@@ -203,6 +217,7 @@ def _proposal_config_payload(
         "min_occurrence": min_occurrence,
         "model": exp.model_name,
         "constraint_representation": exp.constraint_representation,
+        "primary_constraint_mode": exp.primary_constraint_mode,
         "factor_executor_impl": exp.factor_executor_impl,
         "use_edge_attributes": True,
         "use_edge_subtraction": False,
@@ -337,6 +352,11 @@ def main() -> None:
         action="store_true",
         help="Emit the three H2 supporting ablation configs. Existing config files are left untouched.",
     )
+    parser.add_argument(
+        "--include-primary-query-ablations",
+        action="store_true",
+        help="Emit the three A1 primary-query ablation configs for full_strat1m_minocc100/node_id.",
+    )
     args = parser.parse_args()
 
     pairs = list(_iter_variant_encodings(args.processed_root))
@@ -443,6 +463,37 @@ def main() -> None:
         ),
     ]
 
+    primary_query_proposals: list[ProposalExperiment] = [
+        ProposalExperiment(
+            name="a1_qdef_secondary_factors",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            primary_constraint_mode="query_definition",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            validate_factor_labels=True,
+        ),
+        ProposalExperiment(
+            name="a1_qfamily_secondary_factors",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            primary_constraint_mode="query_family",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            validate_factor_labels=True,
+        ),
+        ProposalExperiment(
+            name="a1_primary_passive_secondary_factors",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            primary_constraint_mode="passive_node",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            validate_factor_labels=True,
+        ),
+    ]
+    primary_query_names = {exp.name for exp in primary_query_proposals}
+
     experimental_proposals: list[ProposalExperiment] = [
         ProposalExperiment(
             name="x1_policy_choice_appendix",
@@ -489,6 +540,12 @@ def main() -> None:
         reranker_experiments = list(canonical_rerankers)
         if args.include_h2_ablations:
             proposal_experiments.extend(h2_ablation_proposals)
+        if (
+            args.include_primary_query_ablations
+            and variant == "full_strat1m_minocc100"
+            and encoding == "node_id"
+        ):
+            proposal_experiments.extend(primary_query_proposals)
         if args.include_experimental:
             proposal_experiments.extend(experimental_proposals)
             reranker_experiments.extend(experimental_rerankers)
@@ -505,7 +562,10 @@ def main() -> None:
             )
             if exp.name == "x2_factor_loss_only_appendix":
                 payload["training_config"]["factor_loss"]["enabled"] = True
-            if _write_json(cfg_path, payload, overwrite=not args.include_h2_ablations):
+            overwrite = not args.include_h2_ablations
+            if args.include_primary_query_ablations and exp.name not in primary_query_names:
+                overwrite = False
+            if _write_json(cfg_path, payload, overwrite=overwrite):
                 created += 1
 
         for exp in reranker_experiments:
@@ -520,7 +580,10 @@ def main() -> None:
                 num_factor_types=num_factor_types,
                 proposal_config_tag=proposal_config_tag,
             )
-            if _write_json(cfg_path, payload, overwrite=not args.include_h2_ablations):
+            overwrite = not args.include_h2_ablations
+            if args.include_primary_query_ablations:
+                overwrite = False
+            if _write_json(cfg_path, payload, overwrite=overwrite):
                 created += 1
 
     print(f"[ok] wrote {created} configs under {args.models_root}")

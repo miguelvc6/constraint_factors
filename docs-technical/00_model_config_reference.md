@@ -47,6 +47,12 @@ Paper-facing additions:
   - `B0` should use `eswc_passive`
   - `A1`, `M1C`, `M1D`, and proposal sources for `G0` should use `factorized`
 
+- `primary_constraint_mode`
+  - allowed values: `executable_factor`, `query_definition`, `query_family`, `passive_node`, `none`
+  - default: `executable_factor`
+  - canonical `B0`, `A1`, `M1C`, `M1D`, `G0`, and H2 runs should keep `executable_factor`
+  - A1 primary-query ablations use `query_definition`, `query_family`, or `passive_node`; their graph artifacts must be built with the same mode so the filename suffix matches the config
+
 - `pressure_module_sharing`
   - allowed values: `per_type`, `shared`
   - default: `per_type`
@@ -73,6 +79,7 @@ Core optimization fields:
 - `num_workers`
 - `pin_memory`
 - `validate_factor_labels`
+- `train_subset_size`
 - `validation_subset_size`
 
 Generator defaults for the paper-facing proposal configs:
@@ -92,6 +99,8 @@ These defaults are intentionally conservative for the large streamed graph artif
 The paper-facing reranker generator uses the same cheaper schedule (`num_epochs: 10`, `early_stopping_rounds: 2`, `learning_rate: 1e-4`, `grad_clip: 0.5`, `scheduler_patience: 0`) with its own reranker batch size.
 
 Set `validation_subset_size` to a positive integer for development runs that should validate on only the first N validation graphs each epoch. Leave it unset or `null` for full validation. For streamed graph artifacts, subset validation uses a single validation worker so the stream produces one global prefix rather than one prefix per worker.
+
+Set `train_subset_size` to a positive integer for bounded execution runs that should train on only the first N training graphs each epoch. Leave it unset or `null` for full training. For streamed graph artifacts, subset training also uses a single worker so each epoch consumes one deterministic global prefix.
 
 For `num_factor_types`, the paper-facing generators prefer the compact factor-type count derived from the constraint registry rather than inferring from a single graph sample.
 

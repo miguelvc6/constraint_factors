@@ -316,7 +316,6 @@ def _assert_factor_labels(graph: Data, graph_index: int | None = None) -> None:
     factor_ids = getattr(graph, "factor_constraint_ids", None)
     assert factor_ids is not None, f"{prefix}missing factor_constraint_ids"
     factor_ids_tensor = torch.as_tensor(factor_ids).view(-1)
-    assert factor_ids_tensor.numel() > 0, f"{prefix}factor_constraint_ids must be non-empty"
     expected_len = int(factor_ids_tensor.numel())
 
     primary_idx = getattr(graph, "primary_factor_index", None)
@@ -327,9 +326,12 @@ def _assert_factor_labels(graph: Data, graph_index: int | None = None) -> None:
         primary_idx = int(primary_idx.item())
     else:
         primary_idx = int(primary_idx)
-    assert 0 <= primary_idx < expected_len, (
-        f"{prefix}primary_factor_index {primary_idx} out of range for {expected_len} factors"
-    )
+    if expected_len == 0:
+        assert primary_idx == -1, f"{prefix}primary_factor_index must be -1 when no executable factors exist"
+    else:
+        assert primary_idx == -1 or 0 <= primary_idx < expected_len, (
+            f"{prefix}primary_factor_index {primary_idx} out of range for {expected_len} factors"
+        )
 
     def _check_vector(name: str, *, expect_bool: bool = False, expect_int: bool = False) -> torch.Tensor:
         value = getattr(graph, name, None)
@@ -411,11 +413,12 @@ def _assert_factor_logit_alignment(
             primary_idx = int(primary_idx.item())
         else:
             primary_idx = int(primary_idx)
-        assert 0 <= primary_idx < count, (
+        assert primary_idx == -1 or 0 <= primary_idx < count, (
             f"primary_factor_index {primary_idx} out of range for graph {graph_idx} with {count} factors"
         )
-        primary_logit = factor_logits[offset + primary_idx]
-        assert torch.isfinite(primary_logit).item(), "primary factor logit is not finite"
+        if primary_idx >= 0:
+            primary_logit = factor_logits[offset + primary_idx]
+            assert torch.isfinite(primary_logit).item(), "primary factor logit is not finite"
         offset = end
     assert offset == factor_logits.numel(), "factor_logits_pre length does not match factor label total"
 
@@ -738,7 +741,25 @@ def train(
     # Dataset bookkeeping / loader construction.
     train_dataset_info = "streaming" if isinstance(train_data, IterableDataset) else "in-memory"
     val_dataset_info = "streaming" if isinstance(val_data, IterableDataset) else "in-memory"
+    train_subset_size = train_cfg.train_subset_size
     validation_subset_size = train_cfg.validation_subset_size
+
+    train_loader_data: list[Data] | IterableDataset
+    if train_subset_size is None:
+        train_loader_data = train_data
+    elif isinstance(train_data, list):
+        train_loader_data = train_data[:train_subset_size]
+        logger.info(
+            "Train subset enabled | using first %s/%s in-memory graphs per epoch",
+            len(train_loader_data),
+            len(train_data),
+        )
+    else:
+        train_loader_data = ValidationSubsetStream(cast(IterableDataset, train_data), train_subset_size)
+        logger.info(
+            "Train subset enabled | using first %s streamed graphs per epoch",
+            train_subset_size,
+        )
 
     val_loader_data: list[Data] | IterableDataset
     if validation_subset_size is None:
@@ -769,11 +790,16 @@ def train(
     except TypeError:
         logger.info(f"Validation dataset is {val_dataset_info}; size will be determined lazily")
 
-    train_is_iterable = isinstance(train_data, IterableDataset)
+    train_is_iterable = isinstance(train_loader_data, IterableDataset)
 
     def _loader_kwargs_for_split(split: str, dataset: list[Data] | IterableDataset) -> dict[str, Any]:
         dataset_is_iterable = isinstance(dataset, IterableDataset)
         num_workers = train_cfg.num_workers
+        if split == "train" and train_subset_size is not None and dataset_is_iterable and num_workers > 0:
+            logger.info(
+                "Train subset uses num_workers=0 so streamed training emits one global prefix only."
+            )
+            num_workers = 0
         if split == "val" and validation_subset_size is not None and dataset_is_iterable and num_workers > 0:
             logger.info(
                 "Validation subset uses num_workers=0 so streamed validation emits one global prefix only."
@@ -809,9 +835,9 @@ def train(
         return kwargs
 
     train_loader = DataLoader(
-        cast(Any, train_data),
+        cast(Any, train_loader_data),
         shuffle=(not train_is_iterable),
-        **_loader_kwargs_for_split("train", train_data),
+        **_loader_kwargs_for_split("train", train_loader_data),
     )
     val_loader = DataLoader(
         cast(Any, val_loader_data),
@@ -2912,11 +2938,13 @@ def main():
         "train",
         model_cfg.encoding,
         constraint_representation=model_cfg.constraint_representation,
+        primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
     )
     val_data_path = path / graph_dataset_filename(
         "val",
         model_cfg.encoding,
         constraint_representation=model_cfg.constraint_representation,
+        primary_constraint_mode=getattr(model_cfg, "primary_constraint_mode", "executable_factor"),
     )
     train_data = load_graph_dataset(train_data_path)
     val_data = load_graph_dataset(val_data_path)
@@ -3248,10 +3276,15 @@ def main():
     estimated_val_batches: int | None = None
 
     if isinstance(train_data, list):
-        estimated_train_batches = max(1, math.ceil(len(train_data) / max(training_cfg.batch_size, 1)))
+        train_graph_count = len(train_data)
+        if training_cfg.train_subset_size is not None:
+            train_graph_count = min(train_graph_count, training_cfg.train_subset_size)
+        estimated_train_batches = max(1, math.ceil(train_graph_count / max(training_cfg.batch_size, 1)))
     else:
         train_graph_count = _manifest_graph_count(train_data_path)
         if train_graph_count is not None and train_graph_count > 0:
+            if training_cfg.train_subset_size is not None:
+                train_graph_count = min(train_graph_count, training_cfg.train_subset_size)
             estimated_train_batches = max(1, math.ceil(train_graph_count / max(training_cfg.batch_size, 1)))
 
     if isinstance(val_data, list):

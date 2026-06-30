@@ -1,0 +1,51 @@
+{
+  "run_directory": "/home/mvazquez/constraint_factors/models/a1_qdef_secondary_factors__full_strat1m_minocc100__node_id",
+  "dataset_variant": "full_strat1m_minocc100",
+  "min_occurrence": 100,
+  "encoding": "node_id",
+  "constraint_representation": "factorized",
+  "selection_mode": "slot_argmax",
+  "candidate_config": {
+    "topk_candidates": 20,
+    "topk_per_slot": 5,
+    "heuristic_max_candidates": 30,
+    "heuristic_max_values": 3,
+    "include_gold": false,
+    "max_candidates_total": 80
+  },
+  "max_safe_disruption": 2,
+  "constraint_type_support": {
+    "conflictWith": 15093,
+    "distinct": 34232,
+    "inverse": 15001,
+    "itemRequiresStatement": 15001,
+    "oneOf": 1028,
+    "single": 17958,
+    "type": 15001,
+    "valueRequiresStatement": 15003,
+    "valueType": 14999
+  },
+  "overall": {
+    "support": 143316,
+    "candidate_set_nonempty_rate": 1.0,
+    "candidate_count_mean": 42.747048480281336,
+    "oracle_safe_available_rate": 0.9331198191409193,
+    "selected_safe_rate": 0.7845251053615786,
+    "oracle_non_vacuous_safe_available_rate": 0.17537469647492254,
+    "selected_non_vacuous_safe_rate": 0.09126685087498954,
+    "oracle_primary_fix_rate": 0.9877822434340897,
+    "selected_primary_fix_rate": 0.8062044712383823,
+    "oracle_gfr": 0.9099185158435146,
+    "selected_gfr": 0.8741973194781745,
+    "oracle_srr": 0.0021579617283861694,
+    "selected_srr": 0.002077166487941398,
+    "oracle_sir": 0.15731627246491883,
+    "selected_sir": 0.05342398407250431,
+    "oracle_mean_disruption": 0.502449133383572,
+    "selected_mean_disruption": 0.8168592480951185,
+    "oracle_focus_deleted_rate": 0.4813000641938095,
+    "selected_focus_deleted_rate": 0.2418850651706718,
+    "oracle_vacuous_satisfaction_improvement_rate": 0.4428954199112451,
+    "selected_vacuous_satisfaction_improvement_rate": 0.23197689022858578
+  }
+}
