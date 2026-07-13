@@ -21,27 +21,37 @@ import json
 import logging
 import math
 import pickle
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 import pandas as pd
+import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm.autonotebook import tqdm
 
 from modules.baselines import evaluate_baselines
-from modules.candidates import CandidateConfig, build_candidates, score_candidates_from_logits
+from modules.candidates import (
+    CandidateConfig,
+    build_inference_candidates,
+    candidate_feature_tuples,
+    candidate_identity_tuples,
+    score_candidates_from_logits,
+)
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import (
+    IDENTITY_TO_FEATURE_FILENAME,
     GlobalIntEncoder,
     GraphStreamDataset,
     base_dataset_name,
     dataset_variant_name,
     discover_graph_artifacts,
     graph_dataset_filename,
+    encoder_path,
 )
 from modules.model_store import baseline_dir, config_copy_path, evaluations_dir, get_checkpoint_path
 from modules.models import BaseGraphModel, build_model
@@ -61,6 +71,12 @@ from modules.policy import (
     POLICY_NAMES,
     PolicyDecision,
     filter_candidates_by_policy,
+)
+from modules.provenance import (
+    RUN_MANIFEST_FILENAME,
+    config_differences,
+    file_sha256,
+    json_file_hash,
 )
 
 NONE_CLASS_INDEX = 0  # Bass-style datasets reserve class 0 for "no triple"
@@ -179,6 +195,7 @@ class ChooserSupport:
     contexts: Sequence[ViolationContext]
     heuristics: ConstraintRepairHeuristics
     candidate_cfg: CandidateConfig
+    identity_to_feature: Sequence[int] | None = None
 
 
 @dataclass
@@ -186,6 +203,7 @@ class PolicySupport:
     contexts: Sequence[ViolationContext]
     heuristics: ConstraintRepairHeuristics
     candidate_cfg: CandidateConfig
+    identity_to_feature: Sequence[int] | None = None
     filter_strict: bool = True
 
 
@@ -194,6 +212,57 @@ class DirectSafetySupport:
     contexts: Sequence[ViolationContext]
     heuristics: ConstraintRepairHeuristics
     candidate_cfg: CandidateConfig
+    identity_to_feature: Sequence[int] | None = None
+
+
+def _load_identity_to_feature(root: Path) -> np.ndarray | None:
+    path = root / IDENTITY_TO_FEATURE_FILENAME
+    if not path.exists():
+        logging.warning("Identity-to-feature map not found at %s; assuming legacy shared IDs.", path)
+        return None
+    mapping = np.load(path)
+    if mapping.ndim != 1:
+        raise ValueError(f"Expected a 1D identity-to-feature map at {path}, got {mapping.shape}")
+    return mapping
+
+
+def _feature_to_unique_identity(
+    values: torch.Tensor,
+    identity_to_feature: Sequence[int] | None,
+) -> torch.Tensor:
+    if identity_to_feature is None:
+        return values.to(dtype=torch.long).clone()
+    max_feature = max((int(value) for value in identity_to_feature), default=0)
+    inverse = torch.full((max_feature + 1,), -1, dtype=torch.long)
+    ambiguous: set[int] = set()
+    for identity_id, feature_id_raw in enumerate(identity_to_feature):
+        feature_id = int(feature_id_raw)
+        if feature_id < 0:
+            continue
+        if inverse[feature_id] < 0:
+            inverse[feature_id] = int(identity_id)
+        elif int(inverse[feature_id]) != identity_id:
+            ambiguous.add(feature_id)
+    for feature_id in ambiguous:
+        inverse[feature_id] = -1
+    inverse[NONE_CLASS_INDEX] = NONE_CLASS_INDEX
+    result = torch.full_like(values, -1, dtype=torch.long)
+    valid = (values >= 0) & (values < inverse.numel())
+    result[valid] = inverse[values[valid].to(dtype=torch.long)]
+    return result
+
+
+def _identity_to_feature_values(
+    values: torch.Tensor,
+    identity_to_feature: Sequence[int] | None,
+) -> torch.Tensor:
+    if identity_to_feature is None:
+        return values.to(dtype=torch.long).clone()
+    mapping = torch.as_tensor(identity_to_feature, dtype=torch.long)
+    result = torch.full_like(values, -1, dtype=torch.long)
+    valid = (values >= 0) & (values < mapping.numel())
+    result[valid] = mapping[values[valid].to(dtype=torch.long)]
+    return result
 
 
 def _repair_samples_from_predictions(
@@ -342,13 +411,13 @@ def _maybe_prepare_repair_support(
         variant_dir = f"{variant_dir}{suffix}"
 
     interim_base = Path("data/interim") / variant_dir
-    encoder_path = interim_base / "globalintencoder.txt"
+    identity_encoder_path = encoder_path(interim_base, identity=True)
 
     contexts = load_violation_contexts(interim_base, split, none_class=none_class)
-    placeholder_ids = load_placeholder_ids(encoder_path)
+    placeholder_ids = load_placeholder_ids(identity_encoder_path)
 
     encoder = GlobalIntEncoder()
-    encoder.load(encoder_path)
+    encoder.load(identity_encoder_path)
     encoder.freeze()
 
     heuristics = ConstraintRepairHeuristics(
@@ -376,7 +445,7 @@ def _maybe_prepare_global_support(
         variant_dir = f"{variant_dir}{suffix}"
 
     interim_base = Path("data/interim") / variant_dir
-    encoder_path = interim_base / "globalintencoder.txt"
+    identity_encoder_path = encoder_path(interim_base, identity=True)
     registry_candidates = []
     if registry_dataset:
         registry_candidates.append(registry_dataset)
@@ -401,8 +470,8 @@ def _maybe_prepare_global_support(
             )
         logging.warning("%s Skipping global metrics.", message)
         return None
-    if not encoder_path.exists():
-        message = f"Global encoder not found at {encoder_path}."
+    if not identity_encoder_path.exists():
+        message = f"Identity encoder not found at {identity_encoder_path}."
         if strict:
             raise RuntimeError(
                 message + " Strict global metrics require the encoder; rebuild interim data or disable strict mode."
@@ -422,7 +491,7 @@ def _maybe_prepare_global_support(
         return None
 
     encoder = GlobalIntEncoder()
-    encoder.load(encoder_path)
+    encoder.load(identity_encoder_path)
     encoder.freeze()
 
     try:
@@ -517,6 +586,7 @@ def eval(
     chooser_support: ChooserSupport | None = None,
     direct_safety_support: DirectSafetySupport | None = None,
     policy_support: PolicySupport | None = None,
+    identity_to_feature: Sequence[int] | None = None,
 ) -> dict[str, object]:
     """Evaluate a model and return Bass-style precision/recall/F1 metrics."""
     if isinstance(device, str):
@@ -538,7 +608,11 @@ def eval(
         raise ValueError("Chooser support and direct safety support cannot be used together.")
     if precomputed_predictions is None and model is not None:
         model.eval()
-    predictions, targets = [], []
+    identity_predictions: list[torch.Tensor] = []
+    feature_predictions: list[torch.Tensor] = []
+    identity_targets: list[torch.Tensor] = []
+    feature_targets: list[torch.Tensor] = []
+    representable_masks: list[torch.Tensor] = []
     output_logged = False
     for data in tqdm(test_loader, desc="Test Batches"):
         batch_graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
@@ -567,31 +641,42 @@ def eval(
                 if policy_logits is None:
                     raise RuntimeError("Policy choice enabled but model output missing policy_logits.")
                 graphs = data.to_data_list()
-                batch_preds = []
+                batch_identity_preds = []
+                batch_feature_preds = []
                 for idx, graph in enumerate(graphs):
                     context_index = int(getattr(graph, "context_index", idx))
                     if context_index >= len(policy_support.contexts):
                         raise RuntimeError("Policy context index out of bounds.")
                     context = policy_support.contexts[context_index]
                     policy_id = int(torch.argmax(policy_logits[idx]).item())
-                    candidates, _ = build_candidates(
-                        graph=graph,
+                    candidates = build_inference_candidates(
                         context=context,
                         heuristics=policy_support.heuristics,
                         proposal_logits=logits[idx].detach(),
                         cfg=policy_support.candidate_cfg,
                         placeholder_ids=set(policy_support.heuristics.placeholder_ids.values()),
                         num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
+                        identity_to_feature=policy_support.identity_to_feature,
                     )
+                    identity_candidates = candidate_identity_tuples(candidates)
                     candidates_filtered, match_mask = filter_candidates_by_policy(
-                        candidates,
+                        identity_candidates,
                         policy_id,
                         context,
                         strict=policy_support.filter_strict,
                         none_class=NONE_CLASS_INDEX,
                     )
+                    candidate_by_identity = {candidate.identity_slots: candidate for candidate in candidates}
+                    filtered_records = [
+                        candidate_by_identity[tuple(int(value) for value in candidate)]
+                        for candidate in candidates_filtered
+                    ]
                     if chooser_support is not None:
-                        candidate_tensor = torch.tensor(candidates_filtered, dtype=torch.long, device=logits.device)
+                        candidate_tensor = torch.tensor(
+                            candidate_feature_tuples(filtered_records),
+                            dtype=torch.long,
+                            device=logits.device,
+                        )
                         scores = model.score_candidates(graph_emb[idx], candidate_tensor)
                         if not policy_support.filter_strict:
                             mask_tensor = torch.tensor(
@@ -601,66 +686,98 @@ def eval(
                             )
                             scores = scores + (mask_tensor - 1.0)
                         best_idx = int(torch.argmax(scores).item())
-                        batch_preds.append(list(candidates_filtered[best_idx]))
+                        selected = filtered_records[best_idx]
                     else:
-                        batch_preds.append(list(candidates_filtered[0]))
-                predictions.append(torch.tensor(batch_preds, dtype=torch.long).cpu())
+                        selected = filtered_records[0]
+                    batch_identity_preds.append(list(selected.identity_slots))
+                    batch_feature_preds.append(list(selected.feature_slots))
+                identity_predictions.append(torch.tensor(batch_identity_preds, dtype=torch.long))
+                feature_predictions.append(torch.tensor(batch_feature_preds, dtype=torch.long))
             elif chooser_support is not None:
                 if graph_emb is None:
                     raise RuntimeError("Chooser mode requires graph_emb from model outputs.")
                 graphs = data.to_data_list()
-                batch_preds = []
+                batch_identity_preds = []
+                batch_feature_preds = []
                 for idx, graph in enumerate(graphs):
                     context_index = int(getattr(graph, "context_index", idx))
                     if context_index >= len(chooser_support.contexts):
                         raise RuntimeError("Chooser context index out of bounds.")
                     context = chooser_support.contexts[context_index]
-                    candidates, _ = build_candidates(
-                        graph=graph,
+                    candidates = build_inference_candidates(
                         context=context,
                         heuristics=chooser_support.heuristics,
                         proposal_logits=logits[idx].detach(),
                         cfg=chooser_support.candidate_cfg,
                         placeholder_ids=set(chooser_support.heuristics.placeholder_ids.values()),
                         num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
+                        identity_to_feature=chooser_support.identity_to_feature,
                     )
-                    candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=logits.device)
+                    candidate_tensor = torch.tensor(
+                        candidate_feature_tuples(candidates), dtype=torch.long, device=logits.device
+                    )
                     scores = model.score_candidates(graph_emb[idx], candidate_tensor)
                     best_idx = int(torch.argmax(scores).item())
-                    batch_preds.append(list(candidates[best_idx]))
-                predictions.append(torch.tensor(batch_preds, dtype=torch.long).cpu())
+                    selected = candidates[best_idx]
+                    batch_identity_preds.append(list(selected.identity_slots))
+                    batch_feature_preds.append(list(selected.feature_slots))
+                identity_predictions.append(torch.tensor(batch_identity_preds, dtype=torch.long))
+                feature_predictions.append(torch.tensor(batch_feature_preds, dtype=torch.long))
             elif direct_safety_support is not None:
                 graphs = data.to_data_list()
-                batch_preds = []
+                batch_identity_preds = []
+                batch_feature_preds = []
                 for idx, graph in enumerate(graphs):
                     context_index = int(getattr(graph, "context_index", idx))
                     if context_index >= len(direct_safety_support.contexts):
                         raise RuntimeError("Direct safety context index out of bounds.")
                     context = direct_safety_support.contexts[context_index]
-                    candidates, _ = build_candidates(
-                        graph=graph,
+                    candidates = build_inference_candidates(
                         context=context,
                         heuristics=direct_safety_support.heuristics,
                         proposal_logits=logits[idx].detach(),
                         cfg=direct_safety_support.candidate_cfg,
                         placeholder_ids=set(direct_safety_support.heuristics.placeholder_ids.values()),
                         num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
+                        identity_to_feature=direct_safety_support.identity_to_feature,
                     )
-                    candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=logits.device)
+                    candidate_tensor = torch.tensor(
+                        candidate_feature_tuples(candidates), dtype=torch.long, device=logits.device
+                    )
                     scores = score_candidates_from_logits(logits[idx], candidate_tensor)
                     best_idx = int(torch.argmax(scores).item())
-                    batch_preds.append(list(candidates[best_idx]))
-                predictions.append(torch.tensor(batch_preds, dtype=torch.long).cpu())
+                    selected = candidates[best_idx]
+                    batch_identity_preds.append(list(selected.identity_slots))
+                    batch_feature_preds.append(list(selected.feature_slots))
+                identity_predictions.append(torch.tensor(batch_identity_preds, dtype=torch.long))
+                feature_predictions.append(torch.tensor(batch_feature_preds, dtype=torch.long))
             else:
                 out = logits.argmax(dim=-1)  # class predictions per action
-                predictions.append(out.cpu())
-        targets.append(data.y.cpu())
+                feature_batch = out.cpu()
+                feature_predictions.append(feature_batch)
+                identity_predictions.append(
+                    _feature_to_unique_identity(feature_batch, identity_to_feature)
+                )
+        feature_target = data.y.cpu()
+        identity_target = getattr(data, "y_identity", data.y).cpu()
+        representable = getattr(data, "target_representable_mask", None)
+        if representable is None:
+            representable = torch.ones_like(identity_target, dtype=torch.bool)
+        feature_targets.append(feature_target)
+        identity_targets.append(identity_target)
+        representable_masks.append(representable.cpu().to(dtype=torch.bool))
 
     if precomputed_predictions is None:
-        predictions = torch.cat(predictions, dim=0)
+        predictions = torch.cat(identity_predictions, dim=0)
+        feature_predictions_tensor = torch.cat(feature_predictions, dim=0)
     else:
         predictions = precomputed_predictions
-    targets = torch.cat(targets, dim=0)
+        feature_predictions_tensor = _identity_to_feature_values(
+            predictions, identity_to_feature
+        )
+    targets = torch.cat(identity_targets, dim=0)
+    feature_targets_tensor = torch.cat(feature_targets, dim=0)
+    representable_mask = torch.cat(representable_masks, dim=0)
 
     if predictions.shape[0] != len(kinds):
         raise ValueError(
@@ -673,6 +790,29 @@ def eval(
     global_counts, per_type_counts = _aggregate_counts(predictions, targets, kinds, none_class)
 
     global_micro_metrics = _metrics_from_counts(global_counts)
+    feature_counts, _ = _aggregate_counts(
+        feature_predictions_tensor,
+        feature_targets_tensor,
+        kinds,
+        none_class,
+    )
+    feature_micro_metrics = _metrics_from_counts(feature_counts)
+
+    active_target_mask = targets != none_class
+    active_target_slots = int(active_target_mask.sum().item())
+    representable_active_slots = int((representable_mask & active_target_mask).sum().item())
+    representable_rows = representable_mask.all(dim=1)
+    representable_row_indices = torch.nonzero(representable_rows, as_tuple=False).view(-1)
+    representable_kinds = [kinds[int(index)] for index in representable_row_indices.tolist()]
+    representable_counts, _ = _aggregate_counts(
+        predictions.index_select(0, representable_row_indices),
+        targets.index_select(0, representable_row_indices),
+        representable_kinds,
+        none_class,
+    )
+    representable_micro_metrics = _metrics_from_counts(representable_counts)
+    unresolved_prediction_slots = int((predictions < 0).sum().item())
+    unresolved_prediction_rows = int((predictions < 0).any(dim=1).sum().item())
 
     per_type_metrics: dict[str, dict[str, dict[str, float | int] | dict[str, dict[str, float | int]]]] = {}
     for kind, count_dict in per_type_counts.items():
@@ -727,6 +867,19 @@ def eval(
         macro_precision = macro_recall = macro_f1 = 0.0
 
     results: dict[str, object] = {
+        "evaluation_schema_version": 2,
+        "fidelity_space": "strict_identity",
+        "candidate_inference_gold_access": False,
+        "metric_definitions": {
+            "micro_f1": "Exact add/delete triple match in unfiltered identity-ID space.",
+            "feature_space_micro": "Diagnostic match after training-vocabulary compression.",
+            "primary_fix_rate": (
+                "Fraction of pre-checkable, pre-violated primary constraints that are "
+                "post-checkable and post-satisfied."
+            ),
+            "srr": "Pooled secondary regressions divided by pooled eligible satisfied secondary factors.",
+            "sir": "Pooled secondary improvements divided by pooled eligible violated secondary factors.",
+        },
         "micro_precision": global_micro_metrics["precision"],
         "micro_recall": global_micro_metrics["recall"],
         "micro_f1": global_micro_metrics["f1"],
@@ -737,6 +890,37 @@ def eval(
             "tp": global_counts.tp,
             "fp": global_counts.fp,
             "fn": global_counts.fn,
+        },
+        "feature_space_micro": {
+            "precision": feature_micro_metrics["precision"],
+            "recall": feature_micro_metrics["recall"],
+            "f1": feature_micro_metrics["f1"],
+            "tp": feature_counts.tp,
+            "fp": feature_counts.fp,
+            "fn": feature_counts.fn,
+        },
+        "representability": {
+            "active_target_slots": active_target_slots,
+            "representable_active_target_slots": representable_active_slots,
+            "active_target_slot_coverage": _safe_div(
+                representable_active_slots, active_target_slots
+            ),
+            "rows": int(targets.size(0)),
+            "fully_representable_rows": int(representable_rows.sum().item()),
+            "fully_representable_row_coverage": _safe_div(
+                int(representable_rows.sum().item()), int(targets.size(0))
+            ),
+            "unresolved_prediction_slots": unresolved_prediction_slots,
+            "unresolved_prediction_rows": unresolved_prediction_rows,
+        },
+        "representable_only_micro": {
+            "precision": representable_micro_metrics["precision"],
+            "recall": representable_micro_metrics["recall"],
+            "f1": representable_micro_metrics["f1"],
+            "tp": representable_counts.tp,
+            "fp": representable_counts.fp,
+            "fn": representable_counts.fn,
+            "rows": int(representable_row_indices.numel()),
         },
         "support_per_constraint_type": dict(Counter(kinds)),
         "per_constraint_type": per_type_metrics,
@@ -797,6 +981,7 @@ def _run_and_save(
     policy_support: PolicySupport | None = None,
     selection_weights: dict[str, float] | None = None,
     selection_disruption_field: str = "mean_disruption_total",
+    identity_to_feature: Sequence[int] | None = None,
 ) -> dict[str, object]:
     normalized_predictions = None
     if precomputed_predictions is not None:
@@ -810,6 +995,7 @@ def _run_and_save(
         chooser_support=chooser_support,
         direct_safety_support=direct_safety_support,
         policy_support=policy_support,
+        identity_to_feature=identity_to_feature,
     )
     metrics["global_metrics_computed"] = bool(
         postprocess_state and isinstance(postprocess_state, dict) and "global_metrics" in postprocess_state
@@ -823,6 +1009,7 @@ def _run_and_save(
     if "global_metrics" in metrics and isinstance(metrics["global_metrics"], dict):
         overall = metrics["global_metrics"].get("overall")
         if isinstance(overall, dict):
+            metrics["primary_fix_rate"] = overall.get("primary_fix_rate", 0.0)
             metrics["overall_gfr"] = overall.get("gfr", 0.0)
             metrics["overall_srr"] = overall.get("srr", 0.0)
             metrics["overall_sir"] = overall.get("sir", 0.0)
@@ -832,6 +1019,54 @@ def _run_and_save(
             metrics["mean_disruption_total"] = disruption.get("total_ops_mean", 0.0)
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "model.json"
+    run_manifest_path = output_dir.parent / RUN_MANIFEST_FILENAME
+    evaluation_provenance: dict[str, object] = {
+        "command": [sys.executable, *sys.argv],
+        "run_manifest_path": str(run_manifest_path),
+        "run_manifest_sha256": None,
+        "checkpoint_sha256": None,
+        "dataset_manifest": None,
+        "test_graph_manifest": None,
+    }
+    if run_manifest_path.exists():
+        with run_manifest_path.open("r", encoding="utf-8") as handle:
+            run_manifest = json.load(handle)
+        evaluation_provenance["run_manifest_sha256"] = json_file_hash(run_manifest_path)
+        checkpoint_record = run_manifest.get("checkpoint", {})
+        if isinstance(checkpoint_record, dict):
+            evaluation_provenance["checkpoint_sha256"] = checkpoint_record.get("sha256")
+    config_path = output_dir.parent / "config.json"
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as handle:
+            config_payload = json.load(handle)
+        eval_model_cfg = ModelConfig.from_mapping(config_payload.get("model_config", {}))
+        variant = dataset_variant_name(
+            eval_model_cfg.dataset_variant,
+            eval_model_cfg.min_occurrence,
+        )
+        dataset_manifest_path = Path("data/interim") / variant / "dataset_manifest.json"
+        if dataset_manifest_path.exists():
+            evaluation_provenance["dataset_manifest"] = {
+                "path": str(dataset_manifest_path),
+                "sha256": json_file_hash(dataset_manifest_path),
+            }
+        test_graph_path = Path("data/processed") / variant / graph_dataset_filename(
+            "test",
+            eval_model_cfg.encoding,
+            constraint_representation=eval_model_cfg.constraint_representation,
+            primary_constraint_mode=getattr(
+                eval_model_cfg, "primary_constraint_mode", "executable_factor"
+            ),
+        )
+        test_manifest_path = test_graph_path.with_suffix(
+            test_graph_path.suffix + ".manifest.json"
+        )
+        if test_manifest_path.exists():
+            evaluation_provenance["test_graph_manifest"] = {
+                "path": str(test_manifest_path),
+                "sha256": json_file_hash(test_manifest_path),
+            }
+    metrics["evaluation_provenance"] = evaluation_provenance
     with open(results_path, "w", encoding="utf-8") as f:
         weights = selection_weights or {}
         selection_block = compute_model_selection_block(
@@ -980,7 +1215,7 @@ def _summarize_repair_per_type(repair_metrics: dict[str, object] | None) -> dict
     return summary
 
 
-def _compute_primary_fix_rate(repair_metrics: dict[str, object] | None) -> float | None:
+def _compute_repair_action_match_rate(repair_metrics: dict[str, object] | None) -> float | None:
     if not repair_metrics:
         return None
     per_type = _summarize_repair_per_type(repair_metrics)
@@ -996,6 +1231,15 @@ def _compute_primary_fix_rate(repair_metrics: dict[str, object] | None) -> float
     return float(exact + alternative) / total
 
 
+def _compute_primary_fix_rate(global_metrics: dict[str, object] | None) -> float | None:
+    if not global_metrics:
+        return None
+    overall = global_metrics.get("overall")
+    if not isinstance(overall, dict) or "primary_fix_rate" not in overall:
+        return None
+    return float(overall["primary_fix_rate"])
+
+
 def compute_model_selection_block(
     metrics: dict[str, object],
     weights: dict[str, float],
@@ -1003,9 +1247,10 @@ def compute_model_selection_block(
 ) -> dict[str, object]:
     missing_fields: list[str] = []
 
-    primary_fix_rate = _compute_primary_fix_rate(metrics.get("repair_metrics"))
+    primary_fix_rate = _compute_primary_fix_rate(metrics.get("global_metrics"))
     if primary_fix_rate is None:
         missing_fields.append("primary_fix_rate")
+    repair_action_match_rate = _compute_repair_action_match_rate(metrics.get("repair_metrics"))
 
     fidelity_micro_f1 = float(metrics.get("micro_f1", 0.0))
     if "micro_f1" not in metrics:
@@ -1060,6 +1305,7 @@ def compute_model_selection_block(
 
     selection_block = {
         "primary_fix_rate": primary_fix_rate,
+        "repair_action_match_rate": repair_action_match_rate,
         "secondary_regression_rate_srr": secondary_regression_rate_srr,
         "fidelity_micro_f1": fidelity_micro_f1,
         "disruption_total_ops_mean": float(disruption_total_ops_mean)
@@ -1078,7 +1324,12 @@ def compute_model_selection_block(
             "disruption_field": disruption_field,
         },
         "missing_fields": sorted(set(missing_fields)),
-        "notes": "score = w_primary*primary_fix_rate + w_srr*(1 - srr) + w_fidelity*fidelity_micro_f1 - w_disrupt*disruption",
+        "notes": (
+            "primary_fix_rate is the checkable violated-to-satisfied transition; "
+            "repair_action_match_rate is diagnostic only. "
+            "score = w_primary*primary_fix_rate + w_srr*(1 - srr) + "
+            "w_fidelity*fidelity_micro_f1 - w_disrupt*disruption"
+        ),
     }
     return selection_block
 
@@ -1100,10 +1351,13 @@ def _write_per_constraint_csv(metrics: dict[str, object], output_dir: Path) -> N
                 "constraint_type": constraint_type,
                 "support": int(support_counts.get(constraint_type, 0)),
                 "fidelity_micro_f1": float(micro.get("f1", 0.0)),
-                "primary_fix_rate": float(repair.get("fix_rate", 0.0)),
-                "primary_exact_rate": float(repair.get("exact_rate", 0.0)),
-                "primary_alternative_rate": float(repair.get("alternative_rate", 0.0)),
-                "primary_total": int(repair.get("total", 0)),
+                "primary_fix_rate": float(global_metrics.get("primary_fix_rate", 0.0))
+                if isinstance(global_metrics, dict)
+                else 0.0,
+                "repair_action_match_rate": float(repair.get("fix_rate", 0.0)),
+                "repair_action_exact_rate": float(repair.get("exact_rate", 0.0)),
+                "repair_action_alternative_rate": float(repair.get("alternative_rate", 0.0)),
+                "repair_action_total": int(repair.get("total", 0)),
                 "gfr": float(global_metrics.get("gfr", 0.0)) if isinstance(global_metrics, dict) else 0.0,
                 "srr": float(global_metrics.get("srr", 0.0)) if isinstance(global_metrics, dict) else 0.0,
                 "sir": float(global_metrics.get("sir", 0.0)) if isinstance(global_metrics, dict) else 0.0,
@@ -1134,7 +1388,7 @@ def _smoke_check_global_metrics(
     if sample_count == 0:
         logging.info("Skipping global metrics smoke check (no samples).")
         return
-    preds = torch.cat([graph.y for graph in sample_graphs], dim=0)
+    preds = torch.cat([getattr(graph, "y_identity", graph.y) for graph in sample_graphs], dim=0)
     kinds = [(getattr(graph, "constraint_type", None) or "UNKNOWN") for graph in sample_graphs]
     samples = _repair_samples_from_predictions(preds, preds, kinds, none_class)
     evaluate_global_repair_samples(
@@ -1331,6 +1585,19 @@ def load_trained_model_for_eval(
     checkpoint_model_cfg = checkpoint.get("model_cfg", {})
     if checkpoint_model_cfg:
         effective_model_cfg = ModelConfig.from_mapping(checkpoint_model_cfg)
+        differences = config_differences(
+            model_cfg.to_dict(),
+            effective_model_cfg.to_dict(),
+        )
+        if differences:
+            preview = ", ".join(
+                f"{key}: config={requested!r}, checkpoint={recorded!r}"
+                for key, (requested, recorded) in list(differences.items())[:8]
+            )
+            raise RuntimeError(
+                "Checkpoint/config mismatch. Refusing to evaluate a stale or relabeled artifact. "
+                f"Differences: {preview}"
+            )
     else:
         effective_model_cfg = model_cfg
 
@@ -1369,6 +1636,7 @@ def evaluate_trained_model(
     policy_support: PolicySupport | None = None,
     selection_weights: dict[str, float] | None = None,
     selection_disruption_field: str = "mean_disruption_total",
+    identity_to_feature: Sequence[int] | None = None,
 ) -> None:
     checkpoint_path = get_checkpoint_path(run_directory)
 
@@ -1398,6 +1666,7 @@ def evaluate_trained_model(
         policy_support=policy_support,
         selection_weights=selection_weights,
         selection_disruption_field=selection_disruption_field,
+        identity_to_feature=identity_to_feature,
     )
 
 
@@ -1613,6 +1882,8 @@ def main():
 
         variant = dataset_variant_name(model_cfg.dataset_variant, model_cfg.min_occurrence)
         base_path = Path("data/processed") / variant
+        interim_base = Path("data/interim") / variant
+        identity_to_feature = _load_identity_to_feature(interim_base)
         test_graph_path = base_path / graph_dataset_filename(
             "test",
             model_cfg.encoding,
@@ -1648,16 +1919,13 @@ def main():
         if args.use_chooser:
             if not training_cfg.chooser.enabled:
                 raise RuntimeError("Chooser evaluation requested but chooser is disabled in training config.")
-            interim_base = Path("data/interim") / dataset_variant_name(
-                model_cfg.dataset_variant, model_cfg.min_occurrence
-            )
-            encoder_path = interim_base / "globalintencoder.txt"
-            if not encoder_path.exists():
-                raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
+            identity_encoder_path = encoder_path(interim_base, identity=True)
+            if not identity_encoder_path.exists():
+                raise FileNotFoundError(f"Identity encoder not found at {identity_encoder_path}")
             encoder = GlobalIntEncoder()
-            encoder.load(encoder_path)
+            encoder.load(identity_encoder_path)
             encoder.freeze()
-            placeholder_ids = load_placeholder_ids(encoder_path)
+            placeholder_ids = load_placeholder_ids(identity_encoder_path)
             heuristics = ConstraintRepairHeuristics(
                 encoder=encoder,
                 placeholder_ids=placeholder_ids,
@@ -1672,12 +1940,13 @@ def main():
             candidate_cfg = CandidateConfig(
                 topk_candidates=training_cfg.chooser.topk_candidates,
                 max_candidates_total=training_cfg.chooser.max_candidates_total,
-                include_gold=False,
+                force_include_gold_train=False,
             )
             chooser_support = ChooserSupport(
                 contexts=contexts,
                 heuristics=heuristics,
                 candidate_cfg=candidate_cfg,
+                identity_to_feature=identity_to_feature,
             )
 
         if training_cfg.direct_safety.enabled and not args.reranker_predictions:
@@ -1685,16 +1954,13 @@ def main():
                 raise RuntimeError("Direct safety evaluation cannot be combined with chooser evaluation.")
             if args.use_policy_choice:
                 raise RuntimeError("Direct safety evaluation cannot be combined with policy-choice evaluation.")
-            interim_base = Path("data/interim") / dataset_variant_name(
-                model_cfg.dataset_variant, model_cfg.min_occurrence
-            )
-            encoder_path = interim_base / "globalintencoder.txt"
-            if not encoder_path.exists():
-                raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
+            identity_encoder_path = encoder_path(interim_base, identity=True)
+            if not identity_encoder_path.exists():
+                raise FileNotFoundError(f"Identity encoder not found at {identity_encoder_path}")
             encoder = GlobalIntEncoder()
-            encoder.load(encoder_path)
+            encoder.load(identity_encoder_path)
             encoder.freeze()
-            placeholder_ids = load_placeholder_ids(encoder_path)
+            placeholder_ids = load_placeholder_ids(identity_encoder_path)
             heuristics = ConstraintRepairHeuristics(
                 encoder=encoder,
                 placeholder_ids=placeholder_ids,
@@ -1710,12 +1976,13 @@ def main():
             candidate_cfg = CandidateConfig(
                 topk_candidates=training_cfg.direct_safety.topk_candidates,
                 max_candidates_total=training_cfg.direct_safety.max_candidates_total,
-                include_gold=False,
+                force_include_gold_train=False,
             )
             direct_safety_support = DirectSafetySupport(
                 contexts=contexts,
                 heuristics=heuristics,
                 candidate_cfg=candidate_cfg,
+                identity_to_feature=identity_to_feature,
             )
 
         if args.use_policy_choice:
@@ -1723,16 +1990,13 @@ def main():
                 raise RuntimeError(
                     "Policy choice evaluation requested but policy choice is disabled in model config."
                 )
-            interim_base = Path("data/interim") / dataset_variant_name(
-                model_cfg.dataset_variant, model_cfg.min_occurrence
-            )
-            encoder_path = interim_base / "globalintencoder.txt"
-            if not encoder_path.exists():
-                raise FileNotFoundError(f"Global encoder not found at {encoder_path}")
+            identity_encoder_path = encoder_path(interim_base, identity=True)
+            if not identity_encoder_path.exists():
+                raise FileNotFoundError(f"Identity encoder not found at {identity_encoder_path}")
             encoder = GlobalIntEncoder()
-            encoder.load(encoder_path)
+            encoder.load(identity_encoder_path)
             encoder.freeze()
-            placeholder_ids = load_placeholder_ids(encoder_path)
+            placeholder_ids = load_placeholder_ids(identity_encoder_path)
             heuristics = ConstraintRepairHeuristics(
                 encoder=encoder,
                 placeholder_ids=placeholder_ids,
@@ -1744,11 +2008,12 @@ def main():
             if isinstance(test_data, list):
                 for idx, graph in enumerate(test_data):
                     setattr(graph, "context_index", idx)
-            candidate_cfg = CandidateConfig(include_gold=False)
+            candidate_cfg = CandidateConfig(force_include_gold_train=False)
             policy_support = PolicySupport(
                 contexts=contexts,
                 heuristics=heuristics,
                 candidate_cfg=candidate_cfg,
+                identity_to_feature=identity_to_feature,
                 filter_strict=training_cfg.policy_filter_strict,
             )
 
@@ -1867,6 +2132,7 @@ def main():
             policy_support=policy_support,
             selection_weights=selection_weights,
             selection_disruption_field=args.score_disruption_field,
+            identity_to_feature=identity_to_feature,
         )
 
     else:  # Evaluate baselines
@@ -1960,6 +2226,7 @@ def main():
             if "global_metrics" in metrics and isinstance(metrics["global_metrics"], dict):
                 overall = metrics["global_metrics"].get("overall")
                 if isinstance(overall, dict):
+                    metrics["primary_fix_rate"] = overall.get("primary_fix_rate", 0.0)
                     metrics["overall_gfr"] = overall.get("gfr", 0.0)
                     metrics["overall_srr"] = overall.get("srr", 0.0)
                     metrics["overall_sir"] = overall.get("sir", 0.0)
@@ -1967,7 +2234,34 @@ def main():
                     metrics["mean_disruption_add"] = disruption.get("added_triples_mean", 0.0)
                     metrics["mean_disruption_del"] = disruption.get("deleted_triples_mean", 0.0)
                     metrics["mean_disruption_total"] = disruption.get("total_ops_mean", 0.0)
-            output_root = baseline_dir(args.dataset, "parquet", create=True)
+            dataset_manifest_path = base_path / "dataset_manifest.json"
+            registry_names = [args.registry_dataset, args.dataset, base_dataset_name(args.dataset)]
+            registry_path = next(
+                (
+                    Path("data/interim") / f"constraint_registry_{name}.parquet"
+                    for name in registry_names
+                    if name
+                    and (Path("data/interim") / f"constraint_registry_{name}.parquet").exists()
+                ),
+                None,
+            )
+            metrics["evaluation_provenance"] = {
+                "command": [sys.executable, *sys.argv],
+                "deterministic_baseline": True,
+                "dataset_manifest": {
+                    "path": str(dataset_manifest_path),
+                    "sha256": json_file_hash(dataset_manifest_path),
+                }
+                if dataset_manifest_path.exists()
+                else None,
+                "constraint_registry": {
+                    "path": str(registry_path),
+                    "sha256": file_sha256(registry_path),
+                }
+                if registry_path is not None
+                else None,
+            }
+            output_root = baseline_dir(variant, "parquet", create=True)
             output_root.mkdir(parents=True, exist_ok=True)
             output_path = output_root / f"{name}.json"
             with output_path.open("w", encoding="utf-8") as handle:
@@ -1987,7 +2281,7 @@ def main():
 
         evaluate_baselines(
             baseline_choice="all",
-            dataset=args.dataset,
+            dataset=variant,
             encoding="parquet",
             num_graph_nodes=num_graph_nodes,
             default_add_class=NONE_CLASS_INDEX,

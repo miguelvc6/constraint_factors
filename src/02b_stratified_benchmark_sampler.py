@@ -2,7 +2,9 @@
 """Create a fixed stratified benchmark slice from interim parquet splits."""
 
 import argparse
+import hashlib
 import json
+import math
 import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -14,7 +16,14 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from modules.data_encoders import dataset_variant_name
+from modules.data_encoders import (
+    DATASET_SCHEMA_VERSION,
+    FEATURE_ENCODER_FILENAME,
+    IDENTITY_ENCODER_FILENAME,
+    IDENTITY_TO_FEATURE_FILENAME,
+    LEGACY_ENCODER_FILENAME,
+    dataset_variant_name,
+)
 
 
 SPLITS: tuple[str, ...] = ("train", "val", "test")
@@ -98,18 +107,82 @@ def _collect_strata(
 def _sample_indices(
     strata: dict[tuple[str, str, str], list[int]],
     *,
-    sample_fraction: float,
+    sample_fraction: float | None,
     seed: int,
+    target_rows: int | None = None,
 ) -> tuple[dict[str, set[int]], list[dict[str, object]]]:
     rng = np.random.default_rng(seed)
     selected_by_split: dict[str, set[int]] = {split: set() for split in SPLITS}
     report_rows: list[dict[str, object]] = []
 
+    total_rows = sum(len(indices) for indices in strata.values())
+    if target_rows is not None:
+        if target_rows <= 0:
+            raise ValueError("--target-rows must be positive.")
+        if target_rows > total_rows:
+            raise ValueError(
+                f"Requested {target_rows:,} rows but source contains only {total_rows:,}."
+            )
+        if target_rows < len(strata):
+            raise ValueError(
+                f"--target-rows={target_rows} is smaller than the {len(strata)} non-empty strata."
+            )
+        ideals = {
+            key: (len(indices) * target_rows / total_rows)
+            for key, indices in strata.items()
+        }
+        targets = {
+            key: min(len(strata[key]), max(1, int(math.floor(value))))
+            for key, value in ideals.items()
+        }
+        current = sum(targets.values())
+        if current < target_rows:
+            order = sorted(
+                strata,
+                key=lambda key: (ideals[key] - math.floor(ideals[key]), len(strata[key]), key),
+                reverse=True,
+            )
+            while current < target_rows:
+                changed = False
+                for key in order:
+                    if targets[key] >= len(strata[key]):
+                        continue
+                    targets[key] += 1
+                    current += 1
+                    changed = True
+                    if current == target_rows:
+                        break
+                if not changed:
+                    raise RuntimeError("Unable to allocate the requested target rows across strata.")
+        elif current > target_rows:
+            order = sorted(
+                strata,
+                key=lambda key: (ideals[key] - math.floor(ideals[key]), len(strata[key]), key),
+            )
+            while current > target_rows:
+                changed = False
+                for key in order:
+                    if targets[key] <= 1:
+                        continue
+                    targets[key] -= 1
+                    current -= 1
+                    changed = True
+                    if current == target_rows:
+                        break
+                if not changed:
+                    raise RuntimeError("Unable to reduce allocated stratum counts to target rows.")
+    else:
+        if sample_fraction is None or not 0.0 < sample_fraction <= 1.0:
+            raise ValueError("--sample-fraction must be in (0, 1].")
+        targets = {
+            key: min(len(indices), max(1, int(round(len(indices) * sample_fraction))))
+            for key, indices in strata.items()
+        }
+
     for split, constraint_type, attached_bin in sorted(strata):
         indices = strata[(split, constraint_type, attached_bin)]
         source_count = len(indices)
-        target_count = max(1, int(round(source_count * sample_fraction)))
-        target_count = min(target_count, source_count)
+        target_count = targets[(split, constraint_type, attached_bin)]
         if target_count == source_count:
             sampled = indices
         else:
@@ -204,7 +277,8 @@ def _write_reports(
     output_variant: str,
     source_total_rows: int,
     sampled_counts: dict[str, int],
-    sample_fraction: float,
+    sample_fraction: float | None,
+    target_rows: int | None,
     seed: int,
     column: str,
 ) -> None:
@@ -220,7 +294,8 @@ def _write_reports(
             f"- source_variant: `{source_variant}`",
             f"- output_variant: `{output_variant}`",
             f"- sequence_column: `{column}`",
-            f"- sample_fraction: `{sample_fraction}`",
+            f"- sample_fraction: `{sample_fraction if sample_fraction is not None else 'allocated'}`",
+            f"- target_rows: `{target_rows if target_rows is not None else 'not set'}`",
             f"- seed: `{seed}`",
             f"- source_rows: `{source_total_rows:,}`",
             f"- sampled_rows: `{sampled_total:,}`",
@@ -241,6 +316,7 @@ def _write_reports(
         "output_variant": output_variant,
         "column": column,
         "sample_fraction": sample_fraction,
+        "target_rows": target_rows,
         "seed": seed,
         "source_total_rows": source_total_rows,
         "sampled_total_rows": sampled_total,
@@ -253,12 +329,90 @@ def _write_reports(
     (output_root / "sampling_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_dataset_contract(source_root: Path, output_root: Path) -> None:
+    for filename in (
+        IDENTITY_ENCODER_FILENAME,
+        FEATURE_ENCODER_FILENAME,
+        LEGACY_ENCODER_FILENAME,
+        IDENTITY_TO_FEATURE_FILENAME,
+    ):
+        source = source_root / filename
+        if source.exists():
+            shutil.copy2(source, output_root / filename)
+
+
+def _write_dataset_manifest(
+    *,
+    source_root: Path,
+    output_root: Path,
+    sampled_counts: dict[str, int],
+    seed: int,
+    target_rows: int | None,
+    sample_fraction: float | None,
+) -> None:
+    source_manifest_path = source_root / "dataset_manifest.json"
+    source_manifest = (
+        json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        if source_manifest_path.exists()
+        else {}
+    )
+    payload = {
+        **source_manifest,
+        "schema_version": DATASET_SCHEMA_VERSION,
+        "dataset_variant": output_root.name,
+        "parent_dataset_variant": source_root.name,
+        "parent_manifest_sha256": _sha256_file(source_manifest_path)
+        if source_manifest_path.exists()
+        else None,
+        "rows": dict(sorted(sampled_counts.items())),
+        "sampling": {
+            "seed": int(seed),
+            "target_rows": target_rows,
+            "sample_fraction": sample_fraction,
+        },
+        "outputs": {
+            path.name: _sha256_file(path)
+            for path in sorted(
+                [*output_root.glob("df_*.parquet")]
+                + [
+                    output_root / filename
+                    for filename in (
+                        IDENTITY_ENCODER_FILENAME,
+                        FEATURE_ENCODER_FILENAME,
+                        LEGACY_ENCODER_FILENAME,
+                        IDENTITY_TO_FEATURE_FILENAME,
+                    )
+                    if (output_root / filename).exists()
+                ]
+            )
+        },
+    }
+    (output_root / "dataset_manifest.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create a stratified benchmark variant from interim parquet splits.")
     parser.add_argument("--source-dataset", default="full", help="Source interim dataset name.")
     parser.add_argument("--output-dataset", default="full_strat1m", help="Derived output dataset name.")
     parser.add_argument("--min-occurrence", type=int, default=100)
-    parser.add_argument("--sample-fraction", type=float, default=0.5)
+    parser.add_argument("--sample-fraction", type=float, default=None)
+    parser.add_argument(
+        "--target-rows",
+        type=int,
+        default=None,
+        help="Exact total row count allocated proportionally across non-empty strata.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--scope", choices=["local", "focus"], default="local")
     parser.add_argument("--interim-root", type=Path, default=Path("data/interim"))
@@ -269,7 +423,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not 0.0 < args.sample_fraction <= 1.0:
+    if args.target_rows is not None and args.sample_fraction is not None:
+        raise ValueError("Use either --target-rows or --sample-fraction, not both.")
+    if args.target_rows is None and args.sample_fraction is None:
+        args.sample_fraction = 0.5
+    if args.sample_fraction is not None and not 0.0 < args.sample_fraction <= 1.0:
         raise ValueError("--sample-fraction must be in (0, 1].")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
@@ -290,15 +448,19 @@ def main() -> None:
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    encoder_path = source_root / "globalintencoder.txt"
-    if not encoder_path.exists():
-        raise FileNotFoundError(f"Missing source encoder: {encoder_path}")
-    shutil.copy2(encoder_path, output_root / "globalintencoder.txt")
+    encoder_candidates = [
+        source_root / FEATURE_ENCODER_FILENAME,
+        source_root / LEGACY_ENCODER_FILENAME,
+    ]
+    if not any(path.exists() for path in encoder_candidates):
+        raise FileNotFoundError(f"Missing source feature encoder under {source_root}")
+    _copy_dataset_contract(source_root, output_root)
 
     strata, _source_hist, source_total_rows = _collect_strata(source_root, column=column, batch_size=args.batch_size)
     selected_by_split, report_rows = _sample_indices(
         strata,
-        sample_fraction=float(args.sample_fraction),
+        sample_fraction=float(args.sample_fraction) if args.sample_fraction is not None else None,
+        target_rows=int(args.target_rows) if args.target_rows is not None else None,
         seed=int(args.seed),
     )
     combined_hist, split_hist, sampled_counts = _write_sampled_splits(
@@ -318,9 +480,18 @@ def main() -> None:
         output_variant=output_variant,
         source_total_rows=source_total_rows,
         sampled_counts=sampled_counts,
-        sample_fraction=float(args.sample_fraction),
+        sample_fraction=float(args.sample_fraction) if args.sample_fraction is not None else None,
+        target_rows=int(args.target_rows) if args.target_rows is not None else None,
         seed=int(args.seed),
         column=column,
+    )
+    _write_dataset_manifest(
+        source_root=source_root,
+        output_root=output_root,
+        sampled_counts=sampled_counts,
+        seed=int(args.seed),
+        target_rows=int(args.target_rows) if args.target_rows is not None else None,
+        sample_fraction=float(args.sample_fraction) if args.sample_fraction is not None else None,
     )
 
     sampled_total = sum(sampled_counts.values())

@@ -239,8 +239,9 @@ $$
 where:
 - $r \in \{P,S,O\}$ is the factor edge role,
 - $G_{t,r}$ is a role-conditioned pressure MLP,
-- by default pressure modules are separate per factor type and role,
-- the H2 shared-pressure ablation shares pressure modules across factor types.
+- canonical A1-family pressure modules are shared across factor types while
+  remaining role-conditioned,
+- the H2 per-type-pressure control restores separate modules per factor type and role.
 
 This means pressure is learned from the internal factor state, not from a hand-written negative vector such as:
 

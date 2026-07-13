@@ -11,7 +11,7 @@ For the paper-facing run, `--constraint-scope local` is the canonical setting. `
 **Inputs**
 - Parquet split file(s) produced by `02_dataframe_builder.py` (from `data/interim/<dataset_variant>`).
 - Constraint registry from `03_constraint_registry.py` (`data/interim/constraint_registry_<dataset>.parquet`).
-- Encoder (`data/interim/<dataset_variant>/globalintencoder.txt`) for encoded parquet IDs.
+- Identity encoder (`identity_encoder.txt`) for registry and evidence semantics.
 
 **Outputs**
 - Labeled parquet files under `data/interim/<dataset_variant>_labeled/` with additional columns:
@@ -21,6 +21,9 @@ For the paper-facing run, `--constraint-scope local` is the canonical setting. `
   - `factor_constraint_ids` (the constraint ids evaluated for the row)
   - `num_checkable_factors_pre`, `coverage_pre`
   - `num_checkable_factors_post_gold`, `coverage_post_gold`
+  - `primary_factor_index`, `primary_checkable_pre`, `primary_satisfied_pre`
+  - `primary_checkable_post_gold`, `primary_satisfied_post_gold`
+  - `primary_validation_reason`
 - Coverage reports in the same output folder:
   - `coverage_<scope>.csv`
   - `coverage_<scope>.md`
@@ -28,13 +31,14 @@ For the paper-facing run, `--constraint-scope local` is the canonical setting. `
   - `filtered_factors_<scope>.csv`
   - `filtered_factors_<scope>.md`
   - `filtered_factor_families_<scope>.csv`
+- `primary_validation_audit.csv` and an updated schema-v2 dataset manifest.
 
 By default, `--factor-family-policy supported_only` writes only executable
 supported constraints into `factor_constraint_ids` and aligned label arrays.
 Unsupported secondary constraints remain in `local_constraint_ids` for
-auditability but are not emitted as supervised factor nodes. If an unsupported
-primary constraint is encountered, it is retained and marked not checkable so
-graph construction can still identify the primary factor.
+auditability but are not emitted as supervised factor nodes. For paper data,
+use `--filter-invalid-primary`: exempt, out-of-scope, uncheckable, unsupported,
+and already-satisfied primary rows are excluded and counted by reason.
 
 ## Evidence Model
 The labeler builds a normalized evidence structure per row:
@@ -70,6 +74,12 @@ constraint checks are marked **not checkable** (conservative).
 
 ## Constraint Types Implemented (v1)
 Per-type checkability and satisfaction are implemented in `src/modules/constraint_checkers.py`.
+Registry parsing is centralized in `src/modules/constraint_semantics.py` and is
+shared with reranker/global evaluation. `P2306` is interpreted by family
+(inverse property, required property, or conflicting property), `P2305` carries
+allowed/qualifying items, `P2303` exceptions disable affected rows, and `P4680`
+scope is honored. The focus and comparison triples are explicitly seeded into
+the evidence state before applying edits.
 Canonical constraint-family names come from the registry (`constraint_family`), generated via the
 static catalog in `data/static/constraint_type_catalog.json`. On a fresh clone,
 `03_constraint_registry.py` bootstraps that catalog automatically if it is missing.
@@ -100,7 +110,9 @@ python src/05_constraint_labeler.py \
   --dataset sample \
   --min-occurrence 100 \
   --constraint-scope local \
-  --factor-family-policy supported_only
+  --factor-family-policy supported_only \
+  --filter-invalid-primary \
+  --overwrite
 ```
 
 Key flags:
@@ -110,5 +122,7 @@ Key flags:
   The paper default is `supported_only`; use `all` only to reproduce the older
   all-attached-factor behavior.
 - `--registry-dataset` selects the raw dataset registry to use for derived variants such as `full_strat1m`; use `--registry-dataset full` for the paper benchmark.
+- `--output-dataset` writes a standalone labeled variant; without it the legacy `<variant>_labeled` path is used.
+- `--filter-invalid-primary` is mandatory for paper-facing reruns.
 - `--assume-complete-entity-facts/--no-assume-complete-entity-facts` toggles completeness assumptions.
 - `--max-rows` caps rows per parquet for debugging.

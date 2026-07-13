@@ -29,7 +29,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from modules.candidates import CandidateConfig, build_candidates, score_candidates_from_logits
+from modules.candidates import (
+    CandidateConfig,
+    RepairCandidate,
+    build_inference_candidates,
+    candidate_feature_tuples,
+    candidate_identity_tuples,
+    score_candidates_from_logits,
+)
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import dataset_variant_name, graph_dataset_filename
 from modules.model_store import config_copy_path
@@ -128,15 +135,15 @@ def _candidate_config(training_cfg: TrainingConfig) -> CandidateConfig:
         return CandidateConfig(
             topk_candidates=training_cfg.chooser.topk_candidates,
             max_candidates_total=training_cfg.chooser.max_candidates_total,
-            include_gold=False,
+            force_include_gold_train=False,
         )
     if training_cfg.direct_safety.enabled:
         return CandidateConfig(
             topk_candidates=training_cfg.direct_safety.topk_candidates,
             max_candidates_total=training_cfg.direct_safety.max_candidates_total,
-            include_gold=False,
+            force_include_gold_train=False,
         )
-    return CandidateConfig(include_gold=False)
+    return CandidateConfig(force_include_gold_train=False)
 
 
 def _density_bucket(size: int) -> str:
@@ -289,21 +296,28 @@ def _selected_from_candidates(
     model: Any,
     graph_emb: torch.Tensor | None,
     logits: torch.Tensor,
-    candidates: list[tuple[int, int, int, int, int, int]],
+    candidates: Sequence[RepairCandidate],
     candidate_scores: torch.Tensor,
     training_cfg: TrainingConfig,
+    identity_to_feature: Sequence[int] | None,
 ) -> tuple[list[int], int | None]:
     if training_cfg.chooser.enabled:
         if graph_emb is None:
             raise RuntimeError("Chooser run requires graph_emb from model outputs.")
-        candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=logits.device)
+        candidate_tensor = torch.tensor(
+            candidate_feature_tuples(candidates), dtype=torch.long, device=logits.device
+        )
         scores = model.score_candidates(graph_emb, candidate_tensor)
         best_idx = int(torch.argmax(scores).item())
-        return list(candidates[best_idx]), best_idx
+        return list(candidates[best_idx].identity_slots), best_idx
     if training_cfg.direct_safety.enabled:
         best_idx = int(torch.argmax(candidate_scores).item())
-        return list(candidates[best_idx]), best_idx
-    return _selected_from_argmax(logits), None
+        return list(candidates[best_idx].identity_slots), best_idx
+    feature_prediction = torch.tensor([_selected_from_argmax(logits)], dtype=torch.long)
+    identity_prediction = EVAL._feature_to_unique_identity(
+        feature_prediction, identity_to_feature
+    )
+    return identity_prediction[0].tolist(), None
 
 
 class Aggregate:
@@ -447,6 +461,10 @@ def run_analysis(args: argparse.Namespace) -> None:
     model_cfg, training_cfg = _load_config(run_directory)
     test_data = _load_test_data(model_cfg)
     _set_context_indices(test_data)
+    interim_base = ROOT / "data" / "interim" / dataset_variant_name(
+        model_cfg.dataset_variant, model_cfg.min_occurrence
+    )
+    identity_to_feature = EVAL._load_identity_to_feature(interim_base)
 
     repair_support = EVAL._maybe_prepare_repair_support(
         model_cfg.dataset_variant,
@@ -516,20 +534,22 @@ def run_analysis(args: argparse.Namespace) -> None:
             context = contexts[context_index]
             row = rows[context_index]
             logits = logits_batch[local_idx].detach()
-            candidates, _gold_index = build_candidates(
-                graph=graph,
+            candidates = build_inference_candidates(
                 context=context,
                 heuristics=repair_support.heuristics,
                 proposal_logits=logits,
                 cfg=candidate_cfg,
                 placeholder_ids=placeholder_ids,
                 num_target_ids=model.num_target_ids,
+                identity_to_feature=identity_to_feature,
             )
             if not candidates:
                 processed += 1
                 continue
 
-            candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=logits.device)
+            candidate_tensor = torch.tensor(
+                candidate_feature_tuples(candidates), dtype=torch.long, device=logits.device
+            )
             candidate_scores_tensor = score_candidates_from_logits(logits, candidate_tensor)
             candidate_scores = [float(v) for v in candidate_scores_tensor.detach().cpu().tolist()]
             selected_slots, selected_candidate_index = _selected_from_candidates(
@@ -539,12 +559,13 @@ def run_analysis(args: argparse.Namespace) -> None:
                 candidates=candidates,
                 candidate_scores=candidate_scores_tensor,
                 training_cfg=training_cfg,
+                identity_to_feature=identity_to_feature,
             )
 
             primary_index = _primary_factor_index(graph, row)
             candidate_details = global_support.evaluator.evaluate_candidates(
                 row,
-                candidates=candidates,
+                candidates=candidate_identity_tuples(candidates),
                 primary_factor_index=primary_index,
             )
             selected_detail = global_support.evaluator.evaluate_candidates(
@@ -638,9 +659,13 @@ def run_analysis(args: argparse.Namespace) -> None:
                         if non_vacuous_oracle_candidate_index is not None
                         else "",
                         "selected_slots": json.dumps(_slot_list(selected_slots)),
-                        "oracle_slots": json.dumps(_slot_list(candidates[oracle_candidate_index])),
+                        "oracle_slots": json.dumps(
+                            _slot_list(candidates[oracle_candidate_index].identity_slots)
+                        ),
                         "non_vacuous_oracle_slots": json.dumps(
-                            _slot_list(candidates[non_vacuous_oracle_candidate_index])
+                            _slot_list(
+                                candidates[non_vacuous_oracle_candidate_index].identity_slots
+                            )
                         )
                         if non_vacuous_oracle_candidate_index is not None
                         else "",
@@ -700,7 +725,8 @@ def run_analysis(args: argparse.Namespace) -> None:
             "topk_per_slot": candidate_cfg.topk_per_slot,
             "heuristic_max_candidates": candidate_cfg.heuristic_max_candidates,
             "heuristic_max_values": candidate_cfg.heuristic_max_values,
-            "include_gold": candidate_cfg.include_gold,
+            "force_include_gold_train": candidate_cfg.force_include_gold_train,
+            "inference_gold_access": False,
             "max_candidates_total": candidate_cfg.max_candidates_total,
         },
         "max_safe_disruption": args.max_safe_disruption,

@@ -17,7 +17,13 @@ from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
-from modules.candidates import CandidateConfig, build_candidates, score_candidates_from_logits
+from modules.candidates import (
+    CandidateConfig,
+    build_training_candidates,
+    candidate_feature_tuples,
+    candidate_identity_tuples,
+    score_candidates_from_logits,
+)
 from modules.config import ModelConfig, TrainingConfig
 from modules.data_encoders import (
     GlobalIntEncoder,
@@ -26,6 +32,10 @@ from modules.data_encoders import (
     dataset_variant_name,
     graph_dataset_filename,
     infer_node_feature_spec,
+    FEATURE_ENCODER_FILENAME,
+    IDENTITY_ENCODER_FILENAME,
+    IDENTITY_TO_FEATURE_FILENAME,
+    LEGACY_ENCODER_FILENAME,
 )
 from modules.model_store import (
     ensure_run_dir_for_config,
@@ -36,6 +46,11 @@ from modules.models import BaseGraphModel, build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
 from modules.reranker_eval import CandidateConstraintEvaluator
 from modules.policy import POLICY_NAMES, derive_policy_label
+from modules.provenance import (
+    build_run_provenance,
+    canonical_json_hash,
+    write_run_manifest,
+)
 from modules.training_utils import (
     ConstraintMetricsAccumulator,
     DynamicConstraintWeighter,
@@ -660,6 +675,7 @@ def train(
     chooser_evaluator = None
     chooser_candidate_cfg = None
     chooser_placeholder_ids: set[int] | None = None
+    chooser_identity_to_feature = None
     if chooser_enabled and chooser_state:
         chooser_heuristics = cast(ConstraintRepairHeuristics | None, chooser_state.get("heuristics"))
         chooser_train_rows = cast(list | None, chooser_state.get("train_rows"))
@@ -669,6 +685,7 @@ def train(
         chooser_evaluator = cast(CandidateConstraintEvaluator | None, chooser_state.get("evaluator"))
         chooser_candidate_cfg = cast(CandidateConfig | None, chooser_state.get("candidate_cfg"))
         chooser_placeholder_ids = cast(set[int] | None, chooser_state.get("placeholder_ids_set"))
+        chooser_identity_to_feature = chooser_state.get("identity_to_feature")
 
     direct_safety_cfg = train_cfg.direct_safety
     direct_safety_enabled = bool(direct_safety_cfg.enabled)
@@ -680,6 +697,7 @@ def train(
     direct_safety_evaluator = None
     direct_safety_candidate_cfg = None
     direct_safety_placeholder_ids: set[int] | None = None
+    direct_safety_identity_to_feature = None
     if direct_safety_enabled and direct_safety_state:
         direct_safety_heuristics = cast(
             ConstraintRepairHeuristics | None, direct_safety_state.get("heuristics")
@@ -701,6 +719,7 @@ def train(
         direct_safety_placeholder_ids = cast(
             set[int] | None, direct_safety_state.get("placeholder_ids_set")
         )
+        direct_safety_identity_to_feature = direct_safety_state.get("identity_to_feature")
 
     policy_enabled = bool(getattr(model, "_policy_enabled", False))
     policy_train_contexts = None
@@ -1166,6 +1185,7 @@ def train(
             if train_cfg.validate_factor_labels:
                 _assert_factor_labels_batch(data)
             targets = data.y.long()
+            identity_targets = getattr(data, "y_identity", targets).long()
 
             # Validation checks
             assert targets.dim() == 2 and targets.size(1) == NUM_SLOTS, (
@@ -1455,6 +1475,7 @@ def train(
                     min_value=0,
                 )
                 gold_rows = targets.detach().cpu().tolist()
+                gold_identity_rows = identity_targets.detach().cpu().tolist()
                 out_detached = out.detach()
                 batch_slot_vals, batch_slot_ids = _compute_batch_slot_topk(
                     out_detached,
@@ -1495,24 +1516,28 @@ def train(
                         slots=(3, 4, 5),
                         topk_triples=chooser_candidate_cfg.topk_candidates,
                     )
-                    candidates, gold_index = build_candidates(
-                        gold_slots=gold_rows[idx],
+                    repair_candidates, gold_index = build_training_candidates(
+                        gold_feature_slots=gold_rows[idx],
+                        gold_identity_slots=gold_identity_rows[idx],
                         context=context,
                         heuristics=chooser_heuristics,
                         proposal_logits=out_detached[idx],
                         cfg=chooser_candidate_cfg,
                         placeholder_ids=chooser_placeholder_ids_for_candidates,
                         num_target_ids=model.num_target_ids,
+                        identity_to_feature=chooser_identity_to_feature,
                         slot_allowed_ids=chooser_slot_allowed_ids,
                         precomputed_add_topk=add_topk,
                         precomputed_del_topk=del_topk,
                     )
+                    candidates = candidate_identity_tuples(repair_candidates)
+                    feature_candidates = candidate_feature_tuples(repair_candidates)
                     candidate_groups.append(candidates)
                     gold_indices.append(gold_index)
                     candidate_rows.append(row)
                     primary_indices.append(primary_index)
-                    packed_candidates.extend(candidates)
-                    packed_graph_index.extend([idx] * len(candidates))
+                    packed_candidates.extend(feature_candidates)
+                    packed_graph_index.extend([idx] * len(feature_candidates))
                 chooser_candidate_build_s = (time.perf_counter() - chooser_build_t0) if timing_enabled else 0.0
 
                 if not packed_candidates:
@@ -1665,25 +1690,29 @@ def train(
                         slots=(3, 4, 5),
                         topk_triples=direct_safety_candidate_cfg.topk_candidates,
                     )
-                    candidates, _ = build_candidates(
-                        gold_slots=targets[idx].detach().cpu().tolist(),
+                    repair_candidates, _ = build_training_candidates(
+                        gold_feature_slots=targets[idx].detach().cpu().tolist(),
+                        gold_identity_slots=identity_targets[idx].detach().cpu().tolist(),
                         context=context,
                         heuristics=direct_safety_heuristics,
                         proposal_logits=out_detached[idx],
                         cfg=direct_safety_candidate_cfg,
                         placeholder_ids=direct_safety_placeholder_ids_for_candidates,
                         num_target_ids=model.num_target_ids,
+                        identity_to_feature=direct_safety_identity_to_feature,
                         slot_allowed_ids=direct_safety_slot_allowed_ids,
                         precomputed_add_topk=add_topk,
                         precomputed_del_topk=del_topk,
                     )
-                    candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=graph_loss.device)
+                    feature_candidates = candidate_feature_tuples(repair_candidates)
+                    identity_candidates = candidate_identity_tuples(repair_candidates)
+                    candidate_tensor = torch.tensor(feature_candidates, dtype=torch.long, device=graph_loss.device)
                     scores = score_candidates_from_logits(out[idx], candidate_tensor)
                     log_probs = F.log_softmax(scores, dim=0)
                     probs = log_probs.exp()
                     metrics_summary = direct_safety_evaluator.evaluate_candidate_metrics(
                         row,
-                        candidates=candidates,
+                        candidates=identity_candidates,
                         primary_factor_index=primary_index,
                     )
                     primary_tensor = torch.tensor(
@@ -1981,6 +2010,7 @@ def train(
                 if train_cfg.validate_factor_labels:
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
+                identity_targets = getattr(data, "y_identity", targets).long()
                 _assert_targets_supported_by_heads(targets, split="val", batch_idx=batch_idx)
                 data_s = (time.perf_counter() - phase_t0) if timing_enabled else 0.0
 
@@ -2252,6 +2282,7 @@ def train(
                         min_value=0,
                     )
                     gold_rows = targets.detach().cpu().tolist()
+                    gold_identity_rows = identity_targets.detach().cpu().tolist()
                     out_detached = out.detach()
                     batch_slot_vals, batch_slot_ids = _compute_batch_slot_topk(
                         out_detached,
@@ -2292,24 +2323,28 @@ def train(
                             slots=(3, 4, 5),
                             topk_triples=chooser_candidate_cfg.topk_candidates,
                         )
-                        candidates, gold_index = build_candidates(
-                            gold_slots=gold_rows[idx],
+                        repair_candidates, gold_index = build_training_candidates(
+                            gold_feature_slots=gold_rows[idx],
+                            gold_identity_slots=gold_identity_rows[idx],
                             context=context,
                             heuristics=chooser_heuristics,
                             proposal_logits=out_detached[idx],
                             cfg=chooser_candidate_cfg,
                             placeholder_ids=chooser_placeholder_ids_for_candidates,
                             num_target_ids=model.num_target_ids,
+                            identity_to_feature=chooser_identity_to_feature,
                             slot_allowed_ids=chooser_slot_allowed_ids,
                             precomputed_add_topk=add_topk,
                             precomputed_del_topk=del_topk,
                         )
+                        candidates = candidate_identity_tuples(repair_candidates)
+                        feature_candidates = candidate_feature_tuples(repair_candidates)
                         candidate_groups.append(candidates)
                         gold_indices.append(gold_index)
                         candidate_rows.append(row)
                         primary_indices.append(primary_index)
-                        packed_candidates.extend(candidates)
-                        packed_graph_index.extend([idx] * len(candidates))
+                        packed_candidates.extend(feature_candidates)
+                        packed_graph_index.extend([idx] * len(feature_candidates))
                     chooser_candidate_build_s = (time.perf_counter() - chooser_build_t0) if timing_enabled else 0.0
 
                     if not packed_candidates:
@@ -2462,25 +2497,29 @@ def train(
                             slots=(3, 4, 5),
                             topk_triples=direct_safety_candidate_cfg.topk_candidates,
                         )
-                        candidates, _ = build_candidates(
-                            gold_slots=targets[idx].detach().cpu().tolist(),
+                        repair_candidates, _ = build_training_candidates(
+                            gold_feature_slots=targets[idx].detach().cpu().tolist(),
+                            gold_identity_slots=identity_targets[idx].detach().cpu().tolist(),
                             context=context,
                             heuristics=direct_safety_heuristics,
                             proposal_logits=out_detached[idx],
                             cfg=direct_safety_candidate_cfg,
                             placeholder_ids=direct_safety_placeholder_ids_for_candidates,
                             num_target_ids=model.num_target_ids,
+                            identity_to_feature=direct_safety_identity_to_feature,
                             slot_allowed_ids=direct_safety_slot_allowed_ids,
                             precomputed_add_topk=add_topk,
                             precomputed_del_topk=del_topk,
                         )
-                        candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=graph_loss.device)
+                        feature_candidates = candidate_feature_tuples(repair_candidates)
+                        identity_candidates = candidate_identity_tuples(repair_candidates)
+                        candidate_tensor = torch.tensor(feature_candidates, dtype=torch.long, device=graph_loss.device)
                         scores = score_candidates_from_logits(out[idx], candidate_tensor)
                         log_probs = F.log_softmax(scores, dim=0)
                         probs = log_probs.exp()
                         metrics_summary = direct_safety_evaluator.evaluate_candidate_metrics(
                             row,
-                            candidates=candidates,
+                            candidates=identity_candidates,
                             primary_factor_index=primary_index,
                         )
                         primary_tensor = torch.tensor(
@@ -2877,6 +2916,7 @@ def parse_args():
         choices=["INFO", "DEBUG"],
         help="Verbosity level for logging output.",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed recorded in run provenance.")
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -2904,8 +2944,8 @@ def _write_effective_experiment_config(
 
 
 def main():
-    set_seed(42)
     args = parse_args()
+    set_seed(args.seed)
 
     # Load experiment configuration (model + training sections).
     config_path = Path(args.experiment_config)
@@ -3030,11 +3070,20 @@ def main():
     )
     logger.info("Updated resolved experiment config at %s", config_path)
 
-    # Load and freeze int encoder
-    encoder = GlobalIntEncoder()
     interim_path = Path("data/interim/") / dataset_variant
-    encoder.load(interim_path / "globalintencoder.txt")
+    legacy_encoder_path = interim_path / LEGACY_ENCODER_FILENAME
+    feature_encoder_path = interim_path / FEATURE_ENCODER_FILENAME
+    identity_encoder_path = interim_path / IDENTITY_ENCODER_FILENAME
+    encoder = GlobalIntEncoder()
+    encoder.load(feature_encoder_path if feature_encoder_path.exists() else legacy_encoder_path)
     encoder.freeze()
+    identity_encoder = GlobalIntEncoder()
+    identity_encoder.load(identity_encoder_path if identity_encoder_path.exists() else legacy_encoder_path)
+    identity_encoder.freeze()
+    identity_mapping_path = interim_path / IDENTITY_TO_FEATURE_FILENAME
+    identity_to_feature = (
+        np.load(identity_mapping_path) if identity_mapping_path.exists() else None
+    )
 
     # Optional - Constraint-is-fixed loss components (heuristics + contexts).
     fix_loss_cfg = training_cfg.fix_probability_loss
@@ -3043,9 +3092,9 @@ def main():
 
     if fix_loss_cfg.enabled:
         fix_scheduler = FixProbabilityScheduler(fix_loss_cfg)
-        placeholder_ids = placeholder_ids_from_encoder(encoder)
+        placeholder_ids = placeholder_ids_from_encoder(identity_encoder)
         heuristics = ConstraintRepairHeuristics(
-            encoder=encoder,
+            encoder=identity_encoder,
             placeholder_ids=placeholder_ids,
             none_class=NONE_CLASS_INDEX,
         )
@@ -3107,9 +3156,9 @@ def main():
     chooser_state: dict[str, object] | None = None
     chooser_cfg = training_cfg.chooser
     if chooser_cfg.enabled:
-        placeholder_ids = placeholder_ids_from_encoder(encoder)
+        placeholder_ids = placeholder_ids_from_encoder(identity_encoder)
         chooser_heuristics = ConstraintRepairHeuristics(
-            encoder=encoder,
+            encoder=identity_encoder,
             placeholder_ids=placeholder_ids,
             none_class=NONE_CLASS_INDEX,
         )
@@ -3143,7 +3192,7 @@ def main():
         registry_path = _resolve_constraint_registry_path(model_cfg.dataset_variant)
         evaluator = CandidateConstraintEvaluator(
             str(registry_path),
-            encoder=encoder,
+            encoder=identity_encoder,
             assume_complete=True,
             constraint_scope="local",
             use_encoded_ids=True,
@@ -3151,7 +3200,7 @@ def main():
         candidate_cfg = CandidateConfig(
             topk_candidates=chooser_cfg.topk_candidates,
             max_candidates_total=chooser_cfg.max_candidates_total,
-            include_gold=True,
+            force_include_gold_train=True,
         )
         chooser_state = {
             "heuristics": chooser_heuristics,
@@ -3162,6 +3211,7 @@ def main():
             "evaluator": evaluator,
             "candidate_cfg": candidate_cfg,
             "placeholder_ids_set": set(chooser_heuristics.placeholder_ids.values()),
+            "identity_to_feature": identity_to_feature,
         }
         logger.info(
             "Chooser enabled | topk_candidates=%s max_candidates_total=%s loss_mode=%s loss_weight=%.3f",
@@ -3176,9 +3226,9 @@ def main():
     if direct_safety_cfg.enabled:
         if chooser_cfg.enabled:
             raise RuntimeError("Chooser and direct safety cannot both be enabled in the same training config.")
-        placeholder_ids = placeholder_ids_from_encoder(encoder)
+        placeholder_ids = placeholder_ids_from_encoder(identity_encoder)
         direct_safety_heuristics = ConstraintRepairHeuristics(
-            encoder=encoder,
+            encoder=identity_encoder,
             placeholder_ids=placeholder_ids,
             none_class=NONE_CLASS_INDEX,
         )
@@ -3214,7 +3264,7 @@ def main():
         registry_path = _resolve_constraint_registry_path(model_cfg.dataset_variant)
         evaluator = CandidateConstraintEvaluator(
             str(registry_path),
-            encoder=encoder,
+            encoder=identity_encoder,
             assume_complete=True,
             constraint_scope="local",
             use_encoded_ids=True,
@@ -3222,7 +3272,7 @@ def main():
         candidate_cfg = CandidateConfig(
             topk_candidates=direct_safety_cfg.topk_candidates,
             max_candidates_total=direct_safety_cfg.max_candidates_total,
-            include_gold=True,
+            force_include_gold_train=True,
         )
         direct_safety_state = {
             "heuristics": direct_safety_heuristics,
@@ -3233,6 +3283,7 @@ def main():
             "evaluator": evaluator,
             "candidate_cfg": candidate_cfg,
             "placeholder_ids_set": set(direct_safety_heuristics.placeholder_ids.values()),
+            "identity_to_feature": identity_to_feature,
         }
         logger.info(
             "Direct safety enabled | topk_candidates=%s max_candidates_total=%s alpha_primary=%.3f beta_secondary=%.3f",
@@ -3372,10 +3423,36 @@ def main():
             "model_name": model_cfg.model,
             "model_cfg": model_cfg.to_dict(),
             "training_cfg": training_cfg.to_dict(),
+            "provenance": {
+                "schema_version": 1,
+                "seed": int(args.seed),
+                "model_config_sha256": canonical_json_hash(model_cfg.to_dict()),
+                "training_config_sha256": canonical_json_hash(training_cfg.to_dict()),
+            },
         },
         model_path,
     )
     logger.info("Saved model checkpoint to %s", model_path)
+
+    run_manifest = build_run_provenance(
+        repository_root=Path(__file__).resolve().parents[1],
+        config_path=config_path,
+        checkpoint_path=model_path,
+        model=model,
+        seed=args.seed,
+        dataset_manifest_path=interim_path / "dataset_manifest.json",
+        graph_manifest_paths=[
+            train_data_path.with_suffix(train_data_path.suffix + ".manifest.json"),
+            val_data_path.with_suffix(val_data_path.suffix + ".manifest.json"),
+        ],
+        extra={
+            "dataset_variant": dataset_variant,
+            "encoding": model_cfg.encoding,
+            "constraint_representation": model_cfg.constraint_representation,
+        },
+    )
+    manifest_path = write_run_manifest(run_directory, run_manifest)
+    logger.info("Saved run provenance to %s", manifest_path)
 
     # Save training history
     history_file = history_path(run_directory)

@@ -7,12 +7,13 @@
 ## Inputs & Outputs
 **Inputs**
 - Source parquet splits under `data/interim/<source_variant>/`.
-- `globalintencoder.txt` from the source variant.
-- CLI flags for source/output dataset names, `min_occurrence`, sample fraction, seed, and constraint scope.
+- The v2 encoder contract and dataset manifest from the source variant.
+- CLI flags for source/output dataset names, `min_occurrence`, an exact target or sample fraction, seed, and constraint scope.
 
 **Outputs**
 - Sampled parquet splits under `data/interim/<output_variant>/`.
-- Copied `globalintencoder.txt`.
+- Copied identity/feature encoders and `identity_to_feature.npy`.
+- An updated `dataset_manifest.json` linked to its parent manifest.
 - `sampling_report.csv`, `sampling_report.md`, and `sampling_metadata.json`.
 - `hist_local_constraint_ids.csv` and `hist_local_constraint_ids_by_split.csv` for the sampled variant.
 
@@ -23,7 +24,7 @@ uv run src/02b_stratified_benchmark_sampler.py \
   --source-dataset full \
   --output-dataset full_strat1m \
   --min-occurrence 100 \
-  --sample-fraction 0.5 \
+  --target-rows 1000000 \
   --seed 42 \
   --scope local
 ```
@@ -46,16 +47,19 @@ Default bins:
 - `161-267`
 - `268+`
 
-For every non-empty stratum, the sampler keeps:
-```python
-max(1, round(source_count * sample_fraction))
-```
+`--target-rows` allocates the requested total proportionally across non-empty
+strata using deterministic largest-remainder allocation, subject to one row per
+represented stratum. The output total is exact. `--sample-fraction` remains
+available but is mutually exclusive with `--target-rows`.
 
 The sampled row order is preserved within each split, and row selection is deterministic for a fixed seed.
 
 ## Pipeline Position
-Run this stage after `02_dataframe_builder.py` and before `05_constraint_labeler.py`.
-This avoids labeling and graph-building work for rows that are not part of the paper benchmark.
+For paper-facing schema-v2 data, run this stage after `05_constraint_labeler.py`
+has filtered invalid primary rows into a standalone source variant. Sampling the
+validated source makes the final benchmark size exactly `--target-rows` instead
+of sampling first and then shrinking unpredictably during validation. Sampling
+before labeling remains acceptable only for development subsets.
 
 The constraint registry remains the raw-source registry, for example
 `data/interim/constraint_registry_full.parquet`; the sampled variant is a derived dataframe artifact and does not own a new `constraints.tsv`.

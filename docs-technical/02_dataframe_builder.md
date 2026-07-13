@@ -2,11 +2,11 @@
 
 ## Objective
 - Transform the raw gzipped TSV corrections (downloaded by `01_data_downloader.py`) into cleaned, tokenised, train/val/test parquet splits stored under `data/interim/<variant>/` (where `<variant>` is either `<dataset>` or `<dataset>_minocc<k>`).
-- Build and persist the `GlobalIntEncoder` so every subsequent stage shares a stable integer vocabulary for entities, predicates, literals, placeholders, and constraint metadata.
+- Build separate semantic-identity and frequency-filtered feature vocabularies. Scientific evaluation uses identity IDs; model inputs use feature IDs.
 
 ## Inputs & Outputs
-- **Inputs:** Raw files in `data/raw/<dataset>/` (`constraint-corrections-*.tsv.gz`, `constraints.tsv`), CLI flags `--dataset`, `--min-occurrence`, and optional `--max-rows`.
-- **Outputs:** `data/interim/<variant>/df_{train,val,test}.parquet`, the pruned `globalintencoder.txt`, and derived metadata such as the property → constraint-id index produced by `load_constraint_data()`.
+- **Inputs:** Raw files in `data/raw/<dataset>/` (`constraint-corrections-*.tsv.gz`, `constraints.tsv`), CLI flags `--dataset`, `--output-dataset`, `--split-policy`, `--min-occurrence`, and optional `--max-rows`.
+- **Outputs:** `data/interim/<variant>/df_{train,val,test}.parquet`, `identity_encoder.txt`, `feature_encoder.txt`, `identity_to_feature.npy`, the compatibility alias `globalintencoder.txt`, and `dataset_manifest.json`.
 
 ## Workflow
 1. **Argument handling** – `--dataset {sample,full}` chooses the raw input root, `--min-occurrence` configures how aggressively rare tokens get mapped to `unknown`, and `--max-rows` optionally caps the total rows processed across all input files.
@@ -19,22 +19,22 @@
    - `local_constraint_ids` are computed per row by taking `P_local` (the set of property QIDs found in the main predicate, `other_predicate`, and all neighborhood predicate lists) and then unioning every constraint in `constraints_by_property[p]` for `p ∈ P_local`, plus the row’s own `constraint_id`. The final list is unique and sorted by integer ID.
    - `local_constraint_ids_focus` captures a narrower focus scope: constraints attached to the focus predicate(s) plus the constrained property of the violated constraint.
 4. **Dataset assembly** – `load()` stitches every constraint-type file into a single dictionary per split, converting Python lists to `numpy` arrays (object dtype for ragged sequences, numeric for scalars).
-5. **Global split** – All raw splits are concatenated and repartitioned via `stratified_train_val_test_split()` to guarantee consistent constraint-type proportions.
-6. **Frequency filtering** – `_compute_token_frequency()` inspects only the training split to decide which IDs survive the `MIN_OCCURRENCE` threshold. `_apply_frequency_filter_inplace()` replaces infrequent IDs with `UNKNOWN_TOKEN_ID`, `_prune_encoder()` and `_reindex_encoder()` compress the vocabulary, and `_remap_dataset_inplace()` updates every split accordingly. Constraint factor tokens are treated as reserved so they survive pruning despite having zero frequency.
+5. **Split handling** – The default `--split-policy preserve` maps upstream `train`, `dev`, and `test` to local `train`, `val`, and `test` without pooling or repartitioning. `--split-policy restratify` exists only for legacy reproduction. A debug `--max-rows` cap is applied independently to each upstream split.
+6. **Frequency filtering** – `_compute_token_frequency()` inspects only the training split. Original IDs remain in the identity-bearing columns. Every model-bearing scalar/sequence also receives a `<column>_feature` companion in the compact feature vocabulary; rare identities map to the feature `unknown` ID without becoming semantically identical.
    - Registry-derived tokens are reserved before pruning: all constrained property IDs, constraint parameter predicates, and constraint parameter objects from `constraints.tsv` are encoded into the vocabulary and added to the reserved set so factor definitions remain representable even if their corpus frequency is below `MIN_OCCURRENCE`.
-7. **Persistence** – Each final dictionary becomes a pandas dataframe that is written as `df_train.parquet`, `df_val.parquet`, `df_test.parquet`, and the encoder is saved as `globalintencoder.txt`.
+7. **Persistence** – Each final dictionary becomes a parquet split. The identity encoder, feature encoder, identity-to-feature map, raw/source hashes, split policy, row counts, and output hashes are recorded in `dataset_manifest.json` (schema v2).
 8. **Optional derived benchmark sampling** – `02b_stratified_benchmark_sampler.py` can be run after this stage to create the paper-facing `full_strat1m_minocc100` variant from `full_minocc100`, before constraint labeling and graph construction.
 
 ## Common Pitfalls / Gotchas
 - Memory spikes happen while concatenating large constraint targets; for the full dataset keep 20–30 GB of RAM free or use `--max-rows` for debugging subsets.
-- Changing `--min-occurrence` invalidates every downstream artifact (graphs, embeddings, models) because token IDs shift. Rerun the entire pipeline when you tweak it.
+- Changing `--min-occurrence` changes model features and still invalidates graphs/models, but no longer changes semantic identity labels. Report strict identity metrics and representability coverage for every threshold.
 - If `constraints.tsv` is missing or mismatched with the TSV dumps, `load_constraint_data()` will silently drop rows whose constraint IDs are unknown, shrinking the dataset.
 
 ## Implementation Details
 - Reserved placeholders (`subject`, `predicate`, `object`, `other_*`, `LITERAL_OBJECT`, `unknown`) are always injected into the encoder via `_ensure_reserved_tokens()` so downstream models can rely on fixed IDs even after pruning.
 - Constraint factor tokens follow the exact format `constraint_factor::<constraint_id>` and are seeded up-front, then preserved during pruning so their IDs remain stable for graph construction.
-- `LITERAL_OBJECT` is one of the reserved placeholder tokens the pipeline injects into the GlobalIntEncoder. During dataframe building, every triple slot that holds a plain literal (e.g., `"Paris"@en` or a date) can’t be mapped to a Wikidata entity ID, so the script stores `object = 0` and keeps the raw text in `object_text`. Later, when graphs are built, these literal-only nodes still need a stable identifier; `LITERAL_OBJECT` is that special token. It ensures literals share a consistent ID (and, after `04_wikidata_retriever.py`, an embedding) even though they don’t correspond to real Wikidata entities.
-- `_apply_frequency_filter_inplace()` works on both scalar and sequence features, preserving zero values (used for padding) while masking only the genuinely rare identifiers.
+- Plain literals (for example `"Paris"@en` or a date) retain their full raw token in the identity encoder and their text in `object_text`; they therefore remain distinct graph nodes. Frequency filtering may map rare literals to the feature-space `unknown` ID without merging their semantic identities. `LITERAL_OBJECT` remains a reserved fallback for legacy/cache paths.
+- Frequency remapping works on both scalar and sequence feature companions, preserving zero values while leaving the corresponding identity columns unchanged.
 - Literal overlap heuristics compare subject/object labels against cached HTML snippets, inserting synthetic `pageContainsLabel` edges that graph construction later turns into nodes.
 - By delaying pandas materialisation until after frequency pruning and split creation, the script keeps memory pressure manageable even for the full dataset.
 - The script logs the number of base reserved tokens, registry reserved tokens, and the final vocab size after pruning to make encoder growth visible.

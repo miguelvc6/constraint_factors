@@ -17,12 +17,14 @@ Core questions:
 The canonical paper-facing model surface is:
 
 - `B0`: ESWC-style passive baseline
-- `A1`: factorized imitation model
+- `A1`: factorized imitation model with shared role-pressure blocks
 - `M1C`: safe factor chooser model
 - `M1D`: safe factor direct-loss model
 - `G0`: global-fix reranker reference
 
-For the conceptual research framing, start with [docs-conceptual/00-constraint_factors.md](docs-conceptual/00-constraint_factors.md). For the paper-facing implementation surface, start with [docs-technical/00_models_and_evaluation_matrix.md](docs-technical/00_models_and_evaluation_matrix.md) and [docs-technical/00_training_and_evaluation_execution_plan.md](docs-technical/00_training_and_evaluation_execution_plan.md).
+All stored pre-schema-v2 paper metrics require a clean rerun. Start with the
+[scientific integrity remediation and commands](docs-technical/09_scientific_integrity_remediation.md)
+and the [paper narrative reset](docs-conceptual/09_paper_narrative_after_integrity_remediation.md).
 
 ## Setup
 
@@ -68,7 +70,9 @@ uv run src/01_data_downloader.py --dataset sample
 uv run src/02_dataframe_builder.py \
   --dataset sample \
   --min-occurrence 100 \
-  --max-rows 300
+  --split-policy preserve \
+  --max-rows 300 \
+  --overwrite
 ```
 
 ### 3. Build the constraint registry
@@ -87,17 +91,24 @@ uv run src/05_constraint_labeler.py \
   --dataset sample \
   --min-occurrence 100 \
   --constraint-scope local \
-  --max-rows 300
+  --factor-family-policy supported_only \
+  --filter-invalid-primary \
+  --max-rows 300 \
+  --overwrite
 ```
 
 ### 5. Materialize factorized graphs
 
 ```bash
-uv run src/05_constraint_labeler.py \
+uv run src/06_graph.py \
   --dataset sample \
   --min-occurrence 100 \
   --constraint-scope local \
-  --max-rows 300
+  --constraint-representation factorized \
+  --encoding node_id \
+  --registry-dataset sample \
+  --max-instances 300 \
+  --overwrite atomic
 ```
 
 ### 6. Run baseline evaluation
@@ -125,37 +136,50 @@ The default paper-oriented run uses the `full` dataset, `min-occurrence 100`, `c
 ```bash
 uv run src/01_data_downloader.py --dataset full
 
-uv run src/02_dataframe_builder.py \
-  --dataset full \
-  --min-occurrence 100
+uv run src/02_dataframe_builder.py --dataset full --min-occurrence 100 --split-policy preserve --overwrite
 
 uv run src/03_constraint_registry.py --dataset full
 
 uv run src/05_constraint_labeler.py \
   --dataset full \
+  --output-dataset full_valid \
   --min-occurrence 100 \
-  --constraint-scope local
+  --registry-dataset full \
+  --constraint-scope local \
+  --factor-family-policy supported_only \
+  --filter-invalid-primary \
+  --overwrite
+
+uv run src/02b_stratified_benchmark_sampler.py \
+  --source-dataset full_valid \
+  --output-dataset full_strat1m \
+  --min-occurrence 100 \
+  --target-rows 1000000 \
+  --seed 42 \
+  --overwrite
 ```
 
 For `node_id` factorized graphs:
 
 ```bash
 uv run src/06_graph.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
   --encoding node_id \
   --constraint-scope local \
-  --constraint-representation factorized
+  --constraint-representation factorized \
+  --registry-dataset full
 ```
 
 For the passive baseline graphs:
 
 ```bash
 uv run src/06_graph.py \
-  --dataset full \
+  --dataset full_strat1m \
   --min-occurrence 100 \
   --encoding node_id \
-  --constraint-representation eswc_passive
+  --constraint-representation eswc_passive \
+  --registry-dataset full
 ```
 
 If you want `text_embedding` graphs, build the text cache first:
@@ -171,23 +195,26 @@ Then run `src/06_graph.py` with `--encoding text_embedding`.
 ### Generate experiment configs
 
 ```bash
-uv run scripts/make_experiment_configs.py --models-root models
+uv run scripts/make_experiment_configs.py \
+  --models-root models \
+  --variant full_strat1m_minocc100 \
+  --encoding node_id
 ```
 
 ### Run the canonical paper suite
 
 ```bash
-uv run src/10_scheduler.py --paper-suite
+uv run src/10_scheduler.py --paper-suite --seed 42 --force-retrain
 ```
 
 For a stricter ordered run, execute the model families one at a time:
 
 ```bash
-uv run src/10_scheduler.py --only b0_eswc_reproduction --paper-suite
-uv run src/10_scheduler.py --only a1_factorized_imitation --paper-suite
-uv run src/10_scheduler.py --only m1c_safe_factor_chooser --paper-suite
-uv run src/10_scheduler.py --only m1d_safe_factor_direct --paper-suite
-uv run src/10_scheduler.py --only g0_globalfix_reference --paper-suite
+uv run src/10_scheduler.py --only b0_eswc_reproduction --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only a1_factorized_imitation --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only m1c_safe_factor_chooser --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only m1d_safe_factor_direct --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only g0_globalfix_reference --paper-suite --seed 42 --force-retrain
 ```
 
 ## Repository Layout
@@ -214,6 +241,7 @@ Recommended entry points:
 - [docs-conceptual/constraint_types.md](docs-conceptual/constraint_types.md)
 - [docs-technical/00_models_and_evaluation_matrix.md](docs-technical/00_models_and_evaluation_matrix.md)
 - [docs-technical/00_training_and_evaluation_execution_plan.md](docs-technical/00_training_and_evaluation_execution_plan.md)
+- [docs-technical/09_scientific_integrity_remediation.md](docs-technical/09_scientific_integrity_remediation.md)
 - [docs/README.md](docs/README.md)
 
 ## Validation and Smoke Tests
@@ -221,9 +249,8 @@ Recommended entry points:
 Useful checks during development:
 
 ```bash
-uv run python tests/test_factor_batching.py
-uv run python tests/test_paper_surface.py
-uv run python tests/test_paper_run_readiness.py
+uv run pytest -q
+uv run scripts/validate_scientific_integrity.py --help
 uv run python tests/smoke_pipeline_local_closure.py
 ```
 

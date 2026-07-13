@@ -7,9 +7,10 @@ without rebuilding graphs.
 """
 
 import argparse
+import hashlib
 import json
+import shutil
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
@@ -20,97 +21,30 @@ from modules.constraint_checkers import (
     ConstraintInstance,
     EvidenceState,
     evaluate_constraint,
-    normalize_property_id,
-    normalize_token,
 )
-from modules.data_encoders import GlobalIntEncoder
-
-PARAM_P2306 = "P2306"
-PARAM_P2309 = "P2309"
-PARAM_P2308 = "P2308"
-PARAM_P2305 = "P2305"
-PARAM_P1696 = "P1696"
-
-
-@dataclass(frozen=True)
-class RegistryEntry:
-    constraint_type_raw: str
-    constraint_type_item: str
-    constraint_type_index: int
-    constraint_family: str
-    constraint_label: str
-    constraint_family_supported: bool
-    constrained_property_raw: str
-    param_predicates_raw: Tuple[str, ...]
-    param_objects_raw: Tuple[str, ...]
-
+from modules.constraint_semantics import (
+    RegistryEntry,
+    build_constraint_instance as build_registry_constraint_instance,
+    load_registry,
+    lookup_registry_entry,
+    resolve_registry_id,
+    resolve_registry_mapping,
+)
+from modules.data_encoders import GlobalIntEncoder, encoder_path
+from modules.data_encoders import (
+    DATASET_SCHEMA_VERSION,
+    FEATURE_ENCODER_FILENAME,
+    IDENTITY_ENCODER_FILENAME,
+    IDENTITY_TO_FEATURE_FILENAME,
+    LEGACY_ENCODER_FILENAME,
+)
 
 def _load_registry(path: Path) -> Dict[str, RegistryEntry]:
-    registry_df = pd.read_parquet(path)
-    registry_json = registry_df["registry_json"].iloc[0]
-    registry = json.loads(registry_json) if isinstance(registry_json, str) else registry_json
-    type_items = sorted(
-        {
-            str(entry.get("constraint_type_item", "")).strip()
-            for entry in registry.values()
-            if str(entry.get("constraint_type_item", "")).strip()
-        }
-    )
-    fallback_type_index = {type_item: idx for idx, type_item in enumerate(type_items)}
-    parsed: Dict[str, RegistryEntry] = {}
-    for constraint_id, entry in registry.items():
-        constraint_family = entry.get("constraint_family")
-        if not constraint_family:
-            constraint_family = entry.get("constraint_type_name", "")
-        constraint_family_supported = entry.get("constraint_family_supported")
-        if constraint_family_supported is None:
-            constraint_family_supported = entry.get("constraint_type_supported", False)
-        constraint_type_item = str(entry.get("constraint_type_item", ""))
-        constraint_type_index = entry.get("constraint_type_index")
-        if constraint_type_index is None:
-            constraint_type_index = fallback_type_index.get(constraint_type_item.strip(), -1)
-        parsed[constraint_id] = RegistryEntry(
-            constraint_type_raw=str(entry.get("constraint_type", "")),
-            constraint_type_item=constraint_type_item,
-            constraint_type_index=int(constraint_type_index),
-            constraint_family=str(constraint_family or ""),
-            constraint_label=str(entry.get("constraint_label", "")),
-            constraint_family_supported=bool(constraint_family_supported),
-            constrained_property_raw=str(entry.get("constrained_property", "")),
-            param_predicates_raw=tuple(entry.get("param_predicates") or ()),
-            param_objects_raw=tuple(entry.get("param_objects") or ()),
-        )
-    return parsed
+    return load_registry(path)
 
 
 def _resolve_registry_id(raw_id: str | None, encoder: GlobalIntEncoder | None) -> int:
-    if encoder is None or not raw_id:
-        return 0
-    raw = raw_id.strip()
-    if raw.startswith("<") and raw.endswith(">"):
-        raw = raw[1:-1].strip()
-    if raw.startswith("http://www.wikidata.org/prop/direct/"):
-        raw = raw.replace("http://www.wikidata.org/prop/direct/", "http://www.wikidata.org/entity/")
-    candidates: List[str] = []
-    seen: Set[str] = set()
-    if raw.startswith("http://") or raw.startswith("https://"):
-        candidates.extend([raw, f"<{raw}>"])
-        tail = raw.rsplit("/", 1)[-1]
-        if tail and tail[0] in ("P", "Q") and tail[1:].isdigit():
-            candidates.append(tail)
-    else:
-        if raw and raw[0] in ("P", "Q") and raw[1:].isdigit():
-            entity_uri = f"http://www.wikidata.org/entity/{raw}"
-            candidates.extend([entity_uri, f"<{entity_uri}>"])
-        candidates.append(raw)
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        token_id = encoder.encode(candidate, add_new=False)
-        if token_id:
-            return token_id
-    return 0
+    return resolve_registry_id(raw_id, encoder)
 
 
 def _coerce_sequence(value: Any, *, cast_int: bool = True) -> List[Any]:
@@ -190,6 +124,24 @@ def _build_facts_state(
     facts_by_entity: Dict[int, Dict[int, Set[int]]] = {}
     predicates_present: Dict[int, Set[int]] = {}
 
+    def _merge_entity(
+        entity_id: Any,
+        facts: Dict[Any, Set[Any]],
+        present: Set[Any],
+    ) -> None:
+        if entity_id in (None, "", 0):
+            return
+        target = facts_by_entity.setdefault(entity_id, {})
+        for pred, values in facts.items():
+            target.setdefault(pred, set()).update(values)
+        predicates_present.setdefault(entity_id, set()).update(present)
+
+    def _add_explicit_statement(entity_id: Any, predicate_id: Any, object_id: Any) -> None:
+        if entity_id in (None, "", 0) or predicate_id in (None, "", 0) or object_id in (None, "", 0):
+            return
+        facts_by_entity.setdefault(entity_id, {}).setdefault(predicate_id, set()).add(object_id)
+        predicates_present.setdefault(entity_id, set()).add(predicate_id)
+
     subject_id = _coerce_value(getattr(row, "subject", None), cast_int=cast_int)
     object_id = _coerce_value(getattr(row, "object", None), cast_int=cast_int)
     other_entity_id = _pick_other_entity_id(row, cast_int=cast_int)
@@ -199,8 +151,7 @@ def _build_facts_state(
     subject_facts, subject_present = _build_facts_for_entity(
         subject_preds, subject_objs, p_local=p_local, cast_int=cast_int
     )
-    facts_by_entity[subject_id] = subject_facts
-    predicates_present[subject_id] = subject_present
+    _merge_entity(subject_id, subject_facts, subject_present)
 
     if object_id not in (None, "", 0):
         object_preds = _coerce_sequence(getattr(row, "object_predicates", None), cast_int=cast_int)
@@ -208,8 +159,7 @@ def _build_facts_state(
         object_facts, object_present = _build_facts_for_entity(
             object_preds, object_objs, p_local=p_local, cast_int=cast_int
         )
-        facts_by_entity[object_id] = object_facts
-        predicates_present[object_id] = object_present
+        _merge_entity(object_id, object_facts, object_present)
 
     if other_entity_id not in (None, "", 0):
         other_preds = _coerce_sequence(getattr(row, "other_entity_predicates", None), cast_int=cast_int)
@@ -217,8 +167,20 @@ def _build_facts_state(
         other_facts, other_present = _build_facts_for_entity(
             other_preds, other_objs, p_local=p_local, cast_int=cast_int
         )
-        facts_by_entity[other_entity_id] = other_facts
-        predicates_present[other_entity_id] = other_present
+        _merge_entity(other_entity_id, other_facts, other_present)
+
+    # The correction row's focus and comparison triples are authoritative
+    # pre-edit statements even when the serialized neighborhood omits them.
+    _add_explicit_statement(
+        subject_id,
+        _coerce_value(getattr(row, "predicate", None), cast_int=cast_int),
+        object_id,
+    )
+    _add_explicit_statement(
+        _coerce_value(getattr(row, "other_subject", None), cast_int=cast_int),
+        _coerce_value(getattr(row, "other_predicate", None), cast_int=cast_int),
+        _coerce_value(getattr(row, "other_object", None), cast_int=cast_int),
+    )
 
     return facts_by_entity, predicates_present
 
@@ -288,62 +250,13 @@ def _build_constraint_instance(
     constraint_type_id: int,
     default_relation_predicates: List[int],
 ) -> ConstraintInstance:
-    constrained_property_id = _resolve_registry_id(registry_entry.constrained_property_raw, encoder)
-
-    param_predicates = registry_entry.param_predicates_raw
-    param_objects = registry_entry.param_objects_raw
-    param_pairs = list(zip(param_predicates, param_objects))
-
-    required_properties: Set[int] = set()
-    allowed_items: Set[int] = set()
-    allowed_classes: Set[int] = set()
-    relation_predicates: List[int] = []
-    inverse_properties: List[int] = []
-    conflict_properties: Set[int] = set()
-
-    for pred_raw, obj_raw in param_pairs:
-        pred_norm = normalize_token(pred_raw)
-        obj_norm = normalize_token(obj_raw)
-        pred_key = pred_norm or pred_raw
-        obj_key = obj_norm or obj_raw
-        obj_id = _resolve_registry_id(obj_raw, encoder) if encoder else 0
-
-        if pred_key == PARAM_P2306:
-            if normalize_property_id(obj_key):
-                if obj_id:
-                    required_properties.add(obj_id)
-        elif pred_key == PARAM_P2305:
-            if obj_id:
-                allowed_items.add(obj_id)
-        elif pred_key == PARAM_P2308:
-            if obj_id:
-                allowed_classes.add(obj_id)
-        elif pred_key == PARAM_P2309:
-            if normalize_property_id(obj_key) and obj_id:
-                relation_predicates.append(obj_id)
-        elif pred_key == PARAM_P1696:
-            if normalize_property_id(obj_key) and obj_id:
-                inverse_properties.append(obj_id)
-
-        if normalize_property_id(obj_key) and obj_id:
-            conflict_properties.add(obj_id)
-
-    if not relation_predicates:
-        relation_predicates = list(default_relation_predicates)
-    if not inverse_properties and constrained_property_id:
-        inverse_properties = [constrained_property_id]
-
-    return ConstraintInstance(
-        constraint_id=constraint_id,
-        constraint_type=constraint_type_name,
+    return build_registry_constraint_instance(
+        constraint_id,
+        registry_entry,
+        encoder=encoder,
+        constraint_type_name=constraint_type_name,
         constraint_type_id=constraint_type_id,
-        constrained_property=constrained_property_id,
-        required_properties=required_properties,
-        allowed_items=allowed_items,
-        allowed_classes=allowed_classes,
-        relation_predicates=relation_predicates,
-        inverse_properties=inverse_properties,
-        conflict_properties=conflict_properties,
+        default_relation_predicates=default_relation_predicates,
     )
 
 
@@ -353,14 +266,11 @@ def _lookup_registry_entry(
     *,
     use_encoded_ids: bool,
 ) -> RegistryEntry | None:
-    if use_encoded_ids:
-        try:
-            cid = int(constraint_id)
-        except (TypeError, ValueError):
-            return None
-        return registry_by_id.get(cid)  # type: ignore[arg-type]
-    key = normalize_token(str(constraint_id)) or str(constraint_id)
-    return registry_by_id.get(key)  # type: ignore[arg-type]
+    return lookup_registry_entry(
+        constraint_id,
+        registry_by_id,
+        use_encoded_ids=use_encoded_ids,
+    )
 
 
 def _load_encoder(path: Path | None) -> GlobalIntEncoder | None:
@@ -441,6 +351,12 @@ def _process_dataframe(
     num_checkable_post: List[int] = []
     coverage_pre: List[float] = []
     coverage_post: List[float] = []
+    primary_factor_indices: List[int] = []
+    primary_checkable_pre: List[bool] = []
+    primary_satisfied_pre: List[int] = []
+    primary_checkable_post: List[bool] = []
+    primary_satisfied_post: List[int] = []
+    primary_validation_reasons: List[str] = []
 
     for row in df.itertuples(index=False):
         p_local = _compute_p_local(row, cast_int=use_encoded_ids)
@@ -509,6 +425,7 @@ def _process_dataframe(
         checkable_post_row: List[bool] = []
         satisfied_post_row: List[int] = []
         types_row: List[int] = []
+        primary_reason = "missing_primary_factor"
 
         for constraint_id in local_constraint_ids:
             entry = _lookup_registry_entry(constraint_id, registry_by_id, use_encoded_ids=use_encoded_ids)
@@ -527,6 +444,8 @@ def _process_dataframe(
                 satisfied_post_row.append(0)
                 types_row.append(-1)
                 coverage["missing_registry"]["total"] += 1
+                if is_primary:
+                    primary_reason = "missing_registry"
                 continue
 
             cache_key = str(int(constraint_id)) if use_encoded_ids else str(constraint_id)
@@ -552,6 +471,7 @@ def _process_dataframe(
                     continue
                 if is_primary:
                     filter_stats["unsupported_primary_retained"] += 1
+                    primary_reason = "unsupported_family"
                 checkable_pre = False
                 satisfied_pre = 0
                 checkable_post = False
@@ -560,6 +480,18 @@ def _process_dataframe(
                 filter_stats["supported_retained"] += 1
                 checkable_pre, satisfied_pre = evaluate_constraint(pre_state, constraint_instance, p_local)
                 checkable_post, satisfied_post = evaluate_constraint(post_state, constraint_instance, p_local)
+
+            if is_primary and entry.constraint_family_supported:
+                if subject in constraint_instance.exceptions:
+                    primary_reason = "exempt"
+                elif not constraint_instance.applies_to_main_value:
+                    primary_reason = "unsupported_scope"
+                elif not checkable_pre:
+                    primary_reason = "uncheckable_pre"
+                elif satisfied_pre:
+                    primary_reason = "already_satisfied_pre"
+                else:
+                    primary_reason = "valid"
 
             retained_constraint_ids.append(int(constraint_id))
             checkable_pre_row.append(bool(checkable_pre))
@@ -592,6 +524,24 @@ def _process_dataframe(
         coverage_pre.append(num_checkable / total if total else 0.0)
         coverage_post.append(num_checkable_post_row / total if total else 0.0)
 
+        try:
+            primary_index = retained_constraint_ids.index(int(primary_constraint_id))
+        except (ValueError, TypeError):
+            primary_index = -1
+        primary_factor_indices.append(primary_index)
+        if primary_index >= 0:
+            primary_checkable_pre.append(bool(checkable_pre_row[primary_index]))
+            primary_satisfied_pre.append(int(satisfied_pre_row[primary_index]))
+            primary_checkable_post.append(bool(checkable_post_row[primary_index]))
+            primary_satisfied_post.append(int(satisfied_post_row[primary_index]))
+        else:
+            primary_checkable_pre.append(False)
+            primary_satisfied_pre.append(0)
+            primary_checkable_post.append(False)
+            primary_satisfied_post.append(0)
+        primary_validation_reasons.append(primary_reason)
+        filter_stats[f"primary_validation::{primary_reason}"] += 1
+
     df = df.copy()
     df["factor_checkable_pre"] = factor_checkable_pre
     df["factor_satisfied_pre"] = factor_satisfied_pre
@@ -603,6 +553,12 @@ def _process_dataframe(
     df["coverage_pre"] = coverage_pre
     df["num_checkable_factors_post_gold"] = num_checkable_post
     df["coverage_post_gold"] = coverage_post
+    df["primary_factor_index"] = primary_factor_indices
+    df["primary_checkable_pre"] = primary_checkable_pre
+    df["primary_satisfied_pre"] = primary_satisfied_pre
+    df["primary_checkable_post_gold"] = primary_checkable_post
+    df["primary_satisfied_post_gold"] = primary_satisfied_post
+    df["primary_validation_reason"] = primary_validation_reasons
 
     return df, coverage, filter_stats
 
@@ -825,25 +781,11 @@ def _resolve_registry_mapping(
     encoder: GlobalIntEncoder | None,
     use_encoded_ids: bool,
 ) -> Dict[int, RegistryEntry] | Dict[str, RegistryEntry]:
-    if use_encoded_ids:
-        if encoder is None:
-            raise ValueError("Encoder required to map registry constraint ids to dataset ids.")
-        mapped: Dict[int, RegistryEntry] = {}
-        missing: List[str] = []
-        for constraint_id, entry in registry.items():
-            cid = _resolve_registry_id(constraint_id, encoder)
-            if cid == 0:
-                missing.append(constraint_id)
-                continue
-            mapped[cid] = entry
-        if missing:
-            print(f"Warning: {len(missing)} registry ids could not be resolved via encoder.")
-        return mapped
-    mapped_str: Dict[str, RegistryEntry] = {}
-    for constraint_id, entry in registry.items():
-        key = normalize_token(constraint_id) or constraint_id
-        mapped_str[key] = entry
-    return mapped_str
+    return resolve_registry_mapping(
+        registry,
+        encoder=encoder,
+        use_encoded_ids=use_encoded_ids,
+    )
 
 
 def _iter_parquet_paths(input_path: Path) -> List[Path]:
@@ -857,6 +799,75 @@ def _iter_parquet_paths(input_path: Path) -> List[Path]:
     return candidates
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_dataset_contract(input_dir: Path, output_root: Path) -> None:
+    for filename in (
+        IDENTITY_ENCODER_FILENAME,
+        FEATURE_ENCODER_FILENAME,
+        LEGACY_ENCODER_FILENAME,
+        IDENTITY_TO_FEATURE_FILENAME,
+    ):
+        source = input_dir / filename
+        if source.exists():
+            shutil.copy2(source, output_root / filename)
+
+
+def _write_labeled_manifest(
+    *,
+    input_dir: Path,
+    output_root: Path,
+    rows_by_split: dict[str, int],
+    exclusions: Counter[str],
+    filter_invalid_primary: bool,
+) -> None:
+    source_manifest_path = input_dir / "dataset_manifest.json"
+    source_manifest: dict[str, Any] = {}
+    if source_manifest_path.exists():
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    payload = {
+        **source_manifest,
+        "schema_version": DATASET_SCHEMA_VERSION,
+        "dataset_variant": output_root.name,
+        "parent_dataset_variant": input_dir.name,
+        "parent_manifest_sha256": _sha256_file(source_manifest_path)
+        if source_manifest_path.exists()
+        else None,
+        "semantic_labeling": {
+            "version": "wikidata-main-v2",
+            "filter_invalid_primary": bool(filter_invalid_primary),
+            "exclusions": dict(sorted(exclusions.items())),
+        },
+        "rows": dict(sorted(rows_by_split.items())),
+        "outputs": {
+            path.name: _sha256_file(path)
+            for path in sorted(
+                [*output_root.glob("df_*.parquet")]
+                + [
+                    output_root / filename
+                    for filename in (
+                        IDENTITY_ENCODER_FILENAME,
+                        FEATURE_ENCODER_FILENAME,
+                        LEGACY_ENCODER_FILENAME,
+                        IDENTITY_TO_FEATURE_FILENAME,
+                        "primary_validation_audit.csv",
+                    )
+                    if (output_root / filename).exists()
+                ]
+            )
+        },
+    }
+    with (output_root / "dataset_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Label constraint satisfaction for local factors.")
     parser.add_argument(
@@ -868,6 +879,21 @@ def main() -> None:
         "--registry-dataset",
         default=None,
         help="Raw dataset name for constraint_registry_<dataset>.parquet. Defaults to --dataset.",
+    )
+    parser.add_argument(
+        "--output-dataset",
+        default=None,
+        help="Write a standalone dataset variant instead of the legacy <variant>_labeled directory.",
+    )
+    parser.add_argument(
+        "--filter-invalid-primary",
+        action="store_true",
+        help="Exclude rows whose primary constraint is exempt, uncheckable, or already satisfied.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing output dataset directory.",
     )
     parser.add_argument(
         "--min-occurrence",
@@ -911,7 +937,11 @@ def main() -> None:
 
     dataset_variant = dataset_variant_name(args.dataset, args.min_occurrence)
     input_dir = Path("data") / "interim" / dataset_variant
-    output_root = Path("data") / "interim" / f"{dataset_variant}_labeled"
+    if args.output_dataset:
+        output_variant = dataset_variant_name(args.output_dataset, args.min_occurrence)
+    else:
+        output_variant = f"{dataset_variant}_labeled"
+    output_root = Path("data") / "interim" / output_variant
     registry_candidates = []
     if args.registry_dataset:
         registry_candidates.append(args.registry_dataset)
@@ -926,10 +956,10 @@ def main() -> None:
             break
     if registry_path is None:
         raise FileNotFoundError(f"No constraint registry found for candidates: {', '.join(dict.fromkeys(registry_candidates))}")
-    encoder_path = input_dir / "globalintencoder.txt"
+    resolved_encoder_path = encoder_path(input_dir, identity=True)
 
     registry_raw = _load_registry(registry_path)
-    encoder = _load_encoder(encoder_path if encoder_path.exists() else None)
+    encoder = _load_encoder(resolved_encoder_path if resolved_encoder_path.exists() else None)
 
     parquet_paths = _iter_parquet_paths(input_dir)
     first_df = pd.read_parquet(parquet_paths[0], columns=["constraint_id"])
@@ -937,10 +967,19 @@ def main() -> None:
     if use_encoded_ids and encoder is None:
         raise SystemExit("Encoder is required to resolve registry ids for encoded parquet data.")
     registry_by_id = _resolve_registry_mapping(registry_raw, encoder=encoder, use_encoded_ids=use_encoded_ids)
+    if output_root.exists() and any(output_root.iterdir()):
+        if not args.overwrite:
+            raise FileExistsError(
+                f"Output dataset already exists: {output_root}. Use --overwrite to replace it."
+            )
+        shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    _copy_dataset_contract(input_dir, output_root)
 
     combined_coverage: Dict[str, Counter[str]] = defaultdict(Counter)
     combined_filter_stats: Counter[str] = Counter()
+    exclusion_counts: Counter[str] = Counter()
+    rows_by_split: dict[str, int] = {}
 
     for parquet_path in parquet_paths:
         df = pd.read_parquet(parquet_path)
@@ -962,9 +1001,19 @@ def main() -> None:
             combined_coverage[ctype].update(stats)
         combined_filter_stats.update(filter_stats)
 
+        split = parquet_path.stem.removeprefix("df_")
+        reason_counts = labeled_df["primary_validation_reason"].value_counts()
+        for reason, count in reason_counts.items():
+            exclusion_counts[f"{split}::{reason}"] += int(count)
+        if args.filter_invalid_primary:
+            labeled_df = labeled_df.loc[
+                labeled_df["primary_validation_reason"] == "valid"
+            ].reset_index(drop=True)
+        rows_by_split[split] = int(len(labeled_df))
+
         output_path = output_root / parquet_path.name
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        labeled_df.to_parquet(output_path)
+        labeled_df.to_parquet(output_path, index=False)
         print(f"Wrote labeled parquet to {output_path}")
 
     _print_coverage(combined_coverage)
@@ -975,6 +1024,21 @@ def main() -> None:
         output_root,
         args.constraint_scope,
         args.factor_family_policy,
+    )
+    exclusion_rows = []
+    for key, count in sorted(exclusion_counts.items()):
+        split, reason = key.split("::", 1)
+        exclusion_rows.append({"split": split, "reason": reason, "count": int(count)})
+    pd.DataFrame(exclusion_rows).to_csv(
+        output_root / "primary_validation_audit.csv",
+        index=False,
+    )
+    _write_labeled_manifest(
+        input_dir=input_dir,
+        output_root=output_root,
+        rows_by_split=rows_by_split,
+        exclusions=exclusion_counts,
+        filter_invalid_primary=args.filter_invalid_primary,
     )
 
 

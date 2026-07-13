@@ -81,6 +81,8 @@ class ConstraintInstance:
     relation_predicates: List[int]
     inverse_properties: List[int]
     conflict_properties: Set[int]
+    exceptions: Set[int] = frozenset()
+    applies_to_main_value: bool = True
 
 
 def _needs_edit_guard(state: EvidenceState, entity_id: int, predicate_id: int) -> bool:
@@ -144,7 +146,11 @@ def is_satisfied_conflict_with(
     for prop in conflict_props:
         if prop == 0:
             continue
-        if state.has_property(subject, prop):
+        values = state.values_for(subject, prop)
+        if constraint.allowed_items:
+            if values & constraint.allowed_items:
+                has_q = True
+        elif values:
             has_q = True
     return not (has_p and has_q)
 
@@ -241,7 +247,10 @@ def is_satisfied_item_requires_statement(
     if not state.has_property(subject, constraint.constrained_property):
         return True
     for req_prop in constraint.required_properties:
-        if not state.has_property(subject, req_prop):
+        values = state.values_for(subject, req_prop)
+        if constraint.allowed_items and not (values & constraint.allowed_items):
+            return False
+        if not constraint.allowed_items and not values:
             return False
     return True
 
@@ -289,7 +298,10 @@ def is_satisfied_value_requires_statement(
     if not state.focus_statement_present():
         return True
     for req_prop in constraint.required_properties:
-        if not state.has_property(obj, req_prop):
+        values = state.values_for(obj, req_prop)
+        if constraint.allowed_items and not (values & constraint.allowed_items):
+            return False
+        if not constraint.allowed_items and not values:
             return False
     return True
 
@@ -524,6 +536,10 @@ def evaluate_constraint(
     p_local: Set[int],
 ) -> Tuple[bool, int]:
     """Return (checkable, satisfied) for a constraint instance."""
+    if not constraint.applies_to_main_value:
+        return False, 0
+    if state.focus_subject in constraint.exceptions:
+        return False, 0
     checker = CHECKERS.get(constraint.constraint_type)
     if checker is None:
         return False, 0

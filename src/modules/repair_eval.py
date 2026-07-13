@@ -315,7 +315,7 @@ class ConstraintRepairHeuristics:
         self._relation_param = self._maybe_id("<http://www.wikidata.org/entity/P2309>")
         self._items_param = self._maybe_id("<http://www.wikidata.org/entity/P2305>")
         self._property_param = self._maybe_id("<http://www.wikidata.org/entity/P2306>")
-        self._inverse_param = self._maybe_id("<http://www.wikidata.org/entity/P1696>")
+        self._inverse_param = self._property_param
 
     def _maybe_id(self, token: str) -> int | None:
         """Return the encoder id for *token*, or None if missing from the vocabulary."""
@@ -612,8 +612,8 @@ class ConstraintRepairHeuristics:
     def _inverse_additions(self, ctx: ViolationContext) -> list[TriplePattern]:
         """
         adding `(object, inverse_predicate, subject)` where `inverse_predicate` is taken
-        from `inverse property (P1696)` or, if unspecified, defaults to the original predicate (covering symmetric
-        properties).
+        from the constraint `property (P2306)` parameter or, if unspecified,
+        defaults to the original predicate (covering symmetric properties).
         """
         predicate_ids = ctx.values_for_predicate(self._inverse_param or -1, self.none_class)
         if not predicate_ids:
@@ -680,6 +680,8 @@ class GlobalMetricsAccumulator:
     gfr_sum: float = 0.0
     srr_sum: float = 0.0
     sir_sum: float = 0.0
+    srr_defined_support: int = 0
+    sir_defined_support: int = 0
     srr_denom: int = 0
     sir_denom: int = 0
     srr_num: int = 0
@@ -691,6 +693,10 @@ class GlobalMetricsAccumulator:
     focus_preserved: int = 0
     focus_deleted: int = 0
     candidate_deletes_focus: int = 0
+    primary_fix_num: int = 0
+    primary_fix_denom: int = 0
+    primary_post_uncheckable: int = 0
+    primary_still_violated: int = 0
     non_vacuous_primary_fix: int = 0
     vacuous_satisfaction_improvement: int = 0
 
@@ -709,13 +715,21 @@ class GlobalMetricsAccumulator:
         focus_preserved: int = 0,
         focus_deleted: int = 0,
         candidate_deletes_focus: int = 0,
+        primary_fix_num: int = 0,
+        primary_fix_denom: int = 0,
+        primary_post_uncheckable: int = 0,
+        primary_still_violated: int = 0,
         non_vacuous_primary_fix: int = 0,
         vacuous_satisfaction_improvement: int = 0,
     ) -> None:
         self.support += 1
         self.gfr_sum += gfr
-        self.srr_sum += srr
-        self.sir_sum += sir
+        if srr_denom:
+            self.srr_sum += srr
+            self.srr_defined_support += 1
+        if sir_denom:
+            self.sir_sum += sir
+            self.sir_defined_support += 1
         self.srr_num += srr_num
         self.srr_denom += srr_denom
         self.sir_num += sir_num
@@ -728,6 +742,10 @@ class GlobalMetricsAccumulator:
         self.focus_preserved += int(focus_preserved)
         self.focus_deleted += int(focus_deleted)
         self.candidate_deletes_focus += int(candidate_deletes_focus)
+        self.primary_fix_num += int(primary_fix_num)
+        self.primary_fix_denom += int(primary_fix_denom)
+        self.primary_post_uncheckable += int(primary_post_uncheckable)
+        self.primary_still_violated += int(primary_still_violated)
         self.non_vacuous_primary_fix += int(non_vacuous_primary_fix)
         self.vacuous_satisfaction_improvement += int(vacuous_satisfaction_improvement)
 
@@ -736,8 +754,16 @@ class GlobalMetricsAccumulator:
         return {
             "support": self.support,
             "gfr": self.gfr_sum / support,
-            "srr": self.srr_sum / support,
-            "sir": self.sir_sum / support,
+            "srr": self.srr_num / self.srr_denom if self.srr_denom else 0.0,
+            "sir": self.sir_num / self.sir_denom if self.sir_denom else 0.0,
+            "srr_macro_defined": (
+                self.srr_sum / self.srr_defined_support if self.srr_defined_support else 0.0
+            ),
+            "sir_macro_defined": (
+                self.sir_sum / self.sir_defined_support if self.sir_defined_support else 0.0
+            ),
+            "srr_defined_support": self.srr_defined_support,
+            "sir_defined_support": self.sir_defined_support,
             "srr_total": self.srr_num,
             "srr_denom_total": self.srr_denom,
             "sir_total": self.sir_num,
@@ -745,8 +771,23 @@ class GlobalMetricsAccumulator:
             "focus_preserved_rate": self.focus_preserved / support,
             "focus_deleted_rate": self.focus_deleted / support,
             "candidate_deletes_focus_rate": self.candidate_deletes_focus / support,
-            "non_vacuous_primary_fix_rate": self.non_vacuous_primary_fix / support,
-            "vacuous_satisfaction_improvement_rate": self.vacuous_satisfaction_improvement / support,
+            "primary_fix_rate": (
+                self.primary_fix_num / self.primary_fix_denom if self.primary_fix_denom else 0.0
+            ),
+            "primary_fix_total": self.primary_fix_num,
+            "primary_fix_denom_total": self.primary_fix_denom,
+            "primary_post_uncheckable_total": self.primary_post_uncheckable,
+            "primary_still_violated_total": self.primary_still_violated,
+            "non_vacuous_primary_fix_rate": (
+                self.non_vacuous_primary_fix / self.primary_fix_denom
+                if self.primary_fix_denom
+                else 0.0
+            ),
+            "vacuous_satisfaction_improvement_rate": (
+                self.vacuous_satisfaction_improvement / self.primary_fix_denom
+                if self.primary_fix_denom
+                else 0.0
+            ),
             "disruption": {
                 "added_triples_mean": self.add_sum / support,
                 "deleted_triples_mean": self.del_sum / support,
@@ -928,16 +969,50 @@ def evaluate_global_repair_samples(
 
         add_count = 1 if sample.predicted.get("add") is not None else 0
         del_count = 1 if sample.predicted.get("del") is not None else 0
+        primary_fix_eligible = int(
+            0 <= primary_index < len(pre_checkable)
+            and primary_index < len(post_checkable)
+            and bool(pre_checkable[primary_index])
+            and not bool(pre_satisfied[primary_index])
+        )
+        primary_fixed = int(
+            primary_fix_eligible
+            and bool(post_checkable[primary_index])
+            and bool(post_satisfied[primary_index])
+        )
+        primary_post_uncheckable = int(
+            primary_fix_eligible and not bool(post_checkable[primary_index])
+        )
+        primary_still_violated = int(
+            primary_fix_eligible
+            and bool(post_checkable[primary_index])
+            and not bool(post_satisfied[primary_index])
+        )
+        focus_preserved = int(details.get("focus_preserved", 0))
+        non_vacuous_primary_fix = int(primary_fixed and focus_preserved)
+        vacuous_improvement = int(
+            primary_fix_eligible
+            and int(details.get("focus_deleted", 0))
+            and (
+                primary_fixed
+                or float(details.get("post_global_satisfied_fraction", gfr))
+                > float(details.get("pre_global_satisfied_fraction", 0.0))
+            )
+        )
         evidence = {
             "pre_global_satisfied_fraction": float(details.get("pre_global_satisfied_fraction", 0.0)),
             "post_global_satisfied_fraction": float(details.get("post_global_satisfied_fraction", gfr)),
             "pre_focus_present": int(details.get("pre_focus_present", 0)),
             "post_focus_present": int(details.get("post_focus_present", 0)),
-            "focus_preserved": int(details.get("focus_preserved", 0)),
+            "focus_preserved": focus_preserved,
             "focus_deleted": int(details.get("focus_deleted", 0)),
             "candidate_deletes_focus": int(details.get("candidate_deletes_focus", 0)),
-            "non_vacuous_primary_fix": int(details.get("non_vacuous_primary_fix", 0)),
-            "vacuous_satisfaction_improvement": int(details.get("vacuous_satisfaction_improvement", 0)),
+            "primary_fix_eligible": primary_fix_eligible,
+            "primary_fixed": primary_fixed,
+            "primary_post_uncheckable": primary_post_uncheckable,
+            "primary_still_violated": primary_still_violated,
+            "non_vacuous_primary_fix": non_vacuous_primary_fix,
+            "vacuous_satisfaction_improvement": vacuous_improvement,
         }
 
         per_sample_gfr.append(gfr)
@@ -966,6 +1041,10 @@ def evaluate_global_repair_samples(
             focus_preserved=int(evidence["focus_preserved"]),
             focus_deleted=int(evidence["focus_deleted"]),
             candidate_deletes_focus=int(evidence["candidate_deletes_focus"]),
+            primary_fix_num=primary_fixed,
+            primary_fix_denom=primary_fix_eligible,
+            primary_post_uncheckable=primary_post_uncheckable,
+            primary_still_violated=primary_still_violated,
             non_vacuous_primary_fix=int(evidence["non_vacuous_primary_fix"]),
             vacuous_satisfaction_improvement=int(evidence["vacuous_satisfaction_improvement"]),
         )
@@ -984,6 +1063,10 @@ def evaluate_global_repair_samples(
             focus_preserved=int(evidence["focus_preserved"]),
             focus_deleted=int(evidence["focus_deleted"]),
             candidate_deletes_focus=int(evidence["candidate_deletes_focus"]),
+            primary_fix_num=primary_fixed,
+            primary_fix_denom=primary_fix_eligible,
+            primary_post_uncheckable=primary_post_uncheckable,
+            primary_still_violated=primary_still_violated,
             non_vacuous_primary_fix=int(evidence["non_vacuous_primary_fix"]),
             vacuous_satisfaction_improvement=int(evidence["vacuous_satisfaction_improvement"]),
         )

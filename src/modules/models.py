@@ -9,6 +9,22 @@ from torch.nn import BatchNorm1d as BN
 from torch.nn import Linear, ReLU, Sequential
 from torch_geometric.nn import GATConv, GCNConv, GINConv, GINEConv, global_mean_pool
 
+
+def _validate_non_flattened_batch_indices(data, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> None:
+    """Fail fast when a local predicate index crosses PyG graph boundaries."""
+    if edge_index.numel() == 0 or edge_attr.numel() == 0:
+        return
+    if int(edge_attr.min().item()) < 0 or int(edge_attr.max().item()) >= int(data.x.size(0)):
+        raise ValueError("edge_attr_non_flattened contains an out-of-range node index")
+    batch = getattr(data, "batch", None)
+    if batch is None or batch.numel() != data.x.size(0):
+        return
+    source_graph = batch.index_select(0, edge_index[0])
+    target_graph = batch.index_select(0, edge_index[1])
+    predicate_graph = batch.index_select(0, edge_attr)
+    if not torch.equal(source_graph, target_graph) or not torch.equal(source_graph, predicate_graph):
+        raise ValueError("Non-flattened edge endpoints and predicate node cross graph boundaries")
+
 from .config import ModelConfig
 
 
@@ -963,6 +979,7 @@ class BaseGraphModel(nn.Module, ABC):
         if self.use_edge_attributes:
             edge_index = data.edge_index_non_flattened
             edge_attr = data.edge_attr_non_flattened
+            _validate_non_flattened_batch_indices(data, edge_index, edge_attr)
             # TODO: consider removing isolated nodes (requires remapping of the edge_attributes, because they currently refer to the local---in graph---node ids)
         else:
             edge_index = data.edge_index
@@ -1476,6 +1493,7 @@ class RepairGINFactorPressure(BaseGraphModel):
         if self.use_edge_attributes:
             edge_index = data.edge_index_non_flattened
             edge_attr = data.edge_attr_non_flattened
+            _validate_non_flattened_batch_indices(data, edge_index, edge_attr)
         else:
             edge_index = data.edge_index
             edge_attr = None

@@ -56,6 +56,12 @@ from tqdm.auto import tqdm
 
 from modules.data_encoders import (
     ArtifactWriteResult,
+    ConstraintGraphData,
+    FEATURE_ENCODER_FILENAME,
+    GRAPH_SCHEMA_VERSION,
+    IDENTITY_ENCODER_FILENAME,
+    IDENTITY_TO_FEATURE_FILENAME,
+    LEGACY_ENCODER_FILENAME,
     ROLE_NONE,
     ROLE_OBJECT,
     ROLE_PREDICATE,
@@ -174,6 +180,8 @@ def create_graph(
     wikidata_cache: PrecomputedWikidataCache | None,
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
+    feature_int_encoder: GlobalIntEncoder | None = None,
+    identity_to_feature: np.ndarray | None = None,
     encoding: Literal["node_id", "text_embedding"] = "text_embedding",
     constraint_scope: Literal["local", "focus"] = "local",
     constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
@@ -232,9 +240,13 @@ def create_graph(
     """
 
     global_to_local_id_encoder = GlobalToLocalNodeMap()
+    feature_int_encoder = feature_int_encoder or global_int_encoder
     unknown_global_id = global_int_encoder.encode("unknown", add_new=False)
     if unknown_global_id == 0:
         unknown_global_id = global_int_encoder.encode("unknown", add_new=True)
+    unknown_feature_id = feature_int_encoder.encode("unknown", add_new=False)
+    if unknown_feature_id == 0:
+        unknown_feature_id = feature_int_encoder.encode("unknown", add_new=True)
     EDGE_SUBJECT_TO_PREDICATE = 0
     EDGE_PREDICATE_TO_OBJECT = 1
     EDGE_FACTOR_TO_PARAM_PREDICATE = 2
@@ -339,25 +351,37 @@ def create_graph(
     if store_node_names and wikidata_cache is None:
         raise ValueError("wikidata_cache is required to store node names")
 
+    def _feature_id(identity_id: int) -> int:
+        if identity_id <= 0:
+            return 0
+        if identity_to_feature is not None:
+            if identity_id < len(identity_to_feature):
+                return int(identity_to_feature[identity_id])
+            return int(unknown_feature_id)
+        if identity_id in global_int_encoder._filtered_ids:
+            return int(unknown_feature_id)
+        try:
+            return int(global_int_encoder.get_unfiltered_global_id(identity_id))
+        except (KeyError, AssertionError):
+            return int(unknown_feature_id)
+
     def get_node_attribute(global_node_id: int, node_text: str | None) -> Any:
         """Get the node attribute for a global node ID."""
+        feature_id = _feature_id(global_node_id)
         if encoding == "text_embedding":
             assert wikidata_cache is not None
             if node_text is not None and node_text != "":
                 return wikidata_cache.get_embedding_for_literal(
                     node_text,
                     dtype=resolved_embedding_dtype,
-                    fallback_id=unknown_global_id,
+                    fallback_id=unknown_feature_id,
                 )
             return wikidata_cache.get_embedding_for_id(
-                global_node_id,
+                feature_id,
                 dtype=resolved_embedding_dtype,
-                fallback_id=unknown_global_id,
+                fallback_id=unknown_feature_id,
             )
-        else:
-            if global_node_id in global_int_encoder._filtered_ids:
-                global_node_id = unknown_global_id
-            return global_int_encoder.get_unfiltered_global_id(global_node_id)
+        return feature_id
 
     def add_edge_from_ids(
         subject_global_id: int,
@@ -603,7 +627,9 @@ def create_graph(
 
     param_property_gid = _maybe_encode_registry_token("<http://www.wikidata.org/entity/P2306>")
     param_relation_gid = _maybe_encode_registry_token("<http://www.wikidata.org/entity/P2309>")
-    param_inverse_gid = _maybe_encode_registry_token("<http://www.wikidata.org/entity/P1696>")
+    # Inverse constraints encode their inverse predicate with the standard
+    # property-constraint parameter P2306.
+    param_inverse_gid = param_property_gid
     default_relation_gids = [
         gid
         for gid in (
@@ -977,25 +1003,40 @@ def create_graph(
         # integer node ids case
         x_tensor = torch.tensor(global_to_local_id_encoder.local_attributes, dtype=torch.long)
 
-    data_graph = Data(
+    target_keys = (
+        "add_subject",
+        "add_predicate",
+        "add_object",
+        "del_subject",
+        "del_predicate",
+        "del_object",
+    )
+    target_identity = [int(graph.get(key) or 0) for key in target_keys]
+    target_feature = [
+        int(graph.get(f"{key}_feature"))
+        if graph.get(f"{key}_feature") is not None
+        else _feature_id(identity_id)
+        for key, identity_id in zip(target_keys, target_identity)
+    ]
+    target_representable = [
+        identity_id == 0 or feature_id != unknown_feature_id
+        for identity_id, feature_id in zip(target_identity, target_feature)
+    ]
+    node_identity_ids = [
+        int(global_to_local_id_encoder.local_to_global[index])
+        for index in range(num_nodes)
+    ]
+
+    data_graph = ConstraintGraphData(
         x=x_tensor,
+        node_identity_id=torch.tensor(node_identity_ids, dtype=torch.long),
         edge_index=torch.tensor(edges, dtype=torch.long).t().contiguous(),
         edge_type=torch.tensor(edge_types, dtype=torch.long),
         edge_index_non_flattened=torch.tensor(edges_non_flattened, dtype=torch.long).t().contiguous(),
         edge_attr_non_flattened=torch.tensor(non_flattened_edge_attributes, dtype=torch.long),
-        y=torch.tensor(
-            [
-                [
-                    _normalize_target_id(graph["add_subject"], global_int_encoder, unknown_global_id),
-                    _normalize_target_id(graph["add_predicate"], global_int_encoder, unknown_global_id),
-                    _normalize_target_id(graph["add_object"], global_int_encoder, unknown_global_id),
-                    _normalize_target_id(graph["del_subject"], global_int_encoder, unknown_global_id),
-                    _normalize_target_id(graph["del_predicate"], global_int_encoder, unknown_global_id),
-                    _normalize_target_id(graph["del_object"], global_int_encoder, unknown_global_id),
-                ]
-            ],
-            dtype=torch.long,
-        ),
+        y=torch.tensor([target_feature], dtype=torch.long),
+        y_identity=torch.tensor([target_identity], dtype=torch.long),
+        target_representable_mask=torch.tensor([target_representable], dtype=torch.bool),
         role_flags=role_flags,
     )
     if include_debug_fields:
@@ -1004,6 +1045,10 @@ def create_graph(
     # Baseline metadata
     # Violating triple in global ID space
     data_graph.focus_triple = torch.tensor([graph["subject"], graph["predicate"], graph["object"]], dtype=torch.long)
+    data_graph.focus_triple_feature = torch.tensor(
+        [_feature_id(int(graph[key])) for key in ("subject", "predicate", "object")],
+        dtype=torch.long,
+    )
     data_graph.shape_id = int(graph["constraint_id"])
     # Standardize on `constraint_type` across the pipeline
     data_graph.constraint_type = str(graph["constraint_type"])
@@ -1144,6 +1189,8 @@ def compute_torch_geometric_objects(
     global_int_encoder: GlobalIntEncoder,
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
+    feature_int_encoder: GlobalIntEncoder | None = None,
+    identity_to_feature: np.ndarray | None = None,
     constraint_scope: Literal["local", "focus"] = "local",
     constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
     primary_constraint_mode: Literal[
@@ -1175,6 +1222,8 @@ def compute_torch_geometric_objects(
             wikidata_cache=wikidata_cache,
             global_int_encoder=global_int_encoder,
             constraint_registry=constraint_registry,
+            feature_int_encoder=feature_int_encoder,
+            identity_to_feature=identity_to_feature,
             encoding=encoding,
             constraint_scope=constraint_scope,
             constraint_representation=constraint_representation,
@@ -1269,13 +1318,17 @@ def _profile_debug_fields_enabled(persistence_profile: str) -> bool:
 def _profile_kept_fields(persistence_profile: str) -> list[str]:
     core_fields = [
         "x",
+        "node_identity_id",
         "edge_index",
         "edge_type",
         "edge_index_non_flattened",
         "edge_attr_non_flattened",
         "y",
+        "y_identity",
+        "target_representable_mask",
         "role_flags",
         "focus_triple",
+        "focus_triple_feature",
         "shape_id",
         "constraint_type",
         "factor_constraint_ids",
@@ -1480,6 +1533,7 @@ def _write_split_manifest(
     primary_constraint_mode: str,
 ) -> None:
     manifest = {
+        "graph_schema_version": GRAPH_SCHEMA_VERSION,
         "split": split,
         "dataset_variant": dataset_variant,
         "encoding": encoding,
@@ -1518,6 +1572,8 @@ def main(
     constraint_registry: Dict[str, Dict[str, Any]],
     encoding: Literal["node_id", "text_embedding"],
     dataset_variant: str,
+    feature_int_encoder: GlobalIntEncoder | None = None,
+    identity_to_feature: np.ndarray | None = None,
     constraint_scope: Literal["local", "focus"] = "local",
     constraint_representation: Literal["factorized", "eswc_passive"] = "factorized",
     primary_constraint_mode: Literal[
@@ -1666,6 +1722,8 @@ def main(
             wikidata_cache,
             global_int_encoder,
             constraint_registry,
+            feature_int_encoder=feature_int_encoder,
+            identity_to_feature=identity_to_feature,
             encoding=encoding,
             constraint_scope=constraint_scope,
             constraint_representation=constraint_representation,
@@ -2043,10 +2101,19 @@ if __name__ == "__main__":
             "Unsafe overwrite mode enabled: writes go directly to destination files and may leave partial outputs on interruption."
         )
 
-    # Load and freeze int encoder
+    # Load semantic identity and model-feature vocabularies. Legacy artifacts
+    # use the same encoder for both roles.
+    identity_path = base_interim_path / IDENTITY_ENCODER_FILENAME
+    feature_path = base_interim_path / FEATURE_ENCODER_FILENAME
+    legacy_path = base_interim_path / LEGACY_ENCODER_FILENAME
     encoder = GlobalIntEncoder()
-    encoder.load(base_interim_path / "globalintencoder.txt")
+    encoder.load(identity_path if identity_path.exists() else legacy_path)
     encoder.freeze()
+    feature_encoder = GlobalIntEncoder()
+    feature_encoder.load(feature_path if feature_path.exists() else legacy_path)
+    feature_encoder.freeze()
+    mapping_path = base_interim_path / IDENTITY_TO_FEATURE_FILENAME
+    identity_to_feature = np.load(mapping_path) if mapping_path.exists() else None
 
     registry_candidates = []
     if args.registry_dataset:
@@ -2089,6 +2156,8 @@ if __name__ == "__main__":
         constraint_registry=constraint_registry,
         encoding=args.encoding,
         dataset_variant=dataset_variant,
+        feature_int_encoder=feature_encoder,
+        identity_to_feature=identity_to_feature,
         constraint_scope=args.constraint_scope,
         constraint_representation=args.constraint_representation,
         primary_constraint_mode=args.primary_constraint_mode,

@@ -166,10 +166,24 @@ def _infer_experiment_kind(config: dict[str, Any]) -> str:
     return "proposal"
 
 
-def _build_train_command(kind: str, experiment_config: Path) -> List[str]:
+def _build_train_command(kind: str, experiment_config: Path, *, seed: int) -> List[str]:
     if kind == "reranker":
-        return [sys.executable, "src/08_train_reranker.py", "--experiment-config", str(experiment_config)]
-    return [sys.executable, "src/07_train.py", "--experiment-config", str(experiment_config)]
+        return [
+            sys.executable,
+            "src/08_train_reranker.py",
+            "--experiment-config",
+            str(experiment_config),
+            "--seed",
+            str(seed),
+        ]
+    return [
+        sys.executable,
+        "src/07_train.py",
+        "--experiment-config",
+        str(experiment_config),
+        "--seed",
+        str(seed),
+    ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,6 +198,11 @@ def parse_args() -> argparse.Namespace:
         "--keep-going",
         action="store_true",
         help="Continue running remaining experiments after failures.",
+    )
+    parser.add_argument(
+        "--force-retrain",
+        action="store_true",
+        help="Train even when checkpoint.pth already exists in the experiment directory.",
     )
     parser.add_argument(
         "--verbose",
@@ -205,6 +224,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable strict global metrics and per-constraint CSV for paper experiments.",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Training seed recorded in run provenance.")
     return parser.parse_args()
 
 
@@ -253,7 +273,7 @@ def main() -> int:
             logger.info("Skipping %s (filter --only=%s)", model_dir.name, args.only)
             continue
 
-        if checkpoint_path.exists():
+        if checkpoint_path.exists() and not args.force_retrain:
             logger.info("Checkpoint already exists at %s; skipping", checkpoint_path)
             record = {
                 "model_dir": str(model_dir),
@@ -335,6 +355,8 @@ def main() -> int:
                         return 1
             write_history(record)
             continue
+        if checkpoint_path.exists():
+            logger.warning("Force-retraining %s over its existing checkpoint.", model_dir.name)
 
         try:
             cfg = load_config(config_path)
@@ -403,7 +425,7 @@ def main() -> int:
 
         run_name = sanitize_run_name(model_dir)
         raw_log_path = RAW_LOG_DIR / f"{run_name}.log"
-        command = _build_train_command(kind, config_path)
+        command = _build_train_command(kind, config_path, seed=args.seed)
 
         logger.info(
             "Launching training | experiment=%s kind=%s model=%s dataset=%s encoding=%s",

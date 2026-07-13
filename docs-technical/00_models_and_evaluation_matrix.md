@@ -23,7 +23,8 @@ This document defines the canonical paper-facing suite implemented in the reposi
 
 ### A1 Factorized Imitation
 - Uses `constraint_representation="factorized"`.
-- Keeps the factorized graph, per-type factor executors, and per-role pressure, but trains only with edit imitation plus auxiliary factor supervision.
+- Keeps the factorized graph, per-type factor executors, and shared role-pressure blocks, but trains only with edit imitation plus auxiliary factor supervision.
+- This promotes the architecture first evaluated as `h2_a1_shared_pressure`: the role-pressure subsystem falls from 41,829,600 to 1,442,400 parameters (96.6%) with slightly better historical evaluation metrics. Those historical metrics are selection evidence, not final schema-v2 results.
 - Answers whether factorized local constraint context helps before any safety-aware decision objective.
 
 ### M1C Safe Factor Chooser
@@ -51,6 +52,7 @@ The default paper-facing generator should enforce these settings for `A1`, `M1C`
 - graph path: multi-relational / edge-attribute regime
 - encoding: whichever dataset artifact is selected, typically frozen text embeddings when available
 - role embeddings: enabled
+- role-pressure module sharing: `shared`
 - dynamic per-type reweighting: fixed by the locked winning `M1C` configuration
 - fix-probability loss: disabled
 - factor-loss-only training: disabled
@@ -87,15 +89,15 @@ Appendix or exploratory variants such as policy-choice, factor-loss-only, untype
 - `A1 -> M1D`: direct-loss safe selection
 
 ### Required metrics
-- historical fidelity: precision / recall / micro-F1
-- primary fix rate
+- strict identity fidelity: precision / recall / micro-F1, plus feature-space and representability diagnostics
+- primary fix rate defined as a pre-checkable/pre-violated to post-checkable/post-satisfied transition
 - global fix rate (`GFR`)
 - secondary regression rate (`SRR`)
 - secondary improvement rate (`SIR`)
 - disruption / edit-minimality metrics
 
 ### Evaluation rule
-- `M1C`, `M1D`, and `G0` must share the same candidate-level symbolic evaluator contract so reported safety metrics are definitionally aligned.
+- All systems use the shared constraint semantics module. `M1C`, `M1D`, and `G0` must use inference candidate generation that has no gold-target input. SRR/SIR headlines are pooled numerator/denominator ratios; defined-sample macro values are diagnostics.
 
 ## H2 appendix diagnostics
 
@@ -116,8 +118,13 @@ Factor semantic rows report support, positive rate, accuracy, precision, recall,
 The H2 ablations are appendix/supporting runs. They are not canonical main-suite models and should be trained only into new run directories:
 
 - `h2_a1_no_factor_loss__<variant>__<encoding>`: A1-style factorized graph and pressure, but disables auxiliary factor satisfaction loss.
-- `h2_a1_shared_pressure__<variant>__<encoding>`: keeps factor pressure enabled but shares role pressure modules across factor types through `pressure_module_sharing="shared"`.
+- `h2_a1_per_type_pressure__<variant>__<encoding>`: restores the former per-type role-pressure parameterization as the reverse ablation against canonical shared-pressure A1.
 - `h2_a1_legacy_shared_executor__<variant>__<encoding>`: uses the older shared factor executor path through `factor_executor_impl="legacy_shared"`.
 - `h2_a1_gold_scalar_pressure__<variant>__<encoding>`: A1-style factorized graph and pressure, but appends the gold pre-repair factor violation scalar to pressure messages through `pressure_oracle_input="gold_pre_scalar"`.
 
 All four use current processed factorized graphs, A1-style slot inference, no chooser, and no direct safety objective. The gold-scalar run is an oracle diagnostic only, not a deployable model.
+
+The existing `h2_a1_shared_pressure__*` directory is historical selection
+provenance and its config is disabled for scheduler discovery. Its architecture
+is now canonical A1, so new config generation does not create it as a separate
+ablation.

@@ -4776,7 +4776,7 @@
       98872
     ],
     "pressure_enabled": true,
-    "pressure_module_sharing": "per_type",
+    "pressure_module_sharing": "shared",
     "pressure_residual_scale": 0.1,
     "pressure_type_conditioning": "concat",
     "role_embedding_dim": 16,

@@ -1,5 +1,9 @@
 # Primary-Query Factor Experiments: 10-Epoch Review
 
+> Historical diagnostic only. These runs predate schema-v2 identity, semantics,
+> candidate, and metric fixes. Their numbers and conclusions require a clean
+> rerun; see [09_paper_narrative_after_integrity_remediation.md](09_paper_narrative_after_integrity_remediation.md).
+
 This note reviews the primary-query factor experiments.
 The completed 10-epoch runs are:
 

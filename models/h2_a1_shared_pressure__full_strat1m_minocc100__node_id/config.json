@@ -1,4 +1,6 @@
 {
+  "disabled": true,
+  "historical_status": "Promoted to canonical A1; retained as pre-schema-v2 selection provenance.",
   "model_config": {
     "constraint_representation": "factorized",
     "dataset_variant": "full_strat1m_minocc100",

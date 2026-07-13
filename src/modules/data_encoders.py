@@ -10,6 +10,15 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 from torch_geometric.data import Data
 
+
+DATASET_SCHEMA_VERSION = 2
+GRAPH_SCHEMA_VERSION = 2
+FEATURE_COLUMN_SUFFIX = "_feature"
+IDENTITY_ENCODER_FILENAME = "identity_encoder.txt"
+FEATURE_ENCODER_FILENAME = "feature_encoder.txt"
+LEGACY_ENCODER_FILENAME = "globalintencoder.txt"
+IDENTITY_TO_FEATURE_FILENAME = "identity_to_feature.npy"
+
 ROLE_NONE = 0
 ROLE_SUBJECT = 1  # 0b001
 ROLE_PREDICATE = 2  # 0b010
@@ -44,6 +53,32 @@ class GraphArtifactInfo(NamedTuple):
     format: str
 
 
+class ConstraintGraphData(Data):
+    """PyG graph with explicit batching rules for local node references."""
+
+    _NODE_INDEX_FIELDS = frozenset(
+        {
+            "edge_attr_non_flattened",
+            "factor_node_index",
+            "passive_primary_node_index",
+        }
+    )
+    _GRAPH_LOCAL_FIELDS = frozenset(
+        {
+            "primary_factor_index",
+            "eval_primary_factor_index",
+            "context_index",
+        }
+    )
+
+    def __inc__(self, key: str, value: Any, *args: Any, **kwargs: Any) -> Any:
+        if key in self._NODE_INDEX_FIELDS:
+            return int(self.num_nodes or 0)
+        if key in self._GRAPH_LOCAL_FIELDS:
+            return 0
+        return super().__inc__(key, value, *args, **kwargs)
+
+
 def _torch_load_trusted(path: Path) -> Any:
     """Load trusted local torch artifacts with PyTorch 2.6+ compatibility."""
     return torch.load(path, map_location="cpu", weights_only=False)
@@ -75,6 +110,31 @@ SEQUENCE_FEATURES: tuple[str, ...] = (
     "other_entity_predicates",
     "other_entity_objects",
 )
+
+
+def feature_column(column: str) -> str:
+    """Return the model-feature companion for an identity-bearing column."""
+    return f"{column}{FEATURE_COLUMN_SUFFIX}"
+
+
+def encoder_path(root: Path, *, identity: bool) -> Path:
+    """Resolve a v2 encoder path, with a legacy feature-encoder fallback."""
+    preferred = root / (IDENTITY_ENCODER_FILENAME if identity else FEATURE_ENCODER_FILENAME)
+    if preferred.exists():
+        return preferred
+    legacy = root / LEGACY_ENCODER_FILENAME
+    if legacy.exists():
+        return legacy
+    return preferred
+
+
+def load_encoder(root: Path, *, identity: bool) -> "GlobalIntEncoder":
+    resolved = encoder_path(root, identity=identity)
+    if not resolved.exists():
+        raise FileNotFoundError(f"Encoder not found at {resolved}")
+    encoder = GlobalIntEncoder()
+    encoder.load(resolved)
+    return encoder
 
 
 class GlobalIntEncoder:

@@ -27,7 +27,11 @@ The downloader also ensures `data/.gitignore` exists to keep large artifacts unt
 
 **Artifacts**
 - `df_train.parquet`, `df_val.parquet`, `df_test.parquet`
-- `globalintencoder.txt` (pickled `GlobalIntEncoder`)
+- `identity_encoder.txt` (lossless semantic vocabulary)
+- `feature_encoder.txt` (training-frequency-filtered vocabulary)
+- `identity_to_feature.npy`
+- `globalintencoder.txt` (compatibility alias of the feature encoder)
+- `dataset_manifest.json` (schema v2, split/row/source/output hashes)
 
 ### 3.1 Parquet Schema
 Each dataframe row represents one constraint violation instance with the fields below.
@@ -39,6 +43,9 @@ Each dataframe row represents one constraint violation instance with the fields 
 - `add_subject`, `add_predicate`, `add_object`
 - `del_subject`, `del_predicate`, `del_object`
 
+Every listed scalar also has a `<name>_feature` companion. The original column
+is an identity ID; the companion is a model feature ID.
+
 **Sequence features (object arrays of int lists)**
 - `constraint_predicates`, `constraint_objects`
 - `subject_predicates`, `subject_objects`
@@ -47,14 +54,19 @@ Each dataframe row represents one constraint violation instance with the fields 
 - `local_constraint_ids`
 - `local_constraint_ids_focus`
 
+The first eight model-bearing sequence pairs also have `_feature` companions.
+Local constraint ID lists remain semantic identities.
+
 **Text / string features**
 - `constraint_type` (string, e.g. `conflictWith`)
 - `object_text` (literal text or empty string)
 - `other_object_text` (literal text or empty string)
 
 ### 3.2 Semantics
-- All IDs are encoded by the shared `GlobalIntEncoder`.
-- Literal objects are recorded in `*_text` fields; their numeric IDs may be `0`.
+- Identity IDs are never frequency filtered. Feature IDs are computed from
+  training-only occurrence counts; rare identities map to feature `unknown`.
+- Literal objects are recorded in `*_text` fields and retain a distinct raw-token
+  identity ID. Rare literals may share the feature-space `unknown` ID only.
 - `local_constraint_ids` is the union of:
   - the row’s `constraint_id`, and
   - every constraint attached to predicates in the local neighborhood (`P_local`).
@@ -81,12 +93,13 @@ mapping each constraint id to:
 ## 4b) Stratified Benchmark Variant (`02b_stratified_benchmark_sampler.py`)
 **Location:** `data/interim/<derived_variant>/`
 
-The paper-facing derived benchmark is `full_strat1m_minocc100`, produced from
-`full_minocc100` by deterministic stratified sampling.
+The paper-facing derived benchmark is `full_strat1m_minocc100`, produced from a
+validated/primary-filtered full variant by deterministic exact-size stratified sampling.
 
 **Artifacts**
 - `df_train.parquet`, `df_val.parquet`, `df_test.parquet`
-- `globalintencoder.txt` copied unchanged from the source variant
+- the complete identity/feature encoder contract copied unchanged
+- parent-linked `dataset_manifest.json`
 - `sampling_report.csv`, `sampling_report.md`, `sampling_metadata.json`
 - `hist_local_constraint_ids.csv`
 - `hist_local_constraint_ids_by_split.csv`
@@ -97,9 +110,9 @@ num_attached_constraints = len(local_constraint_ids)
 ```
 
 Default bins are `1-32`, `33-64`, `65-83`, `84-107`, `108`,
-`109-160`, `161-267`, and `268+`. The default paper slice samples 50%
-from each non-empty stratum with seed `42`, keeping at least one row per
-non-empty stratum.
+`109-160`, `161-267`, and `268+`. The paper run uses
+`--target-rows 1000000 --seed 42`; proportional allocation yields exactly one
+million retained rows while keeping at least one row per represented stratum.
 
 ## 5) Wikidata Text Cache (`04_wikidata_retriever.py`)
 **Location:** `data/interim/wikidata_text.parquet`
@@ -127,13 +140,17 @@ re-run.
 
 **Data object fields**
 - `x`: node features (float embeddings or int IDs)
+- `node_identity_id`: semantic identity for each local node
 - `edge_index`: flattened edges `(subject -> predicate -> object)`
 - `edge_type`: integer edge types for base vs factor wiring
 - `edge_index_non_flattened`, `edge_attr_non_flattened`: subject→object edges + predicate attributes
-- `y`: `(1, 6)` tensor `[add_s, add_p, add_o, del_s, del_p, del_o]`
+- `y`: `(1, 6)` feature-space training target
+- `y_identity`: `(1, 6)` strict semantic target
+- `target_representable_mask`: whether each identity target survived feature filtering
 - `x_names`: optional node name list (used when debugging)
 - `role_flags`: bitmask for focus subject/predicate/object nodes
 - `focus_triple`: global IDs of the focus triple `(s, p, o)`
+- `focus_triple_feature`: feature IDs for the same focus triple
 - `shape_id`: the encoded `constraint_id`
 - `constraint_type`: string (e.g., `conflictWith`)
 - `constraint_representation`: `factorized` or `eswc_passive`
@@ -174,6 +191,8 @@ re-run.
 - `coverage_<scope>.csv`, `coverage_<scope>.md`
 - `filtered_factors_<scope>.csv`, `filtered_factors_<scope>.md`
 - `filtered_factor_families_<scope>.csv`
+- `primary_validation_audit.csv`
+- `dataset_manifest.json`
 
 **Additional parquet columns**
 - `factor_checkable_pre`, `factor_satisfied_pre`
@@ -182,13 +201,17 @@ re-run.
 - `factor_constraint_ids`
 - `num_checkable_factors_pre`, `coverage_pre`
 - `num_checkable_factors_post_gold`, `coverage_post_gold`
+- `primary_factor_index`, `primary_checkable_pre`, `primary_satisfied_pre`
+- `primary_checkable_post_gold`, `primary_satisfied_post_gold`
+- `primary_validation_reason`
 
 The labeler can operate on either `local_constraint_ids` or
 `local_constraint_ids_focus`, controlled by `--constraint-scope`.
 By default, `--factor-family-policy supported_only` keeps raw local-closure
-columns unchanged but writes only supported executable secondary constraints to
-`factor_constraint_ids` and aligned label arrays. Unsupported primary
-constraints, if any, are retained and marked not checkable.
+columns unchanged but writes only supported executable constraints to aligned
+factor arrays. Paper data additionally uses `--filter-invalid-primary`, which
+excludes every primary that is exempt, out of scope, unsupported, uncheckable,
+or already satisfied and records the reason.
 When this directory exists, `06_graph.py` uses it automatically unless
 `--use-unlabeled-interim` is passed.
 

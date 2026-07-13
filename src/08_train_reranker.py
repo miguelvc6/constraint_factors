@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from torch import nn
 from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
@@ -17,6 +18,7 @@ from torch_geometric.loader import DataLoader
 
 from modules.config import ModelConfig
 from modules.data_encoders import (
+    IDENTITY_TO_FEATURE_FILENAME,
     GlobalIntEncoder,
     GraphStreamDataset,
     base_dataset_name,
@@ -24,6 +26,7 @@ from modules.data_encoders import (
     discover_graph_artifacts,
     graph_dataset_filename,
     infer_node_feature_spec,
+    load_encoder,
 )
 from modules.model_store import (
     available_config_tags,
@@ -34,9 +37,22 @@ from modules.model_store import (
 )
 from modules.models import build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
-from modules.candidates import CandidateConfig, build_candidates
+from modules.candidates import (
+    CandidateConfig,
+    RepairCandidate,
+    build_inference_candidates,
+    build_training_candidates,
+    candidate_feature_tuples,
+    candidate_identity_tuples,
+)
 from modules.reranker import CandidateReranker, RerankerConfig, build_reranker
 from modules.reranker_eval import CandidateConstraintEvaluator
+from modules.provenance import (
+    build_run_provenance,
+    canonical_json_hash,
+    file_sha256,
+    write_run_manifest,
+)
 from modules.training_utils import (
     load_graph_dataset,
     placeholder_ids_from_encoder,
@@ -219,11 +235,21 @@ def _write_effective_experiment_config(
         fh.write("\n")
 
 
-def _load_encoder(interim_path: Path) -> GlobalIntEncoder:
-    encoder = GlobalIntEncoder()
-    encoder.load(interim_path / "globalintencoder.txt")
+def _load_encoder(interim_path: Path, *, identity: bool) -> GlobalIntEncoder:
+    encoder = load_encoder(interim_path, identity=identity)
     encoder.freeze()
     return encoder
+
+
+def _load_identity_to_feature(interim_path: Path) -> np.ndarray | None:
+    path = interim_path / IDENTITY_TO_FEATURE_FILENAME
+    if not path.exists():
+        logger.warning("Identity-to-feature map not found at %s; assuming legacy shared IDs.", path)
+        return None
+    mapping = np.load(path)
+    if mapping.ndim != 1:
+        raise ValueError(f"Expected a 1D identity-to-feature map at {path}, got {mapping.shape}")
+    return mapping
 
 
 def _load_parquet_rows(interim_path: Path, split: str) -> list:
@@ -428,31 +454,44 @@ def _topk_triples_from_logits(
 
 def _build_candidates(
     *,
-    graph: Data,
+    graph: Data | None,
     context: ViolationContext,
     heuristics: ConstraintRepairHeuristics,
     proposal_logits: torch.Tensor,
     cfg: RerankerTrainingConfig,
     placeholder_ids: set[int],
     num_target_ids: int,
-) -> tuple[list[tuple[int, int, int, int, int, int]], int]:
+    identity_to_feature: Sequence[int] | None,
+    training: bool,
+) -> tuple[list[RepairCandidate], int]:
     candidate_cfg = CandidateConfig(
         topk_candidates=cfg.topk_candidates,
         topk_per_slot=cfg.topk_per_slot,
         heuristic_max_candidates=cfg.heuristic_max_candidates,
         heuristic_max_values=cfg.heuristic_max_values,
-        include_gold=cfg.include_gold,
+        force_include_gold_train=cfg.include_gold,
         max_candidates_total=cfg.max_candidates_total,
     )
-    return build_candidates(
-        graph=graph,
+    common = dict(
         context=context,
         heuristics=heuristics,
         proposal_logits=proposal_logits,
         cfg=candidate_cfg,
         placeholder_ids=placeholder_ids,
         num_target_ids=num_target_ids,
+        identity_to_feature=identity_to_feature,
     )
+    if training:
+        if graph is None:
+            raise ValueError("Training candidate construction requires a graph target.")
+        candidates, gold_index = build_training_candidates(graph=graph, **common)
+        if gold_index < 0:
+            raise RuntimeError(
+                "Gold candidate is absent from the supervised candidate set; "
+                "set training_config.include_gold=true or revise the training objective."
+            )
+        return candidates, gold_index
+    return build_inference_candidates(**common), -1
 
 
 def _evaluate_candidate_set(
@@ -542,6 +581,7 @@ def _predict_reranker_edits(
     evaluator: CandidateConstraintEvaluator,
     device: torch.device,
     cfg: RerankerTrainingConfig,
+    identity_to_feature: Sequence[int] | None,
 ) -> list[dict[str, list[int]]]:
     model.eval()
     proposal_model.eval()
@@ -567,18 +607,22 @@ def _predict_reranker_edits(
             context = contexts[context_index]
             row = rows[context_index]
             candidates, _ = _build_candidates(
-                graph=graph,
+                graph=None,
                 context=context,
                 heuristics=heuristics,
                 proposal_logits=proposal_logits[idx],
                 cfg=cfg,
                 placeholder_ids=set(heuristics.placeholder_ids.values()),
                 num_target_ids=model.num_target_ids,
+                identity_to_feature=identity_to_feature,
+                training=False,
             )
-            candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=device)
+            candidate_tensor = torch.tensor(
+                candidate_feature_tuples(candidates), dtype=torch.long, device=device
+            )
             scores = model.score_candidates(graph_emb[idx], candidate_tensor)
             best_idx = int(torch.argmax(scores).item())
-            best_candidate = _candidate_to_slots(candidates[best_idx])
+            best_candidate = _candidate_to_slots(candidates[best_idx].identity_slots)
             predictions.append(_candidate_slots_to_actions(best_candidate))
             _ = evaluator  # keep evaluator in signature for future diagnostics
 
@@ -596,6 +640,7 @@ def _run_epoch(
     evaluator: CandidateConstraintEvaluator,
     device: torch.device,
     cfg: RerankerTrainingConfig,
+    identity_to_feature: Sequence[int] | None,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> tuple[float, dict[str, float]]:
     is_train = optimizer is not None
@@ -629,15 +674,19 @@ def _run_epoch(
                 cfg=cfg,
                 placeholder_ids=set(heuristics.placeholder_ids.values()),
                 num_target_ids=model.num_target_ids,
+                identity_to_feature=identity_to_feature,
+                training=True,
             )
-            candidate_tensor = torch.tensor(candidates, dtype=torch.long, device=device)
+            candidate_tensor = torch.tensor(
+                candidate_feature_tuples(candidates), dtype=torch.long, device=device
+            )
             scores = model.score_candidates(graph_emb[idx], candidate_tensor)
             log_probs = F.log_softmax(scores, dim=0)
             probs = log_probs.exp()
 
             metrics_summary = evaluator.evaluate_candidate_metrics(
                 row,
-                candidates=candidates,
+                candidates=candidate_identity_tuples(candidates),
                 primary_factor_index=int(getattr(graph, "primary_factor_index", 0)),
             )
 
@@ -750,10 +799,12 @@ def main() -> None:
     train_graph_count = _dataset_graph_count(train_data, train_path)
     val_graph_count = _dataset_graph_count(val_data, val_path)
 
-    encoder = _load_encoder(interim_path)
-    placeholder_ids = placeholder_ids_from_encoder(encoder)
+    feature_encoder = _load_encoder(interim_path, identity=False)
+    identity_encoder = _load_encoder(interim_path, identity=True)
+    identity_to_feature = _load_identity_to_feature(interim_path)
+    placeholder_ids = placeholder_ids_from_encoder(identity_encoder)
     heuristics = ConstraintRepairHeuristics(
-        encoder=encoder,
+        encoder=identity_encoder,
         placeholder_ids=placeholder_ids,
         none_class=NONE_CLASS_INDEX,
     )
@@ -795,7 +846,7 @@ def main() -> None:
 
     evaluator = CandidateConstraintEvaluator(
         str(registry_path),
-        encoder=encoder if use_encoded_ids else None,
+        encoder=identity_encoder if use_encoded_ids else None,
         assume_complete=training_cfg.assume_complete_entity_facts,
         constraint_scope=training_cfg.constraint_scope,
         use_encoded_ids=use_encoded_ids,
@@ -803,11 +854,11 @@ def main() -> None:
 
     use_node_embeddings, feature_dim, _, role_spec = infer_node_feature_spec(train_data)
 
-    vocab_from_filtered = len(encoder._global_id_to_unfiltered_global_id)
+    vocab_from_filtered = len(feature_encoder._global_id_to_unfiltered_global_id)
     if vocab_from_filtered > 0:
         num_input_graph_nodes = vocab_from_filtered + 1
     else:
-        num_input_graph_nodes = len(encoder._encoding) + 1
+        num_input_graph_nodes = len(feature_encoder._encoding) + 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     proposal_model = _load_proposal_model(
@@ -926,6 +977,7 @@ def main() -> None:
                 evaluator=evaluator,
                 device=device,
                 cfg=training_cfg,
+                identity_to_feature=identity_to_feature,
                 optimizer=optimizer,
             )
             val_loss, val_metrics = _run_epoch(
@@ -938,6 +990,7 @@ def main() -> None:
                 evaluator=evaluator,
                 device=device,
                 cfg=training_cfg,
+                identity_to_feature=identity_to_feature,
             )
 
             scheduler.step(val_loss)
@@ -970,6 +1023,13 @@ def main() -> None:
                         "model_cfg": model_cfg.to_dict(),
                         "training_cfg": training_cfg.to_dict(),
                         "reranker_cfg": reranker_cfg.to_dict(),
+                        "provenance": {
+                            "schema_version": 1,
+                            "seed": int(args.seed),
+                            "model_config_sha256": canonical_json_hash(model_cfg.to_dict()),
+                            "training_config_sha256": canonical_json_hash(training_cfg.to_dict()),
+                            "reranker_config_sha256": canonical_json_hash(reranker_cfg.to_dict()),
+                        },
                     },
                     model_path,
                 )
@@ -977,6 +1037,36 @@ def main() -> None:
             if epoch - best_epoch >= training_cfg.early_stopping_rounds:
                 logger.info("Early stopping at epoch %s", epoch + 1)
                 break
+
+        checkpoint_path = get_checkpoint_path(run_dir)
+        if checkpoint_path.exists():
+            proposal_checkpoint_path = _resolve_proposal_checkpoint(
+                proposal_cfg,
+                model_cfg=model_cfg,
+            )
+            run_manifest = build_run_provenance(
+                repository_root=Path(__file__).resolve().parents[1],
+                config_path=args.experiment_config,
+                checkpoint_path=checkpoint_path,
+                model=model,
+                seed=args.seed,
+                dataset_manifest_path=interim_path / "dataset_manifest.json",
+                graph_manifest_paths=[
+                    train_path.with_suffix(train_path.suffix + ".manifest.json"),
+                    val_path.with_suffix(val_path.suffix + ".manifest.json"),
+                ],
+                extra={
+                    "dataset_variant": dataset_variant,
+                    "encoding": model_cfg.encoding,
+                    "proposal_config": proposal_cfg,
+                    "proposal_checkpoint": {
+                        "path": str(proposal_checkpoint_path),
+                        "sha256": file_sha256(proposal_checkpoint_path),
+                    },
+                },
+            )
+            manifest_path = write_run_manifest(run_dir, run_manifest)
+            logger.info("Saved run provenance to %s", manifest_path)
 
     history_file = history_path(run_dir)
     with history_file.open("w", encoding="utf-8") as fh:
@@ -1030,6 +1120,7 @@ def main() -> None:
                     evaluator=evaluator,
                     device=device,
                     cfg=training_cfg,
+                    identity_to_feature=identity_to_feature,
                 )
                 pred_path = run_dir / "reranker_predictions.json"
                 with pred_path.open("w", encoding="utf-8") as fh:

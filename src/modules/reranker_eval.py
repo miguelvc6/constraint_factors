@@ -1,10 +1,8 @@
 
 
 from dataclasses import dataclass
-import json
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 
-import pandas as pd
 import numpy as np
 
 from modules.constraint_checkers import (
@@ -12,16 +10,16 @@ from modules.constraint_checkers import (
     ConstraintInstance,
     EvidenceState,
     evaluate_constraint,
-    normalize_property_id,
-    normalize_token,
+)
+from modules.constraint_semantics import (
+    RegistryEntry,
+    build_constraint_instance as build_registry_constraint_instance,
+    load_registry,
+    lookup_registry_entry,
+    resolve_registry_id,
+    resolve_registry_mapping,
 )
 from modules.data_encoders import GlobalIntEncoder
-
-PARAM_P2306 = "P2306"
-PARAM_P2309 = "P2309"
-PARAM_P2308 = "P2308"
-PARAM_P2305 = "P2305"
-PARAM_P1696 = "P1696"
 
 PLACEHOLDER_LABELS: tuple[str, ...] = (
     "subject",
@@ -33,19 +31,6 @@ PLACEHOLDER_LABELS: tuple[str, ...] = (
 )
 
 _EMPTY_MISSING_EDITS = frozenset()
-
-
-@dataclass(frozen=True)
-class RegistryEntry:
-    constraint_type_raw: str
-    constraint_type_item: str
-    constraint_type_index: int
-    constraint_family: str
-    constraint_label: str
-    constraint_family_supported: bool
-    constrained_property_raw: str
-    param_predicates_raw: Tuple[str, ...]
-    param_objects_raw: Tuple[str, ...]
 
 
 @dataclass
@@ -128,74 +113,11 @@ class _ReusableEvidenceState:
 def _load_registry(path: str | None) -> Dict[str, RegistryEntry]:
     if path is None:
         return {}
-    registry_df = pd.read_parquet(path)
-    registry_json = registry_df["registry_json"].iloc[0]
-    if isinstance(registry_json, str):
-        registry = json.loads(registry_json)
-    else:
-        registry = registry_json
-    type_items = sorted(
-        {
-            str(entry.get("constraint_type_item", "")).strip()
-            for entry in registry.values()
-            if str(entry.get("constraint_type_item", "")).strip()
-        }
-    )
-    fallback_type_index = {type_item: idx for idx, type_item in enumerate(type_items)}
-    parsed: Dict[str, RegistryEntry] = {}
-    for constraint_id, entry in registry.items():
-        constraint_family = entry.get("constraint_family")
-        if not constraint_family:
-            constraint_family = entry.get("constraint_type_name", "")
-        constraint_family_supported = entry.get("constraint_family_supported")
-        if constraint_family_supported is None:
-            constraint_family_supported = entry.get("constraint_type_supported", False)
-        constraint_type_item = str(entry.get("constraint_type_item", ""))
-        constraint_type_index = entry.get("constraint_type_index")
-        if constraint_type_index is None:
-            constraint_type_index = fallback_type_index.get(constraint_type_item.strip(), -1)
-        parsed[constraint_id] = RegistryEntry(
-            constraint_type_raw=str(entry.get("constraint_type", "")),
-            constraint_type_item=constraint_type_item,
-            constraint_type_index=int(constraint_type_index),
-            constraint_family=str(constraint_family or ""),
-            constraint_label=str(entry.get("constraint_label", "")),
-            constraint_family_supported=bool(constraint_family_supported),
-            constrained_property_raw=str(entry.get("constrained_property", "")),
-            param_predicates_raw=tuple(entry.get("param_predicates") or ()),
-            param_objects_raw=tuple(entry.get("param_objects") or ()),
-        )
-    return parsed
+    return load_registry(path)
 
 
 def _resolve_registry_id(raw_id: str | None, encoder: GlobalIntEncoder | None) -> int:
-    if encoder is None or not raw_id:
-        return 0
-    raw = raw_id.strip()
-    if raw.startswith("<") and raw.endswith(">"):
-        raw = raw[1:-1].strip()
-    if raw.startswith("http://www.wikidata.org/prop/direct/"):
-        raw = raw.replace("http://www.wikidata.org/prop/direct/", "http://www.wikidata.org/entity/")
-    candidates: List[str] = []
-    seen: Set[str] = set()
-    if raw.startswith("http://") or raw.startswith("https://"):
-        candidates.extend([raw, f"<{raw}>"])
-        tail = raw.rsplit("/", 1)[-1]
-        if tail and tail[0] in ("P", "Q") and tail[1:].isdigit():
-            candidates.append(tail)
-    else:
-        if raw and raw[0] in ("P", "Q") and raw[1:].isdigit():
-            entity_uri = f"http://www.wikidata.org/entity/{raw}"
-            candidates.extend([entity_uri, f"<{entity_uri}>"])
-        candidates.append(raw)
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        token_id = encoder.encode(candidate, add_new=False)
-        if token_id:
-            return token_id
-    return 0
+    return resolve_registry_id(raw_id, encoder)
 
 
 def _resolve_registry_mapping(
@@ -204,21 +126,11 @@ def _resolve_registry_mapping(
     encoder: GlobalIntEncoder | None,
     use_encoded_ids: bool,
 ) -> Dict[int, RegistryEntry] | Dict[str, RegistryEntry]:
-    if use_encoded_ids:
-        if encoder is None:
-            raise ValueError("Encoder required to map registry constraint ids to dataset ids.")
-        mapped: Dict[int, RegistryEntry] = {}
-        for constraint_id, entry in registry.items():
-            cid = _resolve_registry_id(constraint_id, encoder)
-            if cid == 0:
-                continue
-            mapped[cid] = entry
-        return mapped
-    mapped_str: Dict[str, RegistryEntry] = {}
-    for constraint_id, entry in registry.items():
-        key = normalize_token(constraint_id) or constraint_id
-        mapped_str[key] = entry
-    return mapped_str
+    return resolve_registry_mapping(
+        registry,
+        encoder=encoder,
+        use_encoded_ids=use_encoded_ids,
+    )
 
 
 def _lookup_registry_entry(
@@ -227,14 +139,11 @@ def _lookup_registry_entry(
     *,
     use_encoded_ids: bool,
 ) -> RegistryEntry | None:
-    if use_encoded_ids:
-        try:
-            cid = int(constraint_id)
-        except (TypeError, ValueError):
-            return None
-        return registry_by_id.get(cid)  # type: ignore[arg-type]
-    key = normalize_token(str(constraint_id)) or str(constraint_id)
-    return registry_by_id.get(key)  # type: ignore[arg-type]
+    return lookup_registry_entry(
+        constraint_id,
+        registry_by_id,
+        use_encoded_ids=use_encoded_ids,
+    )
 
 
 def _coerce_sequence(value: Any, *, cast_int: bool = True) -> List[Any]:
@@ -422,6 +331,20 @@ def _build_facts_state(
     facts_by_entity: Dict[int, Dict[int, Set[int]]] = {}
     predicates_present: Dict[int, Set[int]] = {}
 
+    def _merge_entity(entity_id: Any, facts: Dict[Any, Set[Any]], present: Set[Any]) -> None:
+        if entity_id in (None, "", 0):
+            return
+        target = facts_by_entity.setdefault(entity_id, {})
+        for pred, values in facts.items():
+            target.setdefault(pred, set()).update(values)
+        predicates_present.setdefault(entity_id, set()).update(present)
+
+    def _add_explicit_statement(entity_id: Any, predicate_id: Any, object_value: Any) -> None:
+        if entity_id in (None, "", 0) or predicate_id in (None, "", 0) or object_value in (None, "", 0):
+            return
+        facts_by_entity.setdefault(entity_id, {}).setdefault(predicate_id, set()).add(object_value)
+        predicates_present.setdefault(entity_id, set()).add(predicate_id)
+
     subject_id = _coerce_value(getattr(row, "subject", None), cast_int=cast_int)
     object_id = _coerce_value(getattr(row, "object", None), cast_int=cast_int)
     other_entity_id = _pick_other_entity_id(row, cast_int=cast_int)
@@ -431,8 +354,7 @@ def _build_facts_state(
     subject_facts, subject_present = _build_facts_for_entity(
         subject_preds, subject_objs, p_local=p_local, cast_int=cast_int
     )
-    facts_by_entity[subject_id] = subject_facts
-    predicates_present[subject_id] = subject_present
+    _merge_entity(subject_id, subject_facts, subject_present)
 
     if object_id not in (None, "", 0):
         object_preds = getattr(row, "object_predicates", None)
@@ -440,8 +362,7 @@ def _build_facts_state(
         object_facts, object_present = _build_facts_for_entity(
             object_preds, object_objs, p_local=p_local, cast_int=cast_int
         )
-        facts_by_entity[object_id] = object_facts
-        predicates_present[object_id] = object_present
+        _merge_entity(object_id, object_facts, object_present)
 
     if other_entity_id not in (None, "", 0):
         other_preds = getattr(row, "other_entity_predicates", None)
@@ -449,8 +370,18 @@ def _build_facts_state(
         other_facts, other_present = _build_facts_for_entity(
             other_preds, other_objs, p_local=p_local, cast_int=cast_int
         )
-        facts_by_entity[other_entity_id] = other_facts
-        predicates_present[other_entity_id] = other_present
+        _merge_entity(other_entity_id, other_facts, other_present)
+
+    _add_explicit_statement(
+        subject_id,
+        _coerce_value(getattr(row, "predicate", None), cast_int=cast_int),
+        object_id,
+    )
+    _add_explicit_statement(
+        _coerce_value(getattr(row, "other_subject", None), cast_int=cast_int),
+        _coerce_value(getattr(row, "other_predicate", None), cast_int=cast_int),
+        _coerce_value(getattr(row, "other_object", None), cast_int=cast_int),
+    )
 
     return facts_by_entity, predicates_present
 
@@ -700,62 +631,13 @@ def _build_constraint_instance(
     constraint_type_id: int,
     default_relation_predicates: List[int],
 ) -> ConstraintInstance:
-    constrained_property_id = _resolve_registry_id(registry_entry.constrained_property_raw, encoder)
-
-    param_predicates = registry_entry.param_predicates_raw
-    param_objects = registry_entry.param_objects_raw
-    param_pairs = list(zip(param_predicates, param_objects))
-
-    required_properties: Set[int] = set()
-    allowed_items: Set[int] = set()
-    allowed_classes: Set[int] = set()
-    relation_predicates: List[int] = []
-    inverse_properties: List[int] = []
-    conflict_properties: Set[int] = set()
-
-    for pred_raw, obj_raw in param_pairs:
-        pred_norm = normalize_token(pred_raw)
-        obj_norm = normalize_token(obj_raw)
-        pred_key = pred_norm or pred_raw
-        obj_key = obj_norm or obj_raw
-        obj_id = _resolve_registry_id(obj_raw, encoder) if encoder else 0
-
-        if pred_key == PARAM_P2306:
-            if normalize_property_id(obj_key):
-                if obj_id:
-                    required_properties.add(obj_id)
-        elif pred_key == PARAM_P2305:
-            if obj_id:
-                allowed_items.add(obj_id)
-        elif pred_key == PARAM_P2308:
-            if obj_id:
-                allowed_classes.add(obj_id)
-        elif pred_key == PARAM_P2309:
-            if normalize_property_id(obj_key) and obj_id:
-                relation_predicates.append(obj_id)
-        elif pred_key == PARAM_P1696:
-            if normalize_property_id(obj_key) and obj_id:
-                inverse_properties.append(obj_id)
-
-        if normalize_property_id(obj_key) and obj_id:
-            conflict_properties.add(obj_id)
-
-    if not relation_predicates:
-        relation_predicates = list(default_relation_predicates)
-    if not inverse_properties and constrained_property_id:
-        inverse_properties = [constrained_property_id]
-
-    return ConstraintInstance(
-        constraint_id=constraint_id,
-        constraint_type=constraint_type_name,
+    return build_registry_constraint_instance(
+        constraint_id,
+        registry_entry,
+        encoder=encoder,
+        constraint_type_name=constraint_type_name,
         constraint_type_id=constraint_type_id,
-        constrained_property=constrained_property_id,
-        required_properties=required_properties,
-        allowed_items=allowed_items,
-        allowed_classes=allowed_classes,
-        relation_predicates=relation_predicates,
-        inverse_properties=inverse_properties,
-        conflict_properties=conflict_properties,
+        default_relation_predicates=default_relation_predicates,
     )
 
 

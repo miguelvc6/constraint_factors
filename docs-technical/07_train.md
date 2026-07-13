@@ -2,11 +2,11 @@
 
 ## Objective
 - Train a graph neural network (configured via JSON) on the graphs exported by `06_graph.py`, optimising the six action slots (`add/del × subject/predicate/object`) with per-slot cross-entropy while tracking per-constraint performance.
-- Persist the best checkpoint, the resolved experiment configuration, and the full training history under the deterministic run slug `models/<variant>-<encoding>_<MODEL>_<config_tag>/`.
+- Persist the best checkpoint, resolved configuration, full training history, and a cryptographic run-provenance manifest under the experiment directory.
 
 ## Inputs & Outputs
-- **Inputs:** Processed graph files in `data/processed/<variant>/` (either `train_graph-<encoding>.pkl` / `val_graph-<encoding>.pkl` or the `*_repr-eswc_passive-*` equivalents, plus shards when present), experiment config JSONs (model + training blocks), and the frozen encoder from `data/interim/<variant>/globalintencoder.txt`.
-- **Outputs:** Run directory under `models/<variant>-<encoding>_<MODEL>_<config_tag>/` containing `checkpoint.pth`, `config.json`, `training_history.json`, plots, and evaluation artifacts when evaluated later.
+- **Inputs:** Processed graph files, experiment config JSONs, the feature encoder for model dimensions, and the identity encoder/map for symbolic candidate evaluation.
+- **Outputs:** The model directory containing `checkpoint.pth`, `config.json`, `training_history.json`, `run_manifest.json`, plots, and later evaluation artifacts.
 
 ## Workflow
 1. **Configuration intake** – The script requires `--experiment-config path/to/config.json`. The file contains `model_config` (dataset variant, encoding, architecture name, hyperparameters) and `training_config` (batch size, epochs, scheduler knobs, constraint weighting).
@@ -14,7 +14,7 @@
 3. **Data loading** – `dataset_variant_name()` selects the processed root (`data/processed/<variant>/`), `load_graph_dataset()` discovers either monolithic files or shard collections (`*-shardNNN.{pkl,pt}`), returning an in-memory list or a lazy `GraphStreamDataset`/sharded stream as appropriate. `infer_node_feature_spec()` inspects samples to decide whether node features are embeddings or categorical IDs (including optional role flags).
 4. **Target vocabularies** – The model predicts six categorical slots. `load_precomputed_target_vocabs()` reuses cached entity/predicate class IDs when available, otherwise `derive_target_class_ids()` scans the loaded graphs. These IDs are passed into the model so entity and predicate heads can be expanded/masked into a shared `num_target_ids` space.
 5. **Factor type setup** – For `constraint_representation="factorized"`, if `model_config.num_factor_types > 0`, training uses that value directly unless the constraint registry reports a larger compact `constraint_type_index` range, in which case the registry value wins and the resolved config is updated. If the config leaves the field at `0`, the trainer prefers the constraint registry count and only falls back to a dataset scan when no registry-derived count is available. For `constraint_representation="eswc_passive"`, the trainer clears `num_factor_types` in the resolved config because passive graphs may include passive constraint nodes but do not execute per-type factor heads.
-6. **Encoder + model build** – The frozen `GlobalIntEncoder` from `data/interim/<variant>/globalintencoder.txt` defines `num_graph_nodes`. `build_model()` instantiates the chosen architecture (e.g., message-passing network with dual branches). For `GIN_PRESSURE`, `model_config.pressure_module_sharing` controls whether factor-to-local pressure modules are per factor type (`per_type`, default) or shared across types (`shared`). Device selection is automatic (CUDA if available) with memory logging hooks for debugging.
+6. **Encoder + model build** – `feature_encoder.txt` defines model input/output dimensions; `identity_encoder.txt` is used only for semantic heuristics and evaluator calls. For `GIN_PRESSURE`, `model_config.pressure_module_sharing` controls pressure blocks. `shared` is the canonical A1-family setting; `per_type` is now an ablation only.
 7. **Training loop (`train()`):**
    - Wrap datasets in split-specific `DataLoader`s, shuffling the in-memory train split while leaving streaming datasets ordered. For streamed datasets the trainer disables `pin_memory`, reduces `prefetch_factor` to `1`, and keeps `persistent_workers=False` so train/validation worker pools do not overlap and exhaust shared memory at epoch boundaries.
    - Forward pass returns logits of shape `(batch, 6, num_target_ids)` where entity/predicate slots are masked to the per-split vocabularies. Each slot is compared against the gold IDs via `CrossEntropyLoss(reduction="none")`, producing a `(batch, 6)` loss matrix.
@@ -24,13 +24,15 @@
    - Accuracy is tracked both per-slot (percentage of correctly predicted IDs) and as “all-6 correct” (all slots match simultaneously).
    - `ConstraintMetricsAccumulator` aggregates loss/accuracy per constraint type so reports can highlight which shapes dominate or lag.
    - If chooser training is enabled, candidate sets are built per graph and scored by the chooser head. Training uses an optimized path:
+     - training candidates may force-include gold and carry both feature and identity tuples;
+     - validation/test inference uses a separate API that cannot accept `graph.y` or any gold tuple;
      - candidate scoring is done in a packed/batched call (`score_candidates_packed`) rather than one scorer call per graph,
      - `fix1`-style chooser losses use `evaluate_candidates_loss_terms()` to compute only the required terms (no full diagnostic payload),
      - top-k candidate extraction can be restricted to valid entity/predicate class IDs per slot.
    - `torch.optim.Adam` drives the updates, `ReduceLROnPlateau` reduces LR when validation loss stalls, gradient clipping is optional, and early stopping is triggered after `training_config.early_stopping_rounds` epochs without improvement.
    - The trainer records stability diagnostics every epoch: learning rate, unclipped gradient norm mean/max, parameter norm/max absolute parameter value, edit-logit max magnitude, factor-logit max magnitude, and chooser-score max magnitude.
 8. **Validation** – Mirrors the training pass sans gradient steps, feeding results into the same metric accumulators for apples-to-apples comparisons. If `training_config.validation_subset_size` is set, each epoch validates on only the first N validation graphs. Streamed validation subsets force the validation loader to `num_workers=0` so the subset is one global prefix, not one prefix per worker.
-9. **Artifacts** – Once training finishes (or early stopping fires), the best-performing weights are saved via `torch.save()` alongside the effective `model_cfg`/`training_cfg`. `history_path()` stores the scalar curves, and `plot_training_history()` renders PNG charts for quick inspection.
+9. **Artifacts** – The checkpoint embeds resolved configs, seed, and config hashes. `run_manifest.json` records the full checkpoint hash, effective config hashes, dataset/graph manifest hashes, source commit/dirty-state hashes, package versions, command, seed, and parameter counts by top-level component.
 
 ## Common Pitfalls / Gotchas
 - The `model_config.dataset_variant` and `model_config.encoding` must match the graphs on disk; mismatches surface as missing-file errors or shape mismatches deep in PyG.
@@ -43,7 +45,7 @@
 - Fix-probability loss requires in-memory datasets (lists) so the script can attach `context_index` and look up contexts; streamed datasets will disable that term automatically.
 - Chooser training supports streamed datasets via per-graph `context_index` assignment; contexts/parquet sidecars must align with graph ordering/counts.
 - CUDA batch prefetch (`TRAIN_CUDA_PREFETCH`) is available and enabled by default; on some hardware/data combinations it may not improve throughput, so treat it as a tunable runtime flag.
-- H2 ablation configs are appendix runs. Train them only into their generated `h2_a1_*` run directories; they should not replace the current canonical or hyperparameter-search checkpoints.
+- The former `h2_a1_shared_pressure` architecture is promoted to canonical A1. Its historical run is selection evidence only; paper numbers must come from a clean rerun under the v2 data/evaluation schemas.
 - The H2 gold-scalar pressure ablation uses `model_config.pressure_oracle_input="gold_pre_scalar"` and requires `factor_satisfied_pre` / `factor_checkable_pre` graph fields. It is an oracle appendix run, not a deployable training configuration.
 
 ## Profiling & Throughput Controls
@@ -65,6 +67,12 @@ This makes bottlenecks explicit (for example, chooser-heavy runs where `chooser`
 - Per-slot histories are nested under `history["per_slot"][slot_index]`, enabling later analysis of which action (e.g., `del_predicate`) converged slower.
 - GPU monitoring hooks (`log_cuda_memory`) fire at strategic checkpoints (epoch boundaries, first batch) to simplify diagnosing OOMs or fragmentation.
 - Model checkpoints store both the state dict and the resolved configuration, allowing `09_eval.py` to rebuild the architecture without guessing hyperparameters.
+- `09_eval.py` rejects a checkpoint when its embedded model config differs from `config.json`; changing a run config can no longer silently relabel an old checkpoint.
+- `--seed` defaults to `42` and is persisted in both checkpoint and run manifest.
+- Seed setup enables deterministic algorithms in warn-only mode, fixes cuDNN
+  deterministic/benchmark flags, and records those settings. Any CUDA/PyG
+  operation that cannot be deterministic emits a warning that must be retained
+  with the run log.
 - If `training_config.validate_factor_labels` is enabled, training asserts that factor label tensors exist and align with `factor_constraint_ids` (useful for upcoming factor supervision).
 - Models receive `model_config.constraint_representation` at construction time. Passive models skip factor-head and pressure execution even if the passive graph contains constraint/factor nodes; factorized models remain strict and require dense `factor_types` whenever per-type factor execution is reached.
 

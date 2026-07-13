@@ -1,5 +1,11 @@
 # Executable Constraint Factors and the Fidelity-Safety Gap
 
+> **Result reset, 2026-07-10:** the numerical results and empirical conclusions
+> in this document were produced before the scientific-integrity schema-v2
+> remediation and are historical only. They must not be cited as final paper
+> evidence. The current claim status and revised narrative are in
+> [09_paper_narrative_after_integrity_remediation.md](09_paper_narrative_after_integrity_remediation.md).
+
 This document is the canonical conceptual framing for the constraint-factors
 project. It records the current paper narrative: executable constraint factors
 are valuable because they improve historical repair imitation and reveal where
@@ -35,11 +41,10 @@ grounded post-edit evaluation still uses symbolic validators.
 ### Current thesis
 
 **Historical repair fidelity and symbolic repair safety are distinct objectives.**
-Executable constraint factors improve historical edit imitation, and diagnostic
-experiments show that their pressure signals affect predictions. However, better
-imitation does not automatically produce safer post-edit graphs. Conversely,
-directly optimizing local post-edit satisfaction can collapse into deleting the
-violating statement.
+The schema-v2 rerun tests whether executable constraint factors improve strict
+historical edit imitation and whether any such gain transfers to symbolic safety.
+The design also tests whether directly optimizing local satisfaction collapses
+into deleting the violating statement.
 
 The paper should therefore argue for a multi-axis evaluation framework for KG
 repair rather than claim that the current architecture has solved safe repair.
@@ -461,14 +466,15 @@ factorized model but surprisingly strong on some symbolic safety metrics.
 
 #### A1) Factorized imitation model
 
-`A1` isolates the representation effect. It uses executable factors and
-auxiliary factor supervision, but no explicit candidate-level safety objective.
+`A1` isolates the representation effect. It uses executable factors, shared
+role-pressure blocks, and auxiliary factor supervision, but no explicit
+candidate-level safety objective.
 
-Current role:
+Schema-v2 role:
 
-- main positive representation result;
-- improves historical edit imitation;
-- does not improve aggregate symbolic safety over `B0`.
+- test the representation-only hypothesis against `B0`;
+- provide the architecture-matched proposal base for `M1C`, `M1D`, and `G0`;
+- establish fidelity and safety results only after the clean rerun.
 
 #### M1C) Chooser-style safety attempt
 
@@ -602,10 +608,10 @@ edits that improve metrics by deleting the focus evidence.
 
 ---
 
-## 9) Current Empirical Pattern
+## 9) Historical Empirical Pattern (Invalidated)
 
-The current paper-facing result table should be narrated as evidence for a
-fidelity-safety gap, not as a single leaderboard.
+The table below is retained only to document the pre-remediation state. It is
+not a paper-facing result table and must be replaced in full.
 
 | Model | Primary Fix | Micro-F1 | GFR / Local Satisfaction | SIR | SRR | Disruption | Interpretation |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -618,7 +624,7 @@ fidelity-safety gap, not as a single leaderboard.
 | `H2` | 0.5157 | 0.0503 | 0.8544 | 0.0001 | 0.0043 | 0.1047 | Conservative and low disruption, but weak repair intent and fidelity. |
 | `H3` | 0.7731 | 0.2654 | 0.8689 | 0.1917 | 0.0103 | 1.0072 | Coarse repair-prior baseline; much weaker fidelity than learned factorized models. |
 
-### Main findings
+### Historical interpretations requiring retest
 
 1. `A1` improves Micro-F1 from `0.5434` to `0.6785`, validating executable
    factors as a representation for historical repair imitation.

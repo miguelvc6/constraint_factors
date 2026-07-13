@@ -4,7 +4,7 @@ Generate the paper-facing experiment bundle under ``models/<exp_name>/config.jso
 
 Default output:
 - ``b0_eswc_reproduction``
-- ``a1_factorized_imitation``
+- ``a1_factorized_imitation`` (shared role-pressure blocks)
 - ``m1c_safe_factor_chooser``
 - ``m1d_safe_factor_direct``
 - ``g0_globalfix_reference``
@@ -188,7 +188,9 @@ class ProposalExperiment:
     enable_policy_choice: bool = False
     locked_backbone: bool = True
     dynamic_reweighting_enabled: bool = False
-    pressure_module_sharing: str = "per_type"
+    # Shared blocks are the canonical A1-family architecture. Per-type blocks
+    # remain available only when an ablation explicitly requests them.
+    pressure_module_sharing: str = "shared"
     factor_executor_impl: str = "per_type_v1"
     pressure_oracle_input: str = "none"
     factor_loss_enabled: bool | None = None
@@ -346,11 +348,13 @@ def main() -> None:
     parser.add_argument("--processed-root", type=Path, default=Path("data/processed"))
     parser.add_argument("--models-root", type=Path, default=Path("models"))
     parser.add_argument("--limit", type=int, default=0, help="Limit variant/encoding pairs (0 = no limit).")
+    parser.add_argument("--variant", default=None, help="Only generate configs for this processed variant name.")
+    parser.add_argument("--encoding", default=None, help="Only generate configs for this graph encoding.")
     parser.add_argument("--include-experimental", action="store_true")
     parser.add_argument(
         "--include-h2-ablations",
         action="store_true",
-        help="Emit the three H2 supporting ablation configs. Existing config files are left untouched.",
+        help="Emit the H2 supporting ablation configs. Existing config files are left untouched.",
     )
     parser.add_argument(
         "--include-primary-query-ablations",
@@ -360,6 +364,10 @@ def main() -> None:
     args = parser.parse_args()
 
     pairs = list(_iter_variant_encodings(args.processed_root))
+    if args.variant is not None:
+        pairs = [pair for pair in pairs if pair[0] == args.variant]
+    if args.encoding is not None:
+        pairs = [pair for pair in pairs if pair[1] == args.encoding]
     if args.limit > 0:
         pairs = pairs[: args.limit]
     if not pairs:
@@ -435,12 +443,12 @@ def main() -> None:
             factor_loss_enabled=False,
         ),
         ProposalExperiment(
-            name="h2_a1_shared_pressure",
+            name="h2_a1_per_type_pressure",
             model_name="GIN_PRESSURE",
             constraint_representation="factorized",
             pressure_enabled=True,
             pressure_type_conditioning="concat",
-            pressure_module_sharing="shared",
+            pressure_module_sharing="per_type",
             validate_factor_labels=True,
         ),
         ProposalExperiment(

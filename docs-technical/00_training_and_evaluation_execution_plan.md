@@ -4,6 +4,13 @@ Date: 2026-03-11
 
 This document defines the recommended execution order for training and evaluating the baselines and learned models in [docs-technical/00_models_and_evaluation_matrix.md](/home/mvazquez/constraint_factors/docs-technical/00_models_and_evaluation_matrix.md).
 
+> **Schema-v2 reset (2026-07-10):** all previously stored paper metrics predate
+> identity-safe labels, preserved upstream splits, unified constraint semantics,
+> target-free inference candidates, and corrected global metrics. Use
+> [09_scientific_integrity_remediation.md](/home/mvazquez/constraint_factors/docs-technical/09_scientific_integrity_remediation.md)
+> for the mandatory clean rebuild/rerun commands. Earlier commands below are
+> retained as the detailed experiment design but do not make old artifacts valid.
+
 The plan is optimized for:
 
 - paper-facing reproducibility
@@ -25,7 +32,7 @@ Conceptual-to-technical mapping for this paper line:
 Before running anything, freeze these decisions for the entire paper run:
 
 - dataset variant: one paper dataset only, `full_strat1m_minocc100`
-- `min_occurrence`: one value only, typically `100`
+- primary `min_occurrence`: `100`, with preregistered no-filter (`1`) and intermediate (`10`) A1/B0 sensitivity runs
 - encoding: one paper encoding only
 - proposal random seed: `42`
 - reranker random seed: `42`
@@ -33,8 +40,8 @@ Before running anything, freeze these decisions for the entire paper run:
 
 Reproducibility notes:
 
-- `src/07_train.py` currently hardcodes `set_seed(42)`, so all proposal runs are already locked to seed `42`.
-- `src/08_train_reranker.py` accepts `--seed`; use `--seed 42` for all reranker runs.
+- `src/07_train.py`, `src/08_train_reranker.py`, and `src/10_scheduler.py` accept `--seed`; use `--seed 42` for the locked reproduction and record any robustness seeds as separate run directories.
+- every new checkpoint writes `run_manifest.json`; paper result validation requires it.
 - heuristic baselines are deterministic.
 - do not mix encodings or dataset variants inside the same paper table.
 - keep `training_config.validation_subset_size: 25000` for the paper proposal runs. This is the frozen validation policy for the current paper line, not a development-only shortcut.
@@ -233,11 +240,12 @@ uv run scripts/make_experiment_configs.py \
   --include-h2-ablations
 ```
 
-When run after canonical config generation, existing config files are left untouched and this adds only the three H2 appendix proposal configs:
+When run after canonical config generation, existing config files are left untouched and this adds the H2 appendix proposal configs:
 
 - `h2_a1_no_factor_loss__<variant>__<encoding>`
-- `h2_a1_shared_pressure__<variant>__<encoding>`
+- `h2_a1_per_type_pressure__<variant>__<encoding>`
 - `h2_a1_legacy_shared_executor__<variant>__<encoding>`
+- `h2_a1_gold_scalar_pressure__<variant>__<encoding>`
 
 The flag does not modify existing checkpoints or existing config files. Generated H2 ablations should be trained later as separate runs.
 
@@ -594,14 +602,14 @@ uv run scripts/make_experiment_configs.py \
 For the current paper artifact stack, this emits:
 
 - `models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id/config.json`
-- `models/h2_a1_shared_pressure__full_strat1m_minocc100__node_id/config.json`
+- `models/h2_a1_per_type_pressure__full_strat1m_minocc100__node_id/config.json`
 - `models/h2_a1_legacy_shared_executor__full_strat1m_minocc100__node_id/config.json`
 - `models/h2_a1_gold_scalar_pressure__full_strat1m_minocc100__node_id/config.json`
 
 These are supporting ablations only. They use the existing processed graphs, the locked A1-style proposal setup, no chooser, and no direct-safety objective:
 
 - `h2_a1_no_factor_loss`: tests whether the auxiliary factor satisfaction loss contributes to H2 factor semantics.
-- `h2_a1_shared_pressure`: keeps pressure enabled but shares role pressure modules across factor types, testing typed pressure specifically.
+- `h2_a1_per_type_pressure`: restores the former per-type role-pressure blocks, testing the promoted shared-pressure parameterization in reverse.
 - `h2_a1_legacy_shared_executor`: uses the legacy shared factor executor, testing the newer per-type executor path.
 - `h2_a1_gold_scalar_pressure`: appends the gold pre-repair factor violation scalar to pressure messages, testing whether perfect factor-satisfaction information would improve downstream predictions.
 
@@ -610,10 +618,10 @@ The gold-scalar oracle ablation keeps the same dataset, architecture, optimizer,
 Train and evaluate the H2 appendix runs with:
 
 ```bash
-uv run src/10_scheduler.py \
-  --only h2_a1_ \
-  --paper-suite \
-  --keep-going
+uv run src/10_scheduler.py --only h2_a1_per_type_pressure --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only h2_a1_no_factor_loss --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only h2_a1_legacy_shared_executor --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only h2_a1_gold_scalar_pressure --paper-suite --seed 42 --force-retrain
 ```
 
 After the standard evaluation has completed, run the H2 sidecar report for each ablation:
@@ -625,7 +633,7 @@ uv run src/09_eval.py \
   --h2-eval
 
 uv run src/09_eval.py \
-  --run-directory models/h2_a1_shared_pressure__full_strat1m_minocc100__node_id \
+  --run-directory models/h2_a1_per_type_pressure__full_strat1m_minocc100__node_id \
   --strict-global-metrics \
   --h2-eval
 
@@ -640,7 +648,10 @@ uv run src/09_eval.py \
   --h2-eval
 ```
 
-The H2 outputs are written under each run's `evaluations/h2/` directory. These ablations should be reported as appendix diagnostics for H2, not as replacements for the canonical `B0`, `A1`, `M1C`, `M1D`, or `G0` results.
+The H2 outputs are written under each run's `evaluations/h2/` directory. The
+shared-pressure result selected the new canonical A1 architecture; the other H2
+variants remain appendix diagnostics. Do not reuse any pre-schema-v2 H2 metric
+as a final paper number.
 
 To reuse the already trained `A1` checkpoint for the read-only oracle mask, run:
 

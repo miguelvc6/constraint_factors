@@ -55,9 +55,9 @@ Paper-facing additions:
 
 - `pressure_module_sharing`
   - allowed values: `per_type`, `shared`
-  - default: `per_type`
-  - `per_type` preserves the current typed-pressure behavior
-  - `shared` keeps factor pressure enabled but shares the role pressure modules across factor types; use this for the H2 untyped-pressure ablation only
+  - paper-generator default: `shared`
+  - `shared` is canonical for `A1`, `M1C`, `M1D`, their primary-query variants, and new H2 controls
+  - `per_type` is retained only for the parameterization ablation and legacy checkpoint reproduction
 
 - `pressure_oracle_input`
   - allowed values: `none`, `gold_pre_scalar`

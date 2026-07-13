@@ -21,8 +21,10 @@ import argparse
 import csv
 import gc
 import gzip
+import hashlib
 import json
 import re
+import shutil
 from collections import Counter, defaultdict
 from http import HTTPStatus
 from pathlib import Path
@@ -32,7 +34,18 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-from modules.data_encoders import SCALAR_FEATURES, SEQUENCE_FEATURES, GlobalIntEncoder, dataset_variant_name
+from modules.data_encoders import (
+    DATASET_SCHEMA_VERSION,
+    FEATURE_ENCODER_FILENAME,
+    IDENTITY_ENCODER_FILENAME,
+    IDENTITY_TO_FEATURE_FILENAME,
+    LEGACY_ENCODER_FILENAME,
+    SCALAR_FEATURES,
+    SEQUENCE_FEATURES,
+    GlobalIntEncoder,
+    dataset_variant_name,
+    feature_column,
+)
 
 UNKNOWN_TOKEN_STRING = "unknown"
 
@@ -59,6 +72,8 @@ VALIDATE_CONSTRAINTS = True
 PROP_RE = re.compile(r"^P[1-9]\d*$")
 MAX_ROWS: int | None = None
 ROWS_PROCESSED = 0
+SPLIT_POLICY = "preserve"
+OUTPUT_DATASET = ""
 
 # Includes the new per-row constraint neighborhood IDs.
 SEQUENCE_FEATURE_KEYS: tuple[str, ...] = SEQUENCE_FEATURES + (
@@ -624,14 +639,14 @@ def _ensure_reserved_tokens() -> set[int]:
     return reserved_ids
 
 
-def _reindex_encoder(allowed_ids: set[int]) -> dict[int, int]:
-    """Rebuild encoder mappings so surviving token ids are contiguous."""
+def _reindex_encoder(encoder: GlobalIntEncoder, allowed_ids: set[int]) -> dict[int, int]:
+    """Rebuild *encoder* so surviving identity IDs become contiguous feature IDs."""
     old_to_new = {0: 0}
     new_encoding: dict[str, int] = {"": 0}
     new_decoding: dict[int, str] = {0: ""}
 
     next_id = 1
-    for token, old_id in sorted(ENCODER._encoding.items(), key=lambda item: item[1]):
+    for token, old_id in sorted(encoder._encoding.items(), key=lambda item: item[1]):
         if old_id == 0 or old_id not in allowed_ids:
             continue
         new_encoding[token] = next_id
@@ -639,43 +654,63 @@ def _reindex_encoder(allowed_ids: set[int]) -> dict[int, int]:
         old_to_new[old_id] = next_id
         next_id += 1
 
-    ENCODER._encoding = new_encoding
-    ENCODER._decoding = new_decoding
-    ENCODER._frozen = False
-
-    global UNKNOWN_TOKEN_ID
-    UNKNOWN_TOKEN_ID = ENCODER._encoding.get(UNKNOWN_TOKEN_STRING, 0)
+    encoder._encoding = new_encoding
+    encoder._decoding = new_decoding
+    encoder._filtered_ids = set()
+    encoder._global_id_to_unfiltered_global_id = {}
+    encoder._frozen = False
     return old_to_new
+
+
+def _clone_encoder(encoder: GlobalIntEncoder) -> GlobalIntEncoder:
+    clone = GlobalIntEncoder()
+    clone._encoding = dict(encoder._encoding)
+    clone._decoding = dict(encoder._decoding)
+    clone._filtered_ids = set(encoder._filtered_ids)
+    clone._global_id_to_unfiltered_global_id = dict(encoder._global_id_to_unfiltered_global_id)
+    clone._frozen = encoder._frozen
+    return clone
 
 
 def _remap_scalar_array(values: Any, id_map: dict[int, int]) -> np.ndarray:
     """Apply *id_map* to a scalar feature array."""
+    unknown_id = id_map.get(UNKNOWN_TOKEN_ID, 0)
     if isinstance(values, np.ndarray) and values.dtype != object:
-        vectorised = np.vectorize(lambda x: id_map.get(int(x), UNKNOWN_TOKEN_ID), otypes=[np.int64])
+        vectorised = np.vectorize(
+            lambda x: 0 if int(x) == 0 else id_map.get(int(x), unknown_id),
+            otypes=[np.int64],
+        )
         return vectorised(values)
-    return np.asarray([id_map.get(int(v), UNKNOWN_TOKEN_ID) for v in values], dtype=np.int64)
+    return np.asarray(
+        [0 if int(v) == 0 else id_map.get(int(v), unknown_id) for v in values],
+        dtype=np.int64,
+    )
 
 
 def _remap_sequence_array(values: Any, id_map: dict[int, int]) -> np.ndarray:
     """Apply *id_map* to a sequence feature array (list of lists)."""
+    unknown_id = id_map.get(UNKNOWN_TOKEN_ID, 0)
     remapped: list[list[int]] = []
     for seq in values:
         if isinstance(seq, np.ndarray):
             seq_iter = seq.tolist()
         else:
             seq_iter = list(seq)
-        remapped.append([id_map.get(int(v), UNKNOWN_TOKEN_ID) for v in seq_iter])
+        remapped.append(
+            [0 if int(v) == 0 else id_map.get(int(v), unknown_id) for v in seq_iter]
+        )
     return np.array(remapped, dtype=object)
 
 
-def _remap_dataset_inplace(dataset: dict[str, Any], id_map: dict[int, int]) -> None:
+def _add_feature_columns(dataset: dict[str, Any], id_map: dict[int, int]) -> None:
+    """Add filtered model features without changing semantic identity columns."""
     for key in SCALAR_FEATURES:
         if key in dataset:
-            dataset[key] = _remap_scalar_array(dataset[key], id_map)
+            dataset[feature_column(key)] = _remap_scalar_array(dataset[key], id_map)
 
-    for key in SEQUENCE_FEATURE_KEYS:
+    for key in SEQUENCE_FEATURES:
         if key in dataset:
-            dataset[key] = _remap_sequence_array(dataset[key], id_map)
+            dataset[feature_column(key)] = _remap_sequence_array(dataset[key], id_map)
 
 
 def _apply_frequency_filter_inplace(dataset: dict[str, Any], allowed_ids: set[int]) -> None:
@@ -691,7 +726,7 @@ def _apply_frequency_filter_inplace(dataset: dict[str, Any], allowed_ids: set[in
         else:
             dataset[key] = np.asarray([v if v in allowed_ids else unknown_id for v in values])
 
-    for key in SEQUENCE_FEATURE_KEYS:
+    for key in SEQUENCE_FEATURES:
         if key not in dataset:
             continue
         sequences = dataset[key]
@@ -705,17 +740,57 @@ def _apply_frequency_filter_inplace(dataset: dict[str, Any], allowed_ids: set[in
         dataset[key] = np.array(filtered, dtype=object)
 
 
-def _prune_encoder(allowed_ids: set[int]) -> None:
-    removable: list[str] = []
-    for token_str, token_id in ENCODER._encoding.items():
-        if token_id == 0:
-            continue
-        if token_id not in allowed_ids:
-            removable.append(token_str)
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    for token_str in removable:
-        token_id = ENCODER._encoding.pop(token_str)
-        ENCODER._decoding.pop(token_id, None)
+
+def _write_dataset_manifest(
+    *,
+    split_frames: dict[str, pd.DataFrame],
+    identity_encoder: GlobalIntEncoder,
+    feature_encoder: GlobalIntEncoder,
+    raw_inputs: Sequence[Path],
+) -> None:
+    output_files = {
+        f"df_{split}.parquet": _sha256_file(INTERIM_DATA_PATH / f"df_{split}.parquet")
+        for split in split_frames
+    }
+    encoder_files = {
+        IDENTITY_ENCODER_FILENAME: _sha256_file(INTERIM_DATA_PATH / IDENTITY_ENCODER_FILENAME),
+        FEATURE_ENCODER_FILENAME: _sha256_file(INTERIM_DATA_PATH / FEATURE_ENCODER_FILENAME),
+        IDENTITY_TO_FEATURE_FILENAME: _sha256_file(
+            INTERIM_DATA_PATH / IDENTITY_TO_FEATURE_FILENAME
+        ),
+    }
+    raw_files = {
+        str(path.relative_to(RAW_DATA_PATH)): {
+            "bytes": path.stat().st_size,
+            "sha256": _sha256_file(path),
+        }
+        for path in sorted(set(raw_inputs))
+        if path.exists()
+    }
+    payload = {
+        "schema_version": DATASET_SCHEMA_VERSION,
+        "source_dataset": DATASET,
+        "output_dataset": OUTPUT_DATASET,
+        "dataset_variant": INTERIM_DATA_PATH.name,
+        "split_policy": SPLIT_POLICY,
+        "raw_split_mapping": {"train": "train", "dev": "val", "test": "test"},
+        "min_occurrence": MIN_OCCURRENCE,
+        "rows": {split: int(len(frame)) for split, frame in split_frames.items()},
+        "identity_vocab_size": len(identity_encoder._encoding),
+        "feature_vocab_size": len(feature_encoder._encoding),
+        "raw_inputs": raw_files,
+        "outputs": {**output_files, **encoder_files},
+    }
+    with (INTERIM_DATA_PATH / "dataset_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def _concatenate_datasets(
@@ -935,23 +1010,35 @@ def main():
     ALLOW_NEW_TOKENS = True
     RECORD_FREQUENCIES = False
 
-    # Load raw datasets
+    # Load raw datasets. A debug cap is applied independently to each upstream
+    # split so preserve mode always produces train/val/test artifacts.
     ROWS_PROCESSED = 0
     raw_train_dataset = load("train", targets)
+    if MAX_ROWS is not None:
+        ROWS_PROCESSED = 0
     raw_dev_dataset = load("dev", targets)
+    if MAX_ROWS is not None:
+        ROWS_PROCESSED = 0
     raw_test_dataset = load("test", targets)
     print("\nRaw dataset loading complete.\n")
     gc.collect()
 
-    # Concatenate and stratified split
-    full_dataset = _concatenate_datasets([raw_train_dataset, raw_dev_dataset, raw_test_dataset], reuse_first=True)
-    print("Full dataset size: {}\n".format(len(full_dataset["constraint_type"])))
-    del raw_train_dataset, raw_dev_dataset, raw_test_dataset
-    gc.collect()
-
-    train_dataset, val_dataset, test_dataset = stratified_train_val_test_split(
-        full_dataset, "constraint_type", random_state=42
-    )
+    if SPLIT_POLICY == "preserve":
+        train_dataset = raw_train_dataset
+        val_dataset = raw_dev_dataset
+        test_dataset = raw_test_dataset
+    else:
+        full_dataset = _concatenate_datasets(
+            [raw_train_dataset, raw_dev_dataset, raw_test_dataset], reuse_first=True
+        )
+        print("Full dataset size: {}\n".format(len(full_dataset["constraint_type"])))
+        del raw_train_dataset, raw_dev_dataset, raw_test_dataset
+        gc.collect()
+        train_dataset, val_dataset, test_dataset = stratified_train_val_test_split(
+            full_dataset, "constraint_type", random_state=42
+        )
+        del full_dataset
+        gc.collect()
     print(
         "Train size: {}, Val size: {}, Test size: {}\n".format(
             len(train_dataset["constraint_type"]),
@@ -959,9 +1046,6 @@ def main():
             len(test_dataset["constraint_type"]),
         )
     )
-    del full_dataset
-    gc.collect()
-
     # Compute token frequencies on training set
     print("Computing token frequencies on training set...")
     train_frequency = _compute_token_frequency(train_dataset)
@@ -974,29 +1058,34 @@ def main():
     allowed_ids.update(base_reserved_ids)
     allowed_ids.update(REGISTRY_RESERVED_IDS)
 
-    print("Applying frequency filter to all datasets...")
+    feature_encoder = _clone_encoder(ENCODER)
+    id_map = _reindex_encoder(feature_encoder, allowed_ids)
     for dataset in (train_dataset, val_dataset, test_dataset):
-        _apply_frequency_filter_inplace(dataset, allowed_ids)
+        _add_feature_columns(dataset, id_map)
 
-    _prune_encoder(allowed_ids)
-    id_map = _reindex_encoder(allowed_ids)
+    identity_to_feature = np.full(
+        len(ENCODER._decoding),
+        id_map[UNKNOWN_TOKEN_ID],
+        dtype=np.int64,
+    )
+    identity_to_feature[0] = 0
+    for identity_id, feature_id in id_map.items():
+        identity_to_feature[int(identity_id)] = int(feature_id)
 
-    for dataset in (train_dataset, val_dataset, test_dataset):
-        _remap_dataset_inplace(dataset, id_map)
-
-    allowed_ids = set(id_map.values())
-    print("Frequency filter retained {} token IDs (including unknown)".format(len(allowed_ids)))
-    print("Encoder size after pruning: {}".format(len(ENCODER._encoding)))
+    print("Frequency filter retained {} token IDs (including unknown)".format(len(id_map)))
+    print("Identity encoder size: {}".format(len(ENCODER._encoding)))
+    print("Feature encoder size: {}".format(len(feature_encoder._encoding)))
     print(
         "Reserved base tokens: {}, reserved registry tokens: {}, final vocab size: {}".format(
             len(base_reserved_ids),
             len(REGISTRY_RESERVED_IDS),
-            len(ENCODER._encoding),
+            len(feature_encoder._encoding),
         )
     )
 
     # Finalize settings
     ENCODER.freeze()
+    feature_encoder.freeze()
     ALLOW_NEW_TOKENS = False
     RECORD_FREQUENCIES = False
 
@@ -1016,10 +1105,15 @@ def main():
     df_val.to_parquet(INTERIM_DATA_PATH / "df_val.parquet")
     df_test.to_parquet(INTERIM_DATA_PATH / "df_test.parquet")
 
-    ENCODER.save(INTERIM_DATA_PATH / "globalintencoder.txt")
+    ENCODER.save(INTERIM_DATA_PATH / IDENTITY_ENCODER_FILENAME)
+    feature_encoder.save(INTERIM_DATA_PATH / FEATURE_ENCODER_FILENAME)
+    # Keep the legacy filename as a feature-encoder alias for non-v2 utilities.
+    feature_encoder.save(INTERIM_DATA_PATH / LEGACY_ENCODER_FILENAME)
+    np.save(INTERIM_DATA_PATH / IDENTITY_TO_FEATURE_FILENAME, identity_to_feature)
     print("Number of constraints: {}".format(len(constraints_def)))
     print("Number of seeded factor tokens: {}".format(len(FACTOR_TOKEN_STRINGS)))
-    print("Number of tokens in final encoder: {}".format(len(ENCODER._encoding)))
+    print("Number of identity tokens: {}".format(len(ENCODER._encoding)))
+    print("Number of feature tokens: {}".format(len(feature_encoder._encoding)))
 
     if not FACTOR_TOKEN_STRINGS:
         raise AssertionError("No constraint factor tokens were seeded.")
@@ -1029,9 +1123,22 @@ def main():
         sample_constraint_ids = rng.choice(sample_constraint_ids, size=50, replace=False).tolist()
     for constraint_id in sample_constraint_ids:
         token = f"{FACTOR_TOKEN_PREFIX}{constraint_id}"
-        token_id = ENCODER.encode(token, add_new=False)
+        token_id = feature_encoder.encode(token, add_new=False)
         assert token_id != 0, f"Missing constraint factor token in encoder: {token}"
     print("Validated {} constraint factor tokens in encoder.".format(len(sample_constraint_ids)))
+
+    raw_inputs = [
+        RAW_DATA_PATH / f"constraint-corrections-{target}.tsv.gz.full.{kind}.tsv.gz"
+        for kind in ("train", "dev", "test")
+        for target in targets
+    ]
+    raw_inputs.append(RAW_DATA_PATH / "constraints.tsv")
+    _write_dataset_manifest(
+        split_frames={"train": df_train, "val": df_val, "test": df_test},
+        identity_encoder=ENCODER,
+        feature_encoder=feature_encoder,
+        raw_inputs=raw_inputs,
+    )
 
 
 if __name__ == "__main__":
@@ -1049,6 +1156,22 @@ if __name__ == "__main__":
         help="Minimum number of occurrences in the training split required for a token to keep its ID.",
     )
     parser.add_argument(
+        "--output-dataset",
+        default=None,
+        help="Output dataset name before the _minocc suffix. Defaults to --dataset.",
+    )
+    parser.add_argument(
+        "--split-policy",
+        choices=["preserve", "restratify"],
+        default="preserve",
+        help="Preserve upstream train/dev/test boundaries (default) or reproduce the legacy 70/15/15 split.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing output variant directory.",
+    )
+    parser.add_argument(
         "--max_rows",
         "--max-rows",
         type=int,
@@ -1058,17 +1181,28 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     DATASET = args.dataset
+    OUTPUT_DATASET = args.output_dataset or DATASET
+    SPLIT_POLICY = args.split_policy
     MIN_OCCURRENCE = max(1, args.min_occurrence)
     if args.max_rows is not None and args.max_rows > 0:
         MAX_ROWS = args.max_rows
     else:
         MAX_ROWS = None
-    dataset_variant = dataset_variant_name(DATASET, MIN_OCCURRENCE)
-    print(f"Processing {DATASET} data (min_occurrence={MIN_OCCURRENCE})...\n")
+    dataset_variant = dataset_variant_name(OUTPUT_DATASET, MIN_OCCURRENCE)
+    print(
+        f"Processing {DATASET} data as {dataset_variant} "
+        f"(min_occurrence={MIN_OCCURRENCE}, split_policy={SPLIT_POLICY})...\n"
+    )
 
     # Data paths
     RAW_DATA_PATH = Path("data/raw/") / DATASET
     INTERIM_DATA_PATH = Path("data/interim/") / dataset_variant
+    if INTERIM_DATA_PATH.exists() and any(INTERIM_DATA_PATH.iterdir()):
+        if not args.overwrite:
+            raise FileExistsError(
+                f"Output dataset already exists: {INTERIM_DATA_PATH}. Use --overwrite to replace it."
+            )
+        shutil.rmtree(INTERIM_DATA_PATH)
     INTERIM_DATA_PATH.mkdir(parents=True, exist_ok=True)
 
     # Build DataFrames

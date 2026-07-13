@@ -186,11 +186,11 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
             "h2_a1_gold_scalar_pressure__toy_minocc100__node_id",
             "h2_a1_legacy_shared_executor__toy_minocc100__node_id",
             "h2_a1_no_factor_loss__toy_minocc100__node_id",
-            "h2_a1_shared_pressure__toy_minocc100__node_id",
+            "h2_a1_per_type_pressure__toy_minocc100__node_id",
         ]
         cfg = json.loads((models / "h2_a1_gold_scalar_pressure__toy_minocc100__node_id" / "config.json").read_text())
         assert cfg["model_config"]["pressure_oracle_input"] == "gold_pre_scalar"
-        cfg = json.loads((models / "h2_a1_shared_pressure__toy_minocc100__node_id" / "config.json").read_text())
-        assert cfg["model_config"]["pressure_module_sharing"] == "shared"
+        cfg = json.loads((models / "h2_a1_per_type_pressure__toy_minocc100__node_id" / "config.json").read_text())
+        assert cfg["model_config"]["pressure_module_sharing"] == "per_type"
         cfg = json.loads((models / "h2_a1_no_factor_loss__toy_minocc100__node_id" / "config.json").read_text())
         assert cfg["training_config"]["factor_loss"]["enabled"] is False
