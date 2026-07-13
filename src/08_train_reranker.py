@@ -47,6 +47,7 @@ from modules.candidates import (
 )
 from modules.reranker import CandidateReranker, RerankerConfig, build_reranker
 from modules.reranker_eval import CandidateConstraintEvaluator
+from modules.class_hierarchy import CLASS_HIERARCHY_FILENAME
 from modules.provenance import (
     build_run_provenance,
     canonical_json_hash,
@@ -850,6 +851,7 @@ def main() -> None:
         assume_complete=training_cfg.assume_complete_entity_facts,
         constraint_scope=training_cfg.constraint_scope,
         use_encoded_ids=use_encoded_ids,
+        class_hierarchy_path=interim_path / CLASS_HIERARCHY_FILENAME,
     )
 
     use_node_embeddings, feature_dim, _, role_spec = infer_node_feature_spec(train_data)

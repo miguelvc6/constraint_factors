@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import torch
 from torch_geometric.data import Batch
@@ -15,16 +16,24 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from modules.candidates import CandidateConfig, build_inference_candidates
+from modules.class_hierarchy import (
+    CLASS_HIERARCHY_FILENAME,
+    ClassHierarchy,
+    build_training_class_hierarchy,
+    write_class_hierarchy,
+)
 from modules.constraint_semantics import RegistryEntry, build_constraint_instance
 from modules.data_encoders import ConstraintGraphData, GlobalIntEncoder
 from modules.repair_eval import (
     CandidateRepairs,
+    ConstraintRepairHeuristics,
     RepairSample,
     TriplePattern,
     ViolationContext,
     evaluate_global_repair_samples,
 )
 from modules.provenance import build_run_provenance, file_sha256, write_run_manifest
+from modules.reranker_eval import CandidateConstraintEvaluator
 
 
 def _load_module(path: Path, name: str):
@@ -37,6 +46,7 @@ def _load_module(path: Path, name: str):
 
 
 EVAL = _load_module(ROOT / "src" / "09_eval.py", "eval_09_integrity_test")
+LABELER = _load_module(ROOT / "src" / "05_constraint_labeler.py", "labeler_05_integrity_test")
 CONFIG_GENERATOR = _load_module(
     ROOT / "scripts" / "make_experiment_configs.py",
     "make_experiment_configs_integrity_test",
@@ -160,7 +170,9 @@ def test_global_metrics_use_pooled_srr_and_primary_transitions() -> None:
 def _encoder_with_tokens(*tokens: str) -> GlobalIntEncoder:
     encoder = GlobalIntEncoder()
     for token in tokens:
-        encoder.encode(f"http://www.wikidata.org/entity/{token}", add_new=True)
+        uri = f"http://www.wikidata.org/entity/{token}"
+        encoder.encode(uri, add_new=True)
+        encoder.encode(f"<{uri}>", add_new=True)
     encoder.freeze()
     return encoder
 
@@ -185,7 +197,6 @@ def test_registry_parameter_semantics_are_family_specific() -> None:
         encoder=encoder,
         constraint_type_name="inverse",
         constraint_type_id=1,
-        default_relation_predicates=[],
     )
     required = build_constraint_instance(
         2,
@@ -193,7 +204,6 @@ def test_registry_parameter_semantics_are_family_specific() -> None:
         encoder=encoder,
         constraint_type_name="itemRequiresStatement",
         constraint_type_id=2,
-        default_relation_predicates=[],
     )
 
     p20 = encoder.encode("http://www.wikidata.org/entity/P20", add_new=False)
@@ -205,6 +215,465 @@ def test_registry_parameter_semantics_are_family_specific() -> None:
     assert required.allowed_items == {q30}
     assert required.exceptions == {q40}
     assert required.applies_to_main_value is True
+
+
+@pytest.mark.parametrize(
+    ("relation_mode", "expected_predicates"),
+    [
+        ("Q21503252", {"P31"}),
+        ("Q21514624", {"P279"}),
+        ("Q30208840", {"P31", "P279"}),
+    ],
+)
+def test_p2309_relation_modes_resolve_to_statement_predicates(
+    relation_mode: str,
+    expected_predicates: set[str],
+) -> None:
+    encoder = _encoder_with_tokens(
+        "P10",
+        "P31",
+        "P279",
+        "P2308",
+        "P2309",
+        "Q30",
+        relation_mode,
+    )
+    entry = RegistryEntry(
+        constraint_type_raw="",
+        constraint_type_item="Q21503250",
+        constraint_type_index=1,
+        constraint_family="type",
+        constraint_label="type",
+        constraint_family_supported=True,
+        constrained_property_raw="P10",
+        param_predicates_raw=("P2308", "P2309"),
+        param_objects_raw=("Q30", relation_mode),
+    )
+    instance = build_constraint_instance(
+        1,
+        entry,
+        encoder=encoder,
+        constraint_type_name="type",
+        constraint_type_id=1,
+    )
+
+    decoded = {
+        str(encoder.decode(predicate)).rsplit("/", 1)[-1]
+        for predicate in instance.relation_predicates
+    }
+    assert decoded == expected_predicates
+
+
+def test_type_constraint_without_mandatory_p2309_is_unresolved() -> None:
+    encoder = _encoder_with_tokens("P10", "P31", "P279", "P2308", "Q30")
+    entry = RegistryEntry(
+        constraint_type_raw="",
+        constraint_type_item="Q21503250",
+        constraint_type_index=1,
+        constraint_family="type",
+        constraint_label="type",
+        constraint_family_supported=True,
+        constrained_property_raw="P10",
+        param_predicates_raw=("P2308",),
+        param_objects_raw=("Q30",),
+    )
+    instance = build_constraint_instance(
+        1,
+        entry,
+        encoder=encoder,
+        constraint_type_name="type",
+        constraint_type_id=1,
+    )
+    assert instance.relation_predicates == []
+
+
+def test_type_primary_reconstructs_pre_state_before_gold_addition() -> None:
+    encoder = _encoder_with_tokens(
+        "P10",
+        "P31",
+        "P279",
+        "P2308",
+        "P2309",
+        "Q1",
+        "Q2",
+        "Q30",
+        "Q21503252",
+    )
+    encoder._frozen = False
+    subject_placeholder = encoder.encode("subject", add_new=True)
+    constraint_id = encoder.encode("constraint::type-test", add_new=True)
+    encoder.freeze()
+
+    def encoded(token: str) -> int:
+        return encoder.encode(
+            f"http://www.wikidata.org/entity/{token}",
+            add_new=False,
+        )
+
+    subject = encoded("Q1")
+    obj = encoded("Q2")
+    constrained_property = encoded("P10")
+    instance_of = encoded("P31")
+    allowed_class = encoded("Q30")
+    row = {
+        "constraint_id": constraint_id,
+        "constraint_type": "type",
+        "subject": subject,
+        "predicate": constrained_property,
+        "object": obj,
+        "other_subject": 0,
+        "other_predicate": 0,
+        "other_object": 0,
+        "add_subject": subject_placeholder,
+        "add_predicate": instance_of,
+        "add_object": allowed_class,
+        "del_subject": 0,
+        "del_predicate": 0,
+        "del_object": 0,
+        # The serialized snapshot already contains the later addition.
+        "subject_predicates": [constrained_property, instance_of],
+        "subject_objects": [obj, allowed_class],
+        "object_predicates": [],
+        "object_objects": [],
+        "other_entity_predicates": [],
+        "other_entity_objects": [],
+        "local_constraint_ids": [constraint_id],
+        "local_constraint_ids_focus": [constraint_id],
+    }
+    registry = {
+        constraint_id: RegistryEntry(
+            constraint_type_raw="",
+            constraint_type_item="Q21503250",
+            constraint_type_index=1,
+            constraint_family="type",
+            constraint_label="type",
+            constraint_family_supported=True,
+            constrained_property_raw="P10",
+            param_predicates_raw=("P2308", "P2309"),
+            param_objects_raw=("Q30", "Q21503252"),
+        )
+    }
+
+    labeled, _, _ = LABELER._process_dataframe(
+        pd.DataFrame([row]),
+        registry,
+        encoder=encoder,
+        assume_complete=True,
+        use_encoded_ids=True,
+        constraint_scope="local",
+        factor_family_policy="supported_only",
+    )
+    result = labeled.iloc[0]
+    assert bool(result.primary_checkable_pre) is True
+    assert int(result.primary_satisfied_pre) == 0
+    assert bool(result.primary_checkable_post_gold) is True
+    assert int(result.primary_satisfied_post_gold) == 1
+    assert result.primary_validation_reason == "valid"
+
+    context = ViolationContext(
+        constraint_type="type",
+        constraint_id=constraint_id,
+        subject=subject,
+        predicate=constrained_property,
+        object=obj,
+        other_subject=0,
+        other_predicate=0,
+        other_object=0,
+        constraint_predicates=(encoded("P2308"), encoded("P2309")),
+        constraint_objects=(allowed_class, encoded("Q21503252")),
+    )
+    heuristics = ConstraintRepairHeuristics(
+        encoder=encoder,
+        placeholder_ids={},
+        none_class=0,
+    )
+    additions = heuristics.candidates_for(context).add
+    assert additions
+    assert {predicate for pattern in additions for predicate in (pattern.predicates or ())} == {
+        instance_of
+    }
+
+
+def test_type_primary_uses_transitive_training_hierarchy() -> None:
+    encoder = _encoder_with_tokens(
+        "P10",
+        "P31",
+        "P279",
+        "P2308",
+        "P2309",
+        "Q1",
+        "Q2",
+        "Q5",
+        "Q30",
+        "Q21503252",
+    )
+    encoder._frozen = False
+    subject_placeholder = encoder.encode("subject", add_new=True)
+    constraint_id = encoder.encode("constraint::transitive-type-test", add_new=True)
+    encoder.freeze()
+
+    def encoded(token: str) -> int:
+        return encoder.encode(
+            f"http://www.wikidata.org/entity/{token}",
+            add_new=False,
+        )
+
+    subject = encoded("Q1")
+    obj = encoded("Q2")
+    constrained_property = encoded("P10")
+    instance_of = encoded("P31")
+    human = encoded("Q5")
+    person = encoded("Q30")
+    row = {
+        "constraint_id": constraint_id,
+        "constraint_type": "type",
+        "subject": subject,
+        "predicate": constrained_property,
+        "object": obj,
+        "other_subject": 0,
+        "other_predicate": 0,
+        "other_object": 0,
+        "add_subject": subject_placeholder,
+        "add_predicate": instance_of,
+        "add_object": human,
+        "del_subject": 0,
+        "del_predicate": 0,
+        "del_object": 0,
+        "subject_predicates": [constrained_property],
+        "subject_objects": [obj],
+        "object_predicates": [],
+        "object_objects": [],
+        "other_entity_predicates": [],
+        "other_entity_objects": [],
+        "local_constraint_ids": [constraint_id],
+        "local_constraint_ids_focus": [constraint_id],
+    }
+    registry = {
+        constraint_id: RegistryEntry(
+            constraint_type_raw="",
+            constraint_type_item="Q21503250",
+            constraint_type_index=1,
+            constraint_family="type",
+            constraint_label="type",
+            constraint_family_supported=True,
+            constrained_property_raw="P10",
+            param_predicates_raw=("P2308", "P2309"),
+            param_objects_raw=("Q30", "Q21503252"),
+        )
+    }
+    hierarchy = ClassHierarchy.from_edges([(human, person), (person, human)])
+
+    labeled, _, _ = LABELER._process_dataframe(
+        pd.DataFrame([row]),
+        registry,
+        encoder=encoder,
+        assume_complete=True,
+        use_encoded_ids=True,
+        constraint_scope="local",
+        factor_family_policy="supported_only",
+        class_hierarchy=hierarchy,
+    )
+    result = labeled.iloc[0]
+    assert int(result.primary_satisfied_pre) == 0
+    assert int(result.primary_satisfied_post_gold) == 1
+    assert result.primary_gold_repair_status == "verified"
+    assert bool(result.primary_gold_repair_verified) is True
+    assert hierarchy.ancestors_including_self(human) == frozenset({human, person})
+
+
+def test_training_hierarchy_artifact_is_deterministic(tmp_path: Path) -> None:
+    train_path = tmp_path / "df_train.parquet"
+    pd.DataFrame(
+        [
+            {
+                "subject": 10,
+                "subject_predicates": [9, 9],
+                "subject_objects": [20, 20],
+                "object": 20,
+                "object_predicates": [9],
+                "object_objects": [30],
+                "other_subject": 10,
+                "other_object": 40,
+                "other_entity_predicates": [9],
+                "other_entity_objects": [50],
+            }
+        ]
+    ).to_parquet(train_path, index=False)
+
+    hierarchy = build_training_class_hierarchy(
+        train_path,
+        p279_predicate_id=9,
+        batch_size=1,
+    )
+    assert list(hierarchy.direct_edges()) == [(10, 20), (20, 30), (40, 50)]
+    assert hierarchy.reaches_any([10], {30}) is True
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first_manifest = write_class_hierarchy(
+        hierarchy,
+        first,
+        p279_predicate_id=9,
+        source_dataset_variant="fixture",
+        source_manifest_path=None,
+    )
+    second_manifest = write_class_hierarchy(
+        hierarchy,
+        second,
+        p279_predicate_id=9,
+        source_dataset_variant="fixture",
+        source_manifest_path=None,
+    )
+    assert first_manifest["outputs"] == second_manifest["outputs"]
+    assert list(ClassHierarchy.load(first / CLASS_HIERARCHY_FILENAME).direct_edges()) == [
+        (10, 20),
+        (20, 30),
+        (40, 50),
+    ]
+
+
+def test_shared_subject_comparison_facts_belong_to_other_object() -> None:
+    row = next(
+        pd.DataFrame(
+            [
+                {
+                    "subject": 10,
+                    "predicate": 2,
+                    "object": 20,
+                    "other_subject": 10,
+                    "other_predicate": 3,
+                    "other_object": 30,
+                    "subject_predicates": [],
+                    "subject_objects": [],
+                    "object_predicates": [],
+                    "object_objects": [],
+                    "other_entity_predicates": [9],
+                    "other_entity_objects": [40],
+                }
+            ]
+        ).itertuples(index=False)
+    )
+    facts, _ = LABELER._build_facts_state(
+        row,
+        p_local={2, 3, 9},
+        assume_complete=True,
+        cast_int=True,
+    )
+    assert facts[30][9] == {40}
+    assert 9 not in facts[10]
+
+
+def test_candidate_evaluator_loads_persisted_class_hierarchy(tmp_path: Path) -> None:
+    encoder = _encoder_with_tokens(
+        "P10",
+        "P31",
+        "P2308",
+        "P2309",
+        "Q1",
+        "Q2",
+        "Q5",
+        "Q30",
+        "Q999",
+        "Q21503250",
+        "Q21503252",
+    )
+
+    def encoded(token: str) -> int:
+        return encoder.encode(
+            f"http://www.wikidata.org/entity/{token}",
+            add_new=False,
+        )
+
+    registry_payload = {
+        "Q999": {
+            "constraint_type": "Q21503250",
+            "constraint_type_item": "Q21503250",
+            "constraint_type_index": 1,
+            "constraint_family": "type",
+            "constraint_label": "subject type constraint",
+            "constraint_family_supported": True,
+            "constrained_property": "P10",
+            "param_predicates": ["P2308", "P2309"],
+            "param_objects": ["Q30", "Q21503252"],
+        }
+    }
+    registry_path = tmp_path / "registry.parquet"
+    pd.DataFrame(
+        {"registry_json": [json.dumps(registry_payload)]}
+    ).to_parquet(registry_path, index=False)
+
+    hierarchy_root = tmp_path / "hierarchy"
+    write_class_hierarchy(
+        ClassHierarchy.from_edges([(encoded("Q5"), encoded("Q30"))]),
+        hierarchy_root,
+        p279_predicate_id=1,
+        source_dataset_variant="fixture",
+        source_manifest_path=None,
+    )
+    row = next(
+        pd.DataFrame(
+            [
+                {
+                    "constraint_id": encoded("Q999"),
+                    "constraint_type": "type",
+                    "subject": encoded("Q1"),
+                    "predicate": encoded("P10"),
+                    "object": encoded("Q2"),
+                    "other_subject": 0,
+                    "other_predicate": 0,
+                    "other_object": 0,
+                    "add_subject": encoded("Q1"),
+                    "add_predicate": encoded("P31"),
+                    "add_object": encoded("Q5"),
+                    "del_subject": 0,
+                    "del_predicate": 0,
+                    "del_object": 0,
+                    "subject_predicates": [encoded("P10")],
+                    "subject_objects": [encoded("Q2")],
+                    "object_predicates": [],
+                    "object_objects": [],
+                    "other_entity_predicates": [],
+                    "other_entity_objects": [],
+                    "factor_constraint_ids": [encoded("Q999")],
+                    "local_constraint_ids": [encoded("Q999")],
+                }
+            ]
+        ).itertuples(index=False)
+    )
+    candidate = [
+        encoded("Q1"),
+        encoded("P31"),
+        encoded("Q5"),
+        0,
+        0,
+        0,
+    ]
+    direct_evaluator = CandidateConstraintEvaluator(
+        str(registry_path),
+        encoder=encoder,
+        assume_complete=True,
+        constraint_scope="local",
+        use_encoded_ids=True,
+    )
+    hierarchy_evaluator = CandidateConstraintEvaluator(
+        str(registry_path),
+        encoder=encoder,
+        assume_complete=True,
+        constraint_scope="local",
+        use_encoded_ids=True,
+        class_hierarchy_path=hierarchy_root / CLASS_HIERARCHY_FILENAME,
+    )
+
+    assert direct_evaluator.evaluate_full(
+        row,
+        candidate_slots=candidate,
+        primary_factor_index=0,
+    )["primary_satisfied"] == 0
+    assert hierarchy_evaluator.evaluate_full(
+        row,
+        candidate_slots=candidate,
+        primary_factor_index=0,
+    )["primary_satisfied"] == 1
 
 
 def test_constraint_graph_data_offsets_local_node_references_only() -> None:

@@ -43,6 +43,7 @@ from modules.candidates import (
     score_candidates_from_logits,
 )
 from modules.config import ModelConfig, TrainingConfig
+from modules.class_hierarchy import CLASS_HIERARCHY_FILENAME
 from modules.data_encoders import (
     IDENTITY_TO_FEATURE_FILENAME,
     GlobalIntEncoder,
@@ -501,6 +502,7 @@ def _maybe_prepare_global_support(
             assume_complete=True,
             constraint_scope=constraint_scope,
             use_encoded_ids=True,
+            class_hierarchy_path=interim_base / CLASS_HIERARCHY_FILENAME,
         )
     except Exception as exc:
         if strict:

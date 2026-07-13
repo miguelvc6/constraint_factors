@@ -99,8 +99,12 @@ validated/primary-filtered full variant by deterministic exact-size stratified s
 **Artifacts**
 - `df_train.parquet`, `df_val.parquet`, `df_test.parquet`
 - the complete identity/feature encoder contract copied unchanged
+- `class_hierarchy.parquet` and `class_hierarchy_manifest.json`, copied
+  unchanged from the validated source
 - parent-linked `dataset_manifest.json`
 - `sampling_report.csv`, `sampling_report.md`, `sampling_metadata.json`
+- `sample_primary_validation_audit_by_constraint.csv`
+- `sample_gold_repair_audit_by_constraint.csv`
 - `hist_local_constraint_ids.csv`
 - `hist_local_constraint_ids_by_split.csv`
 
@@ -113,6 +117,9 @@ Default bins are `1-32`, `33-64`, `65-83`, `84-107`, `108`,
 `109-160`, `161-267`, and `268+`. The paper run uses
 `--target-rows 1000000 --seed 42`; proportional allocation yields exactly one
 million retained rows while keeping at least one row per represented stratum.
+The two sampled semantic audits report the realized family composition and
+POST_GOLD verification status; their counts are also embedded under `sampling`
+in the dataset manifest.
 
 ## 5) Wikidata Text Cache (`04_wikidata_retriever.py`)
 **Location:** `data/interim/wikidata_text.parquet`
@@ -192,6 +199,10 @@ re-run.
 - `filtered_factors_<scope>.csv`, `filtered_factors_<scope>.md`
 - `filtered_factor_families_<scope>.csv`
 - `primary_validation_audit.csv`
+- `primary_validation_audit_by_constraint.csv`
+- `primary_gold_repair_audit_by_constraint.csv`
+- `class_hierarchy.parquet`
+- `class_hierarchy_manifest.json`
 - `dataset_manifest.json`
 
 **Additional parquet columns**
@@ -204,6 +215,7 @@ re-run.
 - `primary_factor_index`, `primary_checkable_pre`, `primary_satisfied_pre`
 - `primary_checkable_post_gold`, `primary_satisfied_post_gold`
 - `primary_validation_reason`
+- `primary_gold_repair_status`, `primary_gold_repair_verified`
 
 The labeler can operate on either `local_constraint_ids` or
 `local_constraint_ids_focus`, controlled by `--constraint-scope`.
@@ -211,7 +223,16 @@ By default, `--factor-family-policy supported_only` keeps raw local-closure
 columns unchanged but writes only supported executable constraints to aligned
 factor arrays. Paper data additionally uses `--filter-invalid-primary`, which
 excludes every primary that is exempt, out of scope, unsupported, uncheckable,
-or already satisfied and records the reason.
+or already satisfied and records the reason. The family-level audit prevents an
+entire primary task family from disappearing behind aggregate exclusion counts.
+Before checking PRE labels, the gold transition is reversed against serialized
+entity facts: additions are removed and deletions are restored. The manifest
+records the executable constraint semantics version used for this normalization.
+Semantics v4 also freezes a training-only direct `P279` graph and uses its
+reflexive-transitive closure for `type` and `valueType`. The hierarchy manifest
+records its training source and hashes. Primary eligibility remains a PRE-state
+definition; the separate gold-repair fields report whether POST_GOLD is
+checkable and satisfied under the same executable semantics.
 When this directory exists, `06_graph.py` uses it automatically unless
 `--use-unlabeled-interim` is passed.
 

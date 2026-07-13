@@ -1,10 +1,12 @@
 
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 
 import numpy as np
 
+from modules.class_hierarchy import ClassHierarchy
 from modules.constraint_checkers import (
     CHECKERS,
     ConstraintInstance,
@@ -20,6 +22,11 @@ from modules.constraint_semantics import (
     resolve_registry_mapping,
 )
 from modules.data_encoders import GlobalIntEncoder
+from modules.evidence_edits import (
+    normalize_pre_edit_state,
+    resolve_other_entity_id,
+    resolve_row_edits,
+)
 
 PLACEHOLDER_LABELS: tuple[str, ...] = (
     "subject",
@@ -59,6 +66,7 @@ class _ReusableEvidenceState:
         "other_subject",
         "other_predicate",
         "other_object",
+        "class_hierarchy",
     )
 
     def __init__(
@@ -74,6 +82,7 @@ class _ReusableEvidenceState:
         other_subject: int,
         other_predicate: int,
         other_object: int,
+        class_hierarchy: ClassHierarchy | None,
     ) -> None:
         self.facts_by_entity = facts_by_entity
         self.predicates_present = predicates_present
@@ -85,6 +94,7 @@ class _ReusableEvidenceState:
         self.other_subject = other_subject
         self.other_predicate = other_predicate
         self.other_object = other_object
+        self.class_hierarchy = class_hierarchy
 
     def entity_in_scope(self, entity_id: int) -> bool:
         return entity_id in self.facts_by_entity
@@ -258,13 +268,14 @@ def _compute_p_local(row: Any, *, cast_int: bool = True) -> Set[Any]:
 
 
 def _pick_other_entity_id(row: Any, *, cast_int: bool = True) -> Any:
+    subject = _coerce_value(getattr(row, "subject", None), cast_int=cast_int)
     other_subject = _coerce_value(getattr(row, "other_subject", None), cast_int=cast_int)
-    if other_subject not in (None, "", 0):
-        return other_subject
     other_object = _coerce_value(getattr(row, "other_object", None), cast_int=cast_int)
-    if other_object not in (None, "", 0):
-        return other_object
-    return 0
+    return resolve_other_entity_id(
+        subject=subject,
+        other_subject=other_subject,
+        other_object=other_object,
+    )
 
 
 def _build_facts_for_entity(
@@ -605,15 +616,6 @@ def _evidence_preservation_details(
     }
 
 
-def _resolve_default_relations(encoder: GlobalIntEncoder | None) -> List[int]:
-    if encoder is None:
-        return []
-    p31 = _resolve_registry_id("P31", encoder)
-    p279 = _resolve_registry_id("P279", encoder)
-    defaults = [pid for pid in (p31, p279) if pid]
-    return defaults
-
-
 def _constraint_type_id_from_registry(
     registry_entry: RegistryEntry,
     encoder: GlobalIntEncoder | None,
@@ -629,7 +631,6 @@ def _build_constraint_instance(
     encoder: GlobalIntEncoder | None,
     constraint_type_name: str,
     constraint_type_id: int,
-    default_relation_predicates: List[int],
 ) -> ConstraintInstance:
     return build_registry_constraint_instance(
         constraint_id,
@@ -637,7 +638,6 @@ def _build_constraint_instance(
         encoder=encoder,
         constraint_type_name=constraint_type_name,
         constraint_type_id=constraint_type_id,
-        default_relation_predicates=default_relation_predicates,
     )
 
 
@@ -676,6 +676,7 @@ class CandidateConstraintEvaluator:
         assume_complete: bool,
         constraint_scope: str,
         use_encoded_ids: bool,
+        class_hierarchy_path: str | Path | None = None,
     ) -> None:
         registry_raw = _load_registry(registry_path)
         self._registry_by_id = _resolve_registry_mapping(
@@ -685,9 +686,13 @@ class CandidateConstraintEvaluator:
         self._assume_complete = assume_complete
         self._constraint_scope = constraint_scope
         self._use_encoded_ids = use_encoded_ids
-        self._default_relations = _resolve_default_relations(encoder)
         self._placeholder_token_ids = _resolve_placeholder_token_ids(encoder)
         self._constraint_cache: Dict[str, ConstraintInstance] = {}
+        self._class_hierarchy = (
+            ClassHierarchy.load(Path(class_hierarchy_path))
+            if class_hierarchy_path is not None
+            else None
+        )
 
     def _get_constraint_instance(self, constraint_id: Any) -> ConstraintInstance | None:
         entry = _lookup_registry_entry(
@@ -707,7 +712,6 @@ class CandidateConstraintEvaluator:
             encoder=self._encoder,
             constraint_type_name=type_name,
             constraint_type_id=constraint_type_id,
-            default_relation_predicates=self._default_relations,
         )
         self._constraint_cache[cache_key] = instance
         return instance
@@ -753,7 +757,17 @@ class CandidateConstraintEvaluator:
                 f"gold_index {gold_index} out of range for {candidate_count} candidates."
             )
 
+        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
+        resolved_edits = resolve_row_edits(
+            row,
+            placeholder_map=placeholder_map,
+            coerce_value=lambda value: _coerce_value(
+                value,
+                cast_int=self._use_encoded_ids,
+            ),
+        )
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
+        p_local.update(resolved_edits.predicates)
         p_local_set = p_local
         facts_by_entity, predicates_present = _build_facts_state(
             row,
@@ -761,6 +775,7 @@ class CandidateConstraintEvaluator:
             assume_complete=self._assume_complete,
             cast_int=self._use_encoded_ids,
         )
+        normalize_pre_edit_state(facts_by_entity, predicates_present, resolved_edits)
         subject = _coerce_value(getattr(row, "subject", 0), cast_int=self._use_encoded_ids)
         predicate = _coerce_value(getattr(row, "predicate", 0), cast_int=self._use_encoded_ids)
         obj = _coerce_value(getattr(row, "object", 0), cast_int=self._use_encoded_ids)
@@ -810,8 +825,6 @@ class CandidateConstraintEvaluator:
             else None
         )
 
-        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
-
         state = _ReusableEvidenceState(
             facts_by_entity=facts_by_entity,
             predicates_present=predicates_present,
@@ -823,6 +836,7 @@ class CandidateConstraintEvaluator:
             other_subject=other_subject,
             other_predicate=other_predicate,
             other_object=other_object,
+            class_hierarchy=self._class_hierarchy,
         )
 
         tracked_checkers: List[tuple[Any, Any, ConstraintInstance]] = []
@@ -911,7 +925,17 @@ class CandidateConstraintEvaluator:
         primary_factor_index: int | None = None,
         factor_constraint_ids: Sequence[int] | None = None,
     ) -> Dict[str, Any]:
+        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
+        resolved_edits = resolve_row_edits(
+            row,
+            placeholder_map=placeholder_map,
+            coerce_value=lambda value: _coerce_value(
+                value,
+                cast_int=self._use_encoded_ids,
+            ),
+        )
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
+        p_local.update(resolved_edits.predicates)
         p_local_set = p_local
         facts_by_entity, predicates_present = _build_facts_state(
             row,
@@ -919,6 +943,7 @@ class CandidateConstraintEvaluator:
             assume_complete=self._assume_complete,
             cast_int=self._use_encoded_ids,
         )
+        normalize_pre_edit_state(facts_by_entity, predicates_present, resolved_edits)
         subject = _coerce_value(getattr(row, "subject", 0), cast_int=self._use_encoded_ids)
         predicate = _coerce_value(getattr(row, "predicate", 0), cast_int=self._use_encoded_ids)
         obj = _coerce_value(getattr(row, "object", 0), cast_int=self._use_encoded_ids)
@@ -937,9 +962,9 @@ class CandidateConstraintEvaluator:
             other_subject=other_subject,
             other_predicate=other_predicate,
             other_object=other_object,
+            class_hierarchy=self._class_hierarchy,
         )
 
-        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
         post_facts, post_predicates, missing_edits = _build_post_state_for_candidate(
             facts_by_entity,
             predicates_present,
@@ -959,6 +984,7 @@ class CandidateConstraintEvaluator:
             other_subject=other_subject,
             other_predicate=other_predicate,
             other_object=other_object,
+            class_hierarchy=self._class_hierarchy,
         )
 
         if factor_constraint_ids is not None:
@@ -1120,7 +1146,17 @@ class CandidateConstraintEvaluator:
     ) -> List[Dict[str, Any]]:
         if not candidates:
             return []
+        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
+        resolved_edits = resolve_row_edits(
+            row,
+            placeholder_map=placeholder_map,
+            coerce_value=lambda value: _coerce_value(
+                value,
+                cast_int=self._use_encoded_ids,
+            ),
+        )
         p_local = _compute_p_local(row, cast_int=self._use_encoded_ids)
+        p_local.update(resolved_edits.predicates)
         p_local_set = p_local
         facts_by_entity, predicates_present = _build_facts_state(
             row,
@@ -1128,6 +1164,7 @@ class CandidateConstraintEvaluator:
             assume_complete=self._assume_complete,
             cast_int=self._use_encoded_ids,
         )
+        normalize_pre_edit_state(facts_by_entity, predicates_present, resolved_edits)
         subject = _coerce_value(getattr(row, "subject", 0), cast_int=self._use_encoded_ids)
         predicate = _coerce_value(getattr(row, "predicate", 0), cast_int=self._use_encoded_ids)
         obj = _coerce_value(getattr(row, "object", 0), cast_int=self._use_encoded_ids)
@@ -1146,6 +1183,7 @@ class CandidateConstraintEvaluator:
             other_subject=other_subject,
             other_predicate=other_predicate,
             other_object=other_object,
+            class_hierarchy=self._class_hierarchy,
         )
 
         if self._constraint_scope == "focus":
@@ -1155,7 +1193,6 @@ class CandidateConstraintEvaluator:
         else:
             constraint_ids_raw = getattr(row, "local_constraint_ids", None)
         local_constraint_ids = _coerce_sequence(constraint_ids_raw, cast_int=self._use_encoded_ids)
-        placeholder_map = _build_placeholder_map(self._encoder, row, self._placeholder_token_ids)
         if not local_constraint_ids:
             results: List[Dict[str, Any]] = []
             for candidate_slots in candidates:
@@ -1178,6 +1215,7 @@ class CandidateConstraintEvaluator:
                     other_subject=other_subject,
                     other_predicate=other_predicate,
                     other_object=other_object,
+                    class_hierarchy=self._class_hierarchy,
                 )
                 evidence_details = _evidence_preservation_details(
                     pre_state=pre_state,
@@ -1264,6 +1302,7 @@ class CandidateConstraintEvaluator:
                 other_subject=other_subject,
                 other_predicate=other_predicate,
                 other_object=other_object,
+                class_hierarchy=self._class_hierarchy,
             )
 
             post_checkable: List[bool] = []

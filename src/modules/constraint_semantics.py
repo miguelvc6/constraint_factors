@@ -20,6 +20,20 @@ PARAM_CLASS = "P2308"
 PARAM_RELATION = "P2309"
 PARAM_SCOPE = "P4680"
 
+RELATION_MODE_INSTANCE_OF = "Q21503252"
+RELATION_MODE_SUBCLASS_OF = "Q21514624"
+RELATION_MODE_INSTANCE_OR_SUBCLASS_OF = "Q30208840"
+CONSTRAINT_SEMANTICS_VERSION = "wikidata-main-v4"
+
+RELATION_MODE_PREDICATES: dict[str, tuple[str, ...]] = {
+    RELATION_MODE_INSTANCE_OF: ("P31",),
+    RELATION_MODE_SUBCLASS_OF: ("P279",),
+    RELATION_MODE_INSTANCE_OR_SUBCLASS_OF: ("P31", "P279"),
+    # Accept direct property values for compatibility with noncanonical dumps.
+    "P31": ("P31",),
+    "P279": ("P279",),
+}
+
 # Both the historical dump values and current constraint-scope items are
 # accepted. The correction corpus contains main-value statements only.
 MAIN_VALUE_SCOPE_ITEMS = frozenset({"Q54828448", "Q46466787"})
@@ -163,6 +177,35 @@ def _normalized_objects(
     }
 
 
+def resolve_relation_predicate_ids(
+    relation_values: Iterable[Any],
+    *,
+    encoder: GlobalIntEncoder | None,
+) -> list[int]:
+    """Translate P2309 relation-mode items into executable predicates.
+
+    P2309 values are Q-items describing a relation mode, not predicates that
+    can occur on entity statements. P2309 is mandatory for type constraints;
+    an absent or explicitly unknown mode remains unresolved and uncheckable.
+    """
+
+    values = list(relation_values)
+    if not values:
+        return []
+
+    predicate_ids: list[int] = []
+    for value in values:
+        raw_value: Any = value
+        if isinstance(value, int) and encoder is not None:
+            raw_value = encoder.decode(value)
+        mode = normalize_token(str(raw_value)) if raw_value is not None else None
+        for predicate in RELATION_MODE_PREDICATES.get(mode or "", ()):
+            predicate_id = resolve_registry_id(predicate, encoder)
+            if predicate_id and predicate_id not in predicate_ids:
+                predicate_ids.append(predicate_id)
+    return predicate_ids
+
+
 def build_constraint_instance(
     constraint_id: int,
     registry_entry: RegistryEntry,
@@ -170,7 +213,6 @@ def build_constraint_instance(
     encoder: GlobalIntEncoder | None,
     constraint_type_name: str,
     constraint_type_id: int,
-    default_relation_predicates: List[int],
 ) -> ConstraintInstance:
     constrained_property = resolve_registry_id(
         registry_entry.constrained_property_raw,
@@ -186,11 +228,15 @@ def build_constraint_instance(
     }
     item_ids = set(_resolved_objects(pairs, PARAM_ITEMS, encoder))
     class_ids = set(_resolved_objects(pairs, PARAM_CLASS, encoder))
-    relation_ids = [
-        value
-        for value in _resolved_objects(pairs, PARAM_RELATION, encoder)
-        if value
+    relation_values = [
+        obj_raw
+        for pred_raw, obj_raw in pairs
+        if (normalize_token(pred_raw) or pred_raw) == PARAM_RELATION
     ]
+    relation_ids = resolve_relation_predicate_ids(
+        relation_values,
+        encoder=encoder,
+    )
     exception_ids = set(_resolved_objects(pairs, PARAM_EXCEPTIONS, encoder))
     scope_items = _normalized_objects(pairs, PARAM_SCOPE)
     applies_to_main = not scope_items or bool(scope_items & MAIN_VALUE_SCOPE_ITEMS)
@@ -204,9 +250,6 @@ def build_constraint_instance(
         required_properties = set(property_ids)
     elif constraint_type_name == "conflictWith":
         conflict_properties = set(property_ids)
-
-    if not relation_ids:
-        relation_ids = list(default_relation_predicates)
 
     return ConstraintInstance(
         constraint_id=int(constraint_id),

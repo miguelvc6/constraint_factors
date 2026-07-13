@@ -54,6 +54,8 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm.auto import tqdm
 
+from modules.constraint_semantics import resolve_relation_predicate_ids
+from modules.evidence_edits import resolve_other_entity_id
 from modules.data_encoders import (
     ArtifactWriteResult,
     ConstraintGraphData,
@@ -613,13 +615,17 @@ def create_graph(
     # add_edge(graph, "subject_objects", "subject_predicates", "subject")
     # add_edge(graph, "object_objects", "object_predicates", "object")
 
-    # pick the "other_entity"
-    if graph["other_subject"] == graph["subject"]:
+    # Pick the identity represented by the third serialized entity description.
+    other_entity_id = resolve_other_entity_id(
+        subject=graph["subject"],
+        other_subject=graph["other_subject"],
+        other_object=graph["other_object"],
+    )
+    if other_entity_id == graph["other_object"] and other_entity_id != graph["other_subject"]:
         other_entity_name = "other_object"
-    elif graph["other_object"] == graph["object"]:
+    elif other_entity_id == graph["other_subject"]:
         other_entity_name = "other_subject"
     else:
-        assert graph["other_subject"] == graph["other_predicate"] == graph["other_object"] == 0
         other_entity_name = None
 
     if other_entity_name is not None:
@@ -630,15 +636,6 @@ def create_graph(
     # Inverse constraints encode their inverse predicate with the standard
     # property-constraint parameter P2306.
     param_inverse_gid = param_property_gid
-    default_relation_gids = [
-        gid
-        for gid in (
-            _resolve_registry_id("P31"),
-            _resolve_registry_id("P279"),
-        )
-        if gid is not None
-    ]
-
     primary_constraint_id = int(graph["constraint_id"])
 
     # add constraint factor branches
@@ -779,6 +776,15 @@ def create_graph(
                     matches.append(obj_gid)
             return matches
 
+        def _collect_param_objects(param_predicate_gid: int) -> list[Any]:
+            if not param_predicate_gid:
+                return []
+            return [
+                obj_raw
+                for pred_raw, obj_raw in zip(param_predicates, param_objects)
+                if _maybe_encode_registry_token(pred_raw) == param_predicate_gid
+            ]
+
         matched_predicate_local_ids = 0
         wiring_edges_created = 0
         matched_focus_predicate = False
@@ -812,15 +818,17 @@ def create_graph(
                 for obj_gid in _collect_param_object_gids(param_property_gid):
                     _add_observed(obj_gid)
             elif constraint_type == "type":
-                relation_gids = _collect_param_object_gids(param_relation_gid)
-                if not relation_gids:
-                    relation_gids = list(default_relation_gids)
+                relation_gids = resolve_relation_predicate_ids(
+                    _collect_param_objects(param_relation_gid),
+                    encoder=global_int_encoder,
+                )
                 for obj_gid in relation_gids:
                     _add_observed(obj_gid)
             elif constraint_type == "valueType":
-                relation_gids = _collect_param_object_gids(param_relation_gid)
-                if not relation_gids:
-                    relation_gids = list(default_relation_gids)
+                relation_gids = resolve_relation_predicate_ids(
+                    _collect_param_objects(param_relation_gid),
+                    encoder=global_int_encoder,
+                )
                 for obj_gid in relation_gids:
                     _add_observed(obj_gid)
 

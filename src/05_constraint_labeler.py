@@ -17,18 +17,31 @@ from typing import Any, Dict, List, Sequence, Set, Tuple
 import numpy as np
 import pandas as pd
 
+from modules.class_hierarchy import (
+    CLASS_HIERARCHY_FILENAME,
+    CLASS_HIERARCHY_MANIFEST_FILENAME,
+    ClassHierarchy,
+    build_training_class_hierarchy,
+    write_class_hierarchy,
+)
 from modules.constraint_checkers import (
     ConstraintInstance,
     EvidenceState,
     evaluate_constraint,
 )
 from modules.constraint_semantics import (
+    CONSTRAINT_SEMANTICS_VERSION,
     RegistryEntry,
     build_constraint_instance as build_registry_constraint_instance,
     load_registry,
     lookup_registry_entry,
     resolve_registry_id,
     resolve_registry_mapping,
+)
+from modules.evidence_edits import (
+    normalize_pre_edit_state,
+    resolve_other_entity_id,
+    resolve_row_edits,
 )
 from modules.data_encoders import GlobalIntEncoder, encoder_path
 from modules.data_encoders import (
@@ -105,13 +118,14 @@ def _compute_p_local(row: Any, *, cast_int: bool = True) -> Set[Any]:
 
 
 def _pick_other_entity_id(row: Any, *, cast_int: bool = True) -> Any:
+    subject = _coerce_value(getattr(row, "subject", None), cast_int=cast_int)
     other_subject = _coerce_value(getattr(row, "other_subject", None), cast_int=cast_int)
-    if other_subject not in (None, "", 0):
-        return other_subject
     other_object = _coerce_value(getattr(row, "other_object", None), cast_int=cast_int)
-    if other_object not in (None, "", 0):
-        return other_object
-    return 0
+    return resolve_other_entity_id(
+        subject=subject,
+        other_subject=other_subject,
+        other_object=other_object,
+    )
 
 
 def _build_facts_state(
@@ -248,7 +262,6 @@ def _build_constraint_instance(
     encoder: GlobalIntEncoder | None,
     constraint_type_name: str,
     constraint_type_id: int,
-    default_relation_predicates: List[int],
 ) -> ConstraintInstance:
     return build_registry_constraint_instance(
         constraint_id,
@@ -256,7 +269,6 @@ def _build_constraint_instance(
         encoder=encoder,
         constraint_type_name=constraint_type_name,
         constraint_type_id=constraint_type_id,
-        default_relation_predicates=default_relation_predicates,
     )
 
 
@@ -317,15 +329,6 @@ def _constraint_type_id_from_registry(
     return int(registry_entry.constraint_type_index)
 
 
-def _resolve_default_relations(encoder: GlobalIntEncoder | None) -> List[int]:
-    if encoder is None:
-        return []
-    p31 = _resolve_registry_id("P31", encoder)
-    p279 = _resolve_registry_id("P279", encoder)
-    defaults = [pid for pid in (p31, p279) if pid]
-    return defaults
-
-
 def _process_dataframe(
     df: pd.DataFrame,
     registry_by_id: Dict[int, RegistryEntry] | Dict[str, RegistryEntry],
@@ -335,8 +338,8 @@ def _process_dataframe(
     use_encoded_ids: bool,
     constraint_scope: str,
     factor_family_policy: str,
+    class_hierarchy: ClassHierarchy | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Counter[str]], Counter[str]]:
-    default_relation_predicates = _resolve_default_relations(encoder)
     constraint_cache: Dict[str, ConstraintInstance] = {}
     coverage: Dict[str, Counter[str]] = defaultdict(Counter)
     filter_stats: Counter[str] = Counter()
@@ -357,12 +360,21 @@ def _process_dataframe(
     primary_checkable_post: List[bool] = []
     primary_satisfied_post: List[int] = []
     primary_validation_reasons: List[str] = []
+    primary_gold_repair_statuses: List[str] = []
 
     for row in df.itertuples(index=False):
+        placeholder_map = _build_placeholder_map(encoder, row)
+        resolved_edits = resolve_row_edits(
+            row,
+            placeholder_map=placeholder_map,
+            coerce_value=lambda value: _coerce_value(value, cast_int=use_encoded_ids),
+        )
         p_local = _compute_p_local(row, cast_int=use_encoded_ids)
+        p_local.update(resolved_edits.predicates)
         facts_by_entity, predicates_present = _build_facts_state(
             row, p_local=p_local, assume_complete=assume_complete, cast_int=use_encoded_ids
         )
+        normalize_pre_edit_state(facts_by_entity, predicates_present, resolved_edits)
 
         subject = _coerce_value(getattr(row, "subject", 0), cast_int=use_encoded_ids)
         predicate = _coerce_value(getattr(row, "predicate", 0), cast_int=use_encoded_ids)
@@ -382,13 +394,13 @@ def _process_dataframe(
             other_subject=other_subject,
             other_predicate=other_predicate,
             other_object=other_object,
+            class_hierarchy=class_hierarchy,
         )
 
         post_facts = {
             ent: {pred: set(values) for pred, values in facts.items()} for ent, facts in facts_by_entity.items()
         }
         post_predicates = {ent: set(preds) for ent, preds in predicates_present.items()}
-        placeholder_map = _build_placeholder_map(encoder, row)
         missing_edits = _apply_edit(
             post_facts,
             post_predicates,
@@ -409,6 +421,7 @@ def _process_dataframe(
             other_subject=other_subject,
             other_predicate=other_predicate,
             other_object=other_object,
+            class_hierarchy=class_hierarchy,
         )
 
         if constraint_scope == "focus":
@@ -458,7 +471,6 @@ def _process_dataframe(
                     encoder=encoder,
                     constraint_type_name=type_name,
                     constraint_type_id=constraint_type_id,
-                    default_relation_predicates=default_relation_predicates,
                 )
 
             constraint_instance = constraint_cache[cache_key]
@@ -540,7 +552,17 @@ def _process_dataframe(
             primary_checkable_post.append(False)
             primary_satisfied_post.append(0)
         primary_validation_reasons.append(primary_reason)
+        if primary_reason != "valid":
+            gold_repair_status = "ineligible_pre"
+        elif primary_index < 0 or not checkable_post_row[primary_index]:
+            gold_repair_status = "post_uncheckable"
+        elif satisfied_post_row[primary_index]:
+            gold_repair_status = "verified"
+        else:
+            gold_repair_status = "post_unsatisfied"
+        primary_gold_repair_statuses.append(gold_repair_status)
         filter_stats[f"primary_validation::{primary_reason}"] += 1
+        filter_stats[f"primary_gold_repair::{gold_repair_status}"] += 1
 
     df = df.copy()
     df["factor_checkable_pre"] = factor_checkable_pre
@@ -559,6 +581,10 @@ def _process_dataframe(
     df["primary_checkable_post_gold"] = primary_checkable_post
     df["primary_satisfied_post_gold"] = primary_satisfied_post
     df["primary_validation_reason"] = primary_validation_reasons
+    df["primary_gold_repair_status"] = primary_gold_repair_statuses
+    df["primary_gold_repair_verified"] = [
+        status == "verified" for status in primary_gold_repair_statuses
+    ]
 
     return df, coverage, filter_stats
 
@@ -825,6 +851,8 @@ def _write_labeled_manifest(
     output_root: Path,
     rows_by_split: dict[str, int],
     exclusions: Counter[str],
+    exclusions_by_constraint: Counter[str],
+    gold_repairs_by_constraint: Counter[str],
     filter_invalid_primary: bool,
 ) -> None:
     source_manifest_path = input_dir / "dataset_manifest.json"
@@ -840,9 +868,15 @@ def _write_labeled_manifest(
         if source_manifest_path.exists()
         else None,
         "semantic_labeling": {
-            "version": "wikidata-main-v2",
+            "version": CONSTRAINT_SEMANTICS_VERSION,
             "filter_invalid_primary": bool(filter_invalid_primary),
             "exclusions": dict(sorted(exclusions.items())),
+            "primary_validation_by_constraint": dict(
+                sorted(exclusions_by_constraint.items())
+            ),
+            "gold_repair_by_constraint": dict(
+                sorted(gold_repairs_by_constraint.items())
+            ),
         },
         "rows": dict(sorted(rows_by_split.items())),
         "outputs": {
@@ -856,7 +890,11 @@ def _write_labeled_manifest(
                         FEATURE_ENCODER_FILENAME,
                         LEGACY_ENCODER_FILENAME,
                         IDENTITY_TO_FEATURE_FILENAME,
+                        CLASS_HIERARCHY_FILENAME,
+                        CLASS_HIERARCHY_MANIFEST_FILENAME,
                         "primary_validation_audit.csv",
+                        "primary_validation_audit_by_constraint.csv",
+                        "primary_gold_repair_audit_by_constraint.csv",
                     )
                     if (output_root / filename).exists()
                 ]
@@ -976,9 +1014,34 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     _copy_dataset_contract(input_dir, output_root)
 
+    train_parquet = input_dir / "df_train.parquet"
+    if not use_encoded_ids or encoder is None:
+        raise SystemExit(
+            f"{CONSTRAINT_SEMANTICS_VERSION} requires encoded identities and a frozen training hierarchy."
+        )
+    p279_predicate_id = _resolve_registry_id("P279", encoder)
+    class_hierarchy = build_training_class_hierarchy(
+        train_parquet,
+        p279_predicate_id=p279_predicate_id,
+    )
+    write_class_hierarchy(
+        class_hierarchy,
+        output_root,
+        p279_predicate_id=p279_predicate_id,
+        source_dataset_variant=input_dir.name,
+        source_manifest_path=input_dir / "dataset_manifest.json",
+    )
+    print(
+        "Frozen training class hierarchy: "
+        f"{class_hierarchy.direct_edge_count:,} direct P279 edges across "
+        f"{class_hierarchy.child_count:,} child classes."
+    )
+
     combined_coverage: Dict[str, Counter[str]] = defaultdict(Counter)
     combined_filter_stats: Counter[str] = Counter()
     exclusion_counts: Counter[str] = Counter()
+    exclusion_counts_by_constraint: Counter[str] = Counter()
+    gold_repair_counts_by_constraint: Counter[str] = Counter()
     rows_by_split: dict[str, int] = {}
 
     for parquet_path in parquet_paths:
@@ -992,6 +1055,7 @@ def main() -> None:
             df,
             registry_by_id,
             encoder=encoder,
+            class_hierarchy=class_hierarchy,
             assume_complete=args.assume_complete_entity_facts,
             use_encoded_ids=use_encoded_ids,
             constraint_scope=args.constraint_scope,
@@ -1005,6 +1069,22 @@ def main() -> None:
         reason_counts = labeled_df["primary_validation_reason"].value_counts()
         for reason, count in reason_counts.items():
             exclusion_counts[f"{split}::{reason}"] += int(count)
+        grouped_reasons = labeled_df.groupby(
+            ["constraint_type", "primary_validation_reason"],
+            dropna=False,
+        ).size()
+        for (constraint_type, reason), count in grouped_reasons.items():
+            exclusion_counts_by_constraint[
+                f"{split}::{constraint_type}::{reason}"
+            ] += int(count)
+        grouped_gold_repairs = labeled_df.groupby(
+            ["constraint_type", "primary_gold_repair_status"],
+            dropna=False,
+        ).size()
+        for (constraint_type, status), count in grouped_gold_repairs.items():
+            gold_repair_counts_by_constraint[
+                f"{split}::{constraint_type}::{status}"
+            ] += int(count)
         if args.filter_invalid_primary:
             labeled_df = labeled_df.loc[
                 labeled_df["primary_validation_reason"] == "valid"
@@ -1033,11 +1113,43 @@ def main() -> None:
         output_root / "primary_validation_audit.csv",
         index=False,
     )
+    exclusion_rows_by_constraint = []
+    for key, count in sorted(exclusion_counts_by_constraint.items()):
+        split, constraint_type, reason = key.split("::", 2)
+        exclusion_rows_by_constraint.append(
+            {
+                "split": split,
+                "constraint_type": constraint_type,
+                "reason": reason,
+                "count": int(count),
+            }
+        )
+    pd.DataFrame(exclusion_rows_by_constraint).to_csv(
+        output_root / "primary_validation_audit_by_constraint.csv",
+        index=False,
+    )
+    gold_repair_rows_by_constraint = []
+    for key, count in sorted(gold_repair_counts_by_constraint.items()):
+        split, constraint_type, status = key.split("::", 2)
+        gold_repair_rows_by_constraint.append(
+            {
+                "split": split,
+                "constraint_type": constraint_type,
+                "status": status,
+                "count": int(count),
+            }
+        )
+    pd.DataFrame(gold_repair_rows_by_constraint).to_csv(
+        output_root / "primary_gold_repair_audit_by_constraint.csv",
+        index=False,
+    )
     _write_labeled_manifest(
         input_dir=input_dir,
         output_root=output_root,
         rows_by_split=rows_by_split,
         exclusions=exclusion_counts,
+        exclusions_by_constraint=exclusion_counts_by_constraint,
+        gold_repairs_by_constraint=gold_repair_counts_by_constraint,
         filter_invalid_primary=args.filter_invalid_primary,
     )
 

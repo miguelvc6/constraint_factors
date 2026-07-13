@@ -16,6 +16,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from modules.class_hierarchy import (
+    CLASS_HIERARCHY_FILENAME,
+    CLASS_HIERARCHY_MANIFEST_FILENAME,
+)
 from modules.data_encoders import (
     DATASET_SCHEMA_VERSION,
     FEATURE_ENCODER_FILENAME,
@@ -269,6 +273,67 @@ def _write_split_histogram_csv(split_hist: dict[str, Counter[int]], output: Path
     pd.DataFrame(rows).to_csv(output, index=False)
 
 
+def _write_sample_semantic_audits(
+    output_root: Path,
+) -> tuple[dict[str, int], dict[str, int]]:
+    validation_counts: Counter[str] = Counter()
+    gold_repair_counts: Counter[str] = Counter()
+    validation_rows: list[dict[str, object]] = []
+    gold_repair_rows: list[dict[str, object]] = []
+
+    for split, parquet_path in _iter_split_paths(output_root):
+        required = {
+            "constraint_type",
+            "primary_validation_reason",
+            "primary_gold_repair_status",
+        }
+        schema_names = set(pq.ParquetFile(parquet_path).schema_arrow.names)
+        missing = required - schema_names
+        if missing:
+            raise ValueError(
+                f"{parquet_path} is missing sampled semantic-audit columns: {sorted(missing)}"
+            )
+        frame = pd.read_parquet(parquet_path, columns=sorted(required))
+        for (constraint_type, reason), count in frame.groupby(
+            ["constraint_type", "primary_validation_reason"],
+            dropna=False,
+        ).size().items():
+            key = f"{split}::{constraint_type}::{reason}"
+            validation_counts[key] = int(count)
+            validation_rows.append(
+                {
+                    "split": split,
+                    "constraint_type": constraint_type,
+                    "reason": reason,
+                    "count": int(count),
+                }
+            )
+        for (constraint_type, status), count in frame.groupby(
+            ["constraint_type", "primary_gold_repair_status"],
+            dropna=False,
+        ).size().items():
+            key = f"{split}::{constraint_type}::{status}"
+            gold_repair_counts[key] = int(count)
+            gold_repair_rows.append(
+                {
+                    "split": split,
+                    "constraint_type": constraint_type,
+                    "status": status,
+                    "count": int(count),
+                }
+            )
+
+    pd.DataFrame(validation_rows).to_csv(
+        output_root / "sample_primary_validation_audit_by_constraint.csv",
+        index=False,
+    )
+    pd.DataFrame(gold_repair_rows).to_csv(
+        output_root / "sample_gold_repair_audit_by_constraint.csv",
+        index=False,
+    )
+    return dict(sorted(validation_counts.items())), dict(sorted(gold_repair_counts.items()))
+
+
 def _write_reports(
     output_root: Path,
     *,
@@ -343,6 +408,8 @@ def _copy_dataset_contract(source_root: Path, output_root: Path) -> None:
         FEATURE_ENCODER_FILENAME,
         LEGACY_ENCODER_FILENAME,
         IDENTITY_TO_FEATURE_FILENAME,
+        CLASS_HIERARCHY_FILENAME,
+        CLASS_HIERARCHY_MANIFEST_FILENAME,
     ):
         source = source_root / filename
         if source.exists():
@@ -357,6 +424,8 @@ def _write_dataset_manifest(
     seed: int,
     target_rows: int | None,
     sample_fraction: float | None,
+    sample_validation_by_constraint: dict[str, int],
+    sample_gold_repair_by_constraint: dict[str, int],
 ) -> None:
     source_manifest_path = source_root / "dataset_manifest.json"
     source_manifest = (
@@ -377,6 +446,8 @@ def _write_dataset_manifest(
             "seed": int(seed),
             "target_rows": target_rows,
             "sample_fraction": sample_fraction,
+            "primary_validation_by_constraint": sample_validation_by_constraint,
+            "gold_repair_by_constraint": sample_gold_repair_by_constraint,
         },
         "outputs": {
             path.name: _sha256_file(path)
@@ -389,6 +460,10 @@ def _write_dataset_manifest(
                         FEATURE_ENCODER_FILENAME,
                         LEGACY_ENCODER_FILENAME,
                         IDENTITY_TO_FEATURE_FILENAME,
+                        CLASS_HIERARCHY_FILENAME,
+                        CLASS_HIERARCHY_MANIFEST_FILENAME,
+                        "sample_primary_validation_audit_by_constraint.csv",
+                        "sample_gold_repair_audit_by_constraint.csv",
                     )
                     if (output_root / filename).exists()
                 ]
@@ -485,6 +560,9 @@ def main() -> None:
         seed=int(args.seed),
         column=column,
     )
+    sample_validation_by_constraint, sample_gold_repair_by_constraint = (
+        _write_sample_semantic_audits(output_root)
+    )
     _write_dataset_manifest(
         source_root=source_root,
         output_root=output_root,
@@ -492,6 +570,8 @@ def main() -> None:
         seed=int(args.seed),
         target_rows=int(args.target_rows) if args.target_rows is not None else None,
         sample_fraction=float(args.sample_fraction) if args.sample_fraction is not None else None,
+        sample_validation_by_constraint=sample_validation_by_constraint,
+        sample_gold_repair_by_constraint=sample_gold_repair_by_constraint,
     )
 
     sampled_total = sum(sampled_counts.values())

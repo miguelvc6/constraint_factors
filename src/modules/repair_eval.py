@@ -7,6 +7,7 @@ from typing import Iterable, Sequence
 
 import pandas as pd
 
+from modules.constraint_semantics import resolve_registry_id, resolve_relation_predicate_ids
 from modules.data_encoders import GlobalIntEncoder
 from modules.reranker_eval import CandidateConstraintEvaluator
 
@@ -309,8 +310,6 @@ class ConstraintRepairHeuristics:
         self.none_class = none_class
 
         # Frequently used parameter/predicate ids from constraint templates.
-        self._instance_of = self._maybe_id("<http://www.wikidata.org/entity/P31>")
-        self._subclass_of = self._maybe_id("<http://www.wikidata.org/entity/P279>")
         self._class_param = self._maybe_id("<http://www.wikidata.org/entity/P2308>")
         self._relation_param = self._maybe_id("<http://www.wikidata.org/entity/P2309>")
         self._items_param = self._maybe_id("<http://www.wikidata.org/entity/P2305>")
@@ -319,7 +318,7 @@ class ConstraintRepairHeuristics:
 
     def _maybe_id(self, token: str) -> int | None:
         """Return the encoder id for *token*, or None if missing from the vocabulary."""
-        idx = self.encoder.encode(token, add_new=False)
+        idx = resolve_registry_id(token, self.encoder)
         return idx if idx else None
 
     def _has_value(self, value: int | None) -> bool:
@@ -525,8 +524,8 @@ class ConstraintRepairHeuristics:
     # type/valueType-specific additions
     def _type_additions(self, ctx: ViolationContext) -> list[TriplePattern]:
         """adding `(subject, relation, class)` where `class` comes from `class (P2308)` and
-        `relation` is either the constraint's `relation (P2309)` parameter or the defaults
-        `instance of (P31)` / `subclass of (P279)`."""
+        `relation` is the executable predicate selected by the constraint's
+        `relation (P2309)` mode."""
         return self._class_based_additions(ctx, subject_placeholder="subject")
 
     def _value_type_additions(self, ctx: ViolationContext) -> list[TriplePattern]:
@@ -541,9 +540,11 @@ class ConstraintRepairHeuristics:
         if not allowed_classes:
             return []
 
-        relation_candidates = ctx.values_for_predicate(self._relation_param or -1, self.none_class)
-        if not relation_candidates:
-            relation_candidates = [pid for pid in (self._instance_of, self._subclass_of) if pid]
+        relation_modes = ctx.values_for_predicate(self._relation_param or -1, self.none_class)
+        relation_candidates = resolve_relation_predicate_ids(
+            relation_modes,
+            encoder=self.encoder,
+        )
 
         subject_values = self._component_values(
             subject_placeholder, getattr(ctx, subject_placeholder, self.none_class)

@@ -21,6 +21,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from modules.config import ModelConfig
+from modules.class_hierarchy import (
+    CLASS_HIERARCHY_FILENAME,
+    CLASS_HIERARCHY_MANIFEST_FILENAME,
+    CLASS_HIERARCHY_SCHEMA_VERSION,
+    CLASS_HIERARCHY_SEMANTICS,
+)
+from modules.constraint_semantics import CONSTRAINT_SEMANTICS_VERSION
 from modules.data_encoders import (
     DATASET_SCHEMA_VERSION,
     FEATURE_ENCODER_FILENAME,
@@ -120,6 +127,10 @@ def _validate_parquet_contract(interim: Path, report: ValidationReport) -> None:
             "primary_checkable_pre",
             "primary_satisfied_pre",
             "primary_validation_reason",
+            "primary_checkable_post_gold",
+            "primary_satisfied_post_gold",
+            "primary_gold_repair_status",
+            "primary_gold_repair_verified",
         }
         if primary_columns <= columns:
             primary = pd.read_parquet(path, columns=sorted(primary_columns))
@@ -130,6 +141,42 @@ def _validate_parquet_contract(interim: Path, report: ValidationReport) -> None:
                 & (primary["primary_factor_index"].astype(int) >= 0)
             )
             report.require(bool(valid.all()), f"{split} primary rows are checkable pre-repair violations")
+            expected_verified = (
+                primary["primary_checkable_post_gold"].astype(bool)
+                & (primary["primary_satisfied_post_gold"].astype(int) == 1)
+            )
+            report.require(
+                bool(
+                    (
+                        primary["primary_gold_repair_verified"].astype(bool)
+                        == expected_verified
+                    ).all()
+                ),
+                f"{split} gold-repair verification matches executable POST_GOLD labels",
+            )
+            report.require(
+                set(primary["primary_gold_repair_status"].astype(str).unique())
+                <= {"verified", "post_uncheckable", "post_unsatisfied"},
+                f"{split} retained rows carry an eligible gold-repair status",
+            )
+            expected_status = np.where(
+                ~primary["primary_checkable_post_gold"].astype(bool),
+                "post_uncheckable",
+                np.where(
+                    primary["primary_satisfied_post_gold"].astype(int) == 1,
+                    "verified",
+                    "post_unsatisfied",
+                ),
+            )
+            report.require(
+                bool(
+                    (
+                        primary["primary_gold_repair_status"].astype(str).to_numpy()
+                        == expected_status
+                    ).all()
+                ),
+                f"{split} gold-repair status matches POST_GOLD checkability and satisfaction",
+            )
         else:
             report.errors.append(f"{split} is missing primary-validation columns: {sorted(primary_columns - columns)}")
 
@@ -141,6 +188,7 @@ def validate_dataset(
     constraint_representation: str,
     primary_constraint_mode: str,
     verify_hashes: bool,
+    validate_graphs: bool,
     report: ValidationReport,
 ) -> None:
     interim = ROOT / "data" / "interim" / dataset_variant
@@ -159,12 +207,116 @@ def validate_dataset(
         manifest.get("raw_split_mapping") == {"train": "train", "dev": "val", "test": "test"},
         "raw-to-local split mapping is explicit",
     )
+    semantic_labeling = manifest.get("semantic_labeling", {})
+    report.require(
+        semantic_labeling.get("version") == CONSTRAINT_SEMANTICS_VERSION,
+        f"constraint semantics are {CONSTRAINT_SEMANTICS_VERSION}",
+    )
+    validation_by_constraint = semantic_labeling.get(
+        "primary_validation_by_constraint",
+        {},
+    )
+    report.require(
+        bool(validation_by_constraint),
+        "per-family primary-validation audit is embedded in the manifest",
+    )
+    if validation_by_constraint:
+        source_families: set[str] = set()
+        valid_families: set[str] = set()
+        for key, count in validation_by_constraint.items():
+            try:
+                _, family, reason = str(key).split("::", 2)
+            except ValueError:
+                continue
+            if int(count) <= 0:
+                continue
+            source_families.add(family)
+            if reason == "valid":
+                valid_families.add(family)
+        report.require(
+            source_families == valid_families,
+            "every source primary family has retained checkable violations",
+        )
+    gold_repair_by_constraint = semantic_labeling.get(
+        "gold_repair_by_constraint",
+        {},
+    )
+    report.require(
+        bool(gold_repair_by_constraint),
+        "per-family observed-edit repair audit is embedded in the manifest",
+    )
+
+    sampling = manifest.get("sampling", {})
+    target_rows = sampling.get("target_rows") if isinstance(sampling, dict) else None
+    if target_rows is not None:
+        report.require(
+            sum(int(value) for value in manifest.get("rows", {}).values())
+            == int(target_rows),
+            f"sample contains exactly {int(target_rows):,} rows",
+        )
+        sampled_primary = sampling.get("primary_validation_by_constraint", {})
+        sampled_gold = sampling.get("gold_repair_by_constraint", {})
+        report.require(
+            isinstance(sampled_primary, dict)
+            and sum(int(value) for value in sampled_primary.values()) == int(target_rows),
+            "sampled primary-family audit covers every row",
+        )
+        report.require(
+            isinstance(sampled_gold, dict)
+            and sum(int(value) for value in sampled_gold.values()) == int(target_rows),
+            "sampled observed-edit audit covers every row",
+        )
     for filename in (
         IDENTITY_ENCODER_FILENAME,
         FEATURE_ENCODER_FILENAME,
         IDENTITY_TO_FEATURE_FILENAME,
+        CLASS_HIERARCHY_FILENAME,
+        CLASS_HIERARCHY_MANIFEST_FILENAME,
     ):
         report.require((interim / filename).exists(), f"{filename} exists")
+
+    hierarchy_manifest_path = interim / CLASS_HIERARCHY_MANIFEST_FILENAME
+    if hierarchy_manifest_path.exists():
+        hierarchy_manifest = _read_json(hierarchy_manifest_path)
+        report.require(
+            int(hierarchy_manifest.get("schema_version", 0))
+            >= CLASS_HIERARCHY_SCHEMA_VERSION,
+            "class hierarchy schema is current",
+        )
+        report.require(
+            hierarchy_manifest.get("semantics") == CLASS_HIERARCHY_SEMANTICS,
+            "type constraints use the frozen training P279 closure",
+        )
+        report.require(
+            hierarchy_manifest.get("source_split") == "train",
+            "class hierarchy is derived from training context only",
+        )
+        report.require(
+            int(hierarchy_manifest.get("direct_edge_count", 0)) > 0
+            and int(hierarchy_manifest.get("child_count", 0)) > 0,
+            "class hierarchy contains direct training evidence",
+        )
+        report.require(
+            int(hierarchy_manifest.get("p279_predicate_id", 0)) > 0,
+            "class hierarchy records the P279 identity",
+        )
+        report.require(
+            len(str(hierarchy_manifest.get("source_manifest_sha256", ""))) == 64,
+            "class hierarchy records its source dataset manifest hash",
+        )
+        hierarchy_outputs = hierarchy_manifest.get("outputs", {})
+        hierarchy_path = interim / CLASS_HIERARCHY_FILENAME
+        expected_hierarchy_hash = (
+            hierarchy_outputs.get(CLASS_HIERARCHY_FILENAME)
+            if isinstance(hierarchy_outputs, dict)
+            else None
+        )
+        report.require(
+            hierarchy_path.exists()
+            and bool(expected_hierarchy_hash)
+            and file_sha256(hierarchy_path) == expected_hierarchy_hash,
+            "class hierarchy hash matches its manifest",
+        )
 
     mapping_path = interim / IDENTITY_TO_FEATURE_FILENAME
     if mapping_path.exists():
@@ -180,6 +332,9 @@ def validate_dataset(
                 report.require(file_sha256(path) == expected, f"manifest hash matches: {filename}")
 
     _validate_parquet_contract(interim, report)
+
+    if not validate_graphs:
+        return
 
     for split in ("train", "val", "test"):
         graph_path = processed / graph_dataset_filename(
@@ -417,7 +572,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--primary-constraint-mode", default="executable_factor")
     parser.add_argument("--run-directory", action="append", type=Path, default=[])
     parser.add_argument("--baseline-directory", action="append", type=Path, default=[])
-    parser.add_argument("--stage", choices=("data", "run", "results", "all"), default="all")
+    parser.add_argument(
+        "--stage",
+        choices=("interim", "data", "run", "results", "all"),
+        default="all",
+        help="interim validates Section 1 only; data also requires graph artifacts.",
+    )
     parser.add_argument("--verify-hashes", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
@@ -426,13 +586,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     report = ValidationReport()
-    if args.stage in {"data", "all"}:
+    if args.stage in {"interim", "data", "all"}:
         validate_dataset(
             dataset_variant=args.dataset_variant,
             encoding=args.encoding,
             constraint_representation=args.constraint_representation,
             primary_constraint_mode=args.primary_constraint_mode,
             verify_hashes=args.verify_hashes,
+            validate_graphs=args.stage != "interim",
             report=report,
         )
     if args.stage in {"run", "all"}:

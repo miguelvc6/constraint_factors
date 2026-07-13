@@ -4,7 +4,10 @@ Constraint checking utilities for the 05_constraint_labeler stage.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Set, Tuple
+
+if TYPE_CHECKING:
+    from .class_hierarchy import ClassHierarchy
 
 
 def normalize_token(raw: str | None) -> str | None:
@@ -44,6 +47,7 @@ class EvidenceState:
     other_subject: int
     other_predicate: int
     other_object: int
+    class_hierarchy: "ClassHierarchy | None" = None
 
     def entity_in_scope(self, entity_id: int) -> bool:
         return entity_id in self.facts_by_entity
@@ -371,6 +375,19 @@ def _type_relation_predicates(constraint: ConstraintInstance) -> List[int]:
     return constraint.relation_predicates or []
 
 
+def _matches_allowed_classes(
+    state: EvidenceState,
+    class_ids: Set[int],
+    allowed_classes: Set[int],
+) -> bool:
+    if class_ids & allowed_classes:
+        return True
+    hierarchy = getattr(state, "class_hierarchy", None)
+    if hierarchy is None:
+        return False
+    return hierarchy.reaches_any(class_ids, allowed_classes)
+
+
 def is_checkable_type(
     state: EvidenceState,
     constraint: ConstraintInstance,
@@ -396,14 +413,10 @@ def is_checkable_type(
     if not rel_preds:
         return False
     for rel in rel_preds:
-        if rel not in p_local:
-            return False
         if _needs_edit_guard(state, subject, rel):
             return False
         if not state.property_complete(subject, rel) and not state.has_property(subject, rel):
             return False
-    if not any(state.has_property(subject, rel) for rel in rel_preds):
-        return False
     return True
 
 
@@ -417,7 +430,11 @@ def is_satisfied_type(
         return True
     rel_preds = _type_relation_predicates(constraint)
     for rel in rel_preds:
-        if state.values_for(subject, rel) & constraint.allowed_classes:
+        if _matches_allowed_classes(
+            state,
+            state.values_for(subject, rel),
+            constraint.allowed_classes,
+        ):
             return True
     return False
 
@@ -447,14 +464,10 @@ def is_checkable_value_type(
     if not rel_preds:
         return False
     for rel in rel_preds:
-        if rel not in p_local:
-            return False
         if _needs_edit_guard(state, obj, rel):
             return False
         if not state.property_complete(obj, rel) and not state.has_property(obj, rel):
             return False
-    if not any(state.has_property(obj, rel) for rel in rel_preds):
-        return False
     return True
 
 
@@ -468,7 +481,11 @@ def is_satisfied_value_type(
         return True
     rel_preds = _type_relation_predicates(constraint)
     for rel in rel_preds:
-        if state.values_for(obj, rel) & constraint.allowed_classes:
+        if _matches_allowed_classes(
+            state,
+            state.values_for(obj, rel),
+            constraint.allowed_classes,
+        ):
             return True
     return False
 

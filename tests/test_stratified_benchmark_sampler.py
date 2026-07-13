@@ -42,6 +42,8 @@ def _write_source_variant(interim_root: Path) -> None:
         "del_subject": 0,
         "del_predicate": 0,
         "del_object": 0,
+        "primary_validation_reason": "valid",
+        "primary_gold_repair_status": "verified",
     }
 
     def row(constraint_type: str, attached_count: int, row_id: int) -> dict:
@@ -115,6 +117,8 @@ def test_stratified_sampler_is_deterministic_and_preserves_reports(tmp_path: Pat
         assert (output / "sampling_metadata.json").exists()
         assert (output / "hist_local_constraint_ids.csv").exists()
         assert (output / "hist_local_constraint_ids_by_split.csv").exists()
+        assert (output / "sample_primary_validation_audit_by_constraint.csv").exists()
+        assert (output / "sample_gold_repair_audit_by_constraint.csv").exists()
 
     first_train = pd.read_parquet(first / "df_train.parquet")
     second_train = pd.read_parquet(second / "df_train.parquet")

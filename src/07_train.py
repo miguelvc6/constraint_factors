@@ -45,6 +45,7 @@ from modules.model_store import (
 from modules.models import BaseGraphModel, build_model
 from modules.repair_eval import ConstraintRepairHeuristics, ViolationContext, load_violation_contexts
 from modules.reranker_eval import CandidateConstraintEvaluator
+from modules.class_hierarchy import CLASS_HIERARCHY_FILENAME
 from modules.policy import POLICY_NAMES, derive_policy_label
 from modules.provenance import (
     build_run_provenance,
@@ -3196,6 +3197,7 @@ def main():
             assume_complete=True,
             constraint_scope="local",
             use_encoded_ids=True,
+            class_hierarchy_path=interim_path / CLASS_HIERARCHY_FILENAME,
         )
         candidate_cfg = CandidateConfig(
             topk_candidates=chooser_cfg.topk_candidates,
@@ -3268,6 +3270,7 @@ def main():
             assume_complete=True,
             constraint_scope="local",
             use_encoded_ids=True,
+            class_hierarchy_path=interim_path / CLASS_HIERARCHY_FILENAME,
         )
         candidate_cfg = CandidateConfig(
             topk_candidates=direct_safety_cfg.topk_candidates,

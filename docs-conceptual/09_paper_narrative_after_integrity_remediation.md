@@ -1,6 +1,6 @@
 # Paper Narrative After Integrity Remediation
 
-Date: 2026-07-10
+Date: 2026-07-13
 
 This document records how the audit changes the research claims and paper
 structure. Implementation details and exact rerun commands are in the
@@ -30,6 +30,7 @@ result.
 | Frequency threshold 100 defines the task vocabulary. | Retracted. | Threshold 100 is a model-capacity decision; semantic identities are never filtered. |
 | Historical Micro-F1 is exact repair fidelity. | Retracted. | Headline fidelity is strict identity triple F1; feature-space F1 is diagnostic. |
 | Heuristic alternative-action match is primary fix. | Retracted. | Primary fix is an observed violated-to-satisfied constraint transition. |
+| Every observed correction is a verified primary repair. | Retracted. | Eligibility is defined from PRE. Report separately whether POST_GOLD is checkable and satisfies the executable primary constraint. |
 | Per-sample mean SRR/SIR is the aggregate safety rate. | Retracted. | Use pooled eligible-event ratios; show defined-sample macros only as diagnostics. |
 | Shared-pressure A1 is 96.6% smaller. | Narrow and retain. | Say the **role-pressure subsystem** is 96.6% smaller, not the whole model. Report total counts from the new run manifest. |
 
@@ -47,6 +48,7 @@ check. The paper should report:
 - the exact sampling target and realized split allocation;
 - identity and feature vocabulary sizes;
 - target representability coverage.
+- the per-family rate at which the observed gold edit is a verified primary repair.
 
 This replaces language implying that frequency pruning changes which entities
 or literals count as the same answer.
@@ -75,10 +77,33 @@ parameter predicates are interpreted by constraint family, exceptions and
 main-value scope are honored, and insufficient evidence yields “uncheckable”
 rather than a guessed truth value.
 
+For `type` and `valueType`, relation-mode items select `P31`, `P279`, or both,
+and class membership is tested through `P279*`. The available corpus does not
+contain a complete historical Wikidata taxonomy, so the executable benchmark
+freezes the union of direct `P279` facts found in training-split entity
+descriptions and uses its reflexive-transitive closure for every split.
+Validation and test context cannot add hierarchy edges. This is a reproducible,
+training-only operationalization, not complete-Wikidata entailment; hierarchy
+edge count, hash, and coverage belong in Methods and Limitations.
+
 The estimand changes from “all correction rows” to “rows whose primary
 constraint is supported, applicable, checkable, and violated in the pre-state.”
 Exclusions are part of the benchmark definition and must be reported, not hidden
 as preprocessing loss.
+
+The upstream corpus supplies observed correction events, not a guarantee that
+each event is a complete repair under this executable semantics. Retain eligible
+PRE violations for the correction-imitation task, but stratify the observed
+edits as verified, post-uncheckable, or post-unsatisfied. Do not describe the
+one-million-row sample as one million successful repairs.
+
+The completed Section 1 audit makes this distinction material: 73.45% of the
+sampled historical edits verify as complete primary repairs, while 26.55% leave
+the executable primary constraint unsatisfied. The paper must therefore frame
+the supervised target as an **observed curator correction**, and reserve
+“repair success” for the transition-based semantic metric. Family-level counts
+and rerun provenance are recorded in the
+[technical remediation report](../docs-technical/09_scientific_integrity_remediation.md#section-1-rerun-record-2026-07-13).
 
 ### Canonical A1
 
@@ -111,6 +136,7 @@ The main table should use:
 - strict identity Micro-F1, precision, and recall;
 - active-target-slot and fully-representable-row coverage;
 - primary fix transition rate and eligible denominator;
+- POST_GOLD verified-repair rate by primary family as a dataset diagnostic;
 - GFR;
 - pooled SRR and pooled SIR with their total numerators/denominators;
 - disruption/edit-minimality;
@@ -171,7 +197,9 @@ Explicitly separate three questions:
   architecture-matched A1?
 
 Discuss filtering sensitivity, eligibility coverage, and unresolved rare targets
-as limitations. Do not infer full-Wikidata validity from locally checkable rows.
+as limitations. Discuss incomplete training-derived taxonomy coverage and
+historical edits that do not verify as complete repairs. Do not infer
+full-Wikidata validity from locally checkable rows.
 
 ## Rerun Interpretation Matrix
 
@@ -196,6 +224,8 @@ as limitations. Do not infer full-Wikidata validity from locally checkable rows.
 - Do not claim the full model is 96.6% smaller.
 - Do not describe the promoted A1's old test advantage as confirmatory.
 - Do not omit primary-exclusion or representability denominators.
+- Do not equate an eligible correction row with a verified gold repair.
+- Do not describe the frozen training hierarchy as complete Wikidata closure.
 - Do not accept results without matching config/checkpoint/data provenance.
 
 ## Completion Condition
@@ -204,4 +234,3 @@ The paper narrative can leave reset state only when the technical validator
 passes the full canonical suite and the conceptual claims above have been filled
 with schema-v2 results. Until then, all result statements should use future or
 hypothesis language.
-
