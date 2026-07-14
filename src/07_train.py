@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, cast
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset
@@ -291,6 +292,11 @@ def _load_encoder(interim_path: Path) -> GlobalIntEncoder:
     encoder.load(interim_path / "globalintencoder.txt")
     encoder.freeze()
     return encoder
+
+
+def _load_identity_to_feature_mapping(interim_path: Path) -> np.ndarray | None:
+    mapping_path = interim_path / IDENTITY_TO_FEATURE_FILENAME
+    return np.load(mapping_path) if mapping_path.exists() else None
 
 
 def _load_parquet_rows(interim_path: Path, split: str) -> list:
@@ -3081,10 +3087,7 @@ def main():
     identity_encoder = GlobalIntEncoder()
     identity_encoder.load(identity_encoder_path if identity_encoder_path.exists() else legacy_encoder_path)
     identity_encoder.freeze()
-    identity_mapping_path = interim_path / IDENTITY_TO_FEATURE_FILENAME
-    identity_to_feature = (
-        np.load(identity_mapping_path) if identity_mapping_path.exists() else None
-    )
+    identity_to_feature = _load_identity_to_feature_mapping(interim_path)
 
     # Optional - Constraint-is-fixed loss components (heuristics + contexts).
     fix_loss_cfg = training_cfg.fix_probability_loss

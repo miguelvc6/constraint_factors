@@ -27,8 +27,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -227,26 +228,47 @@ def _load_identity_to_feature(root: Path) -> np.ndarray | None:
     return mapping
 
 
+def _build_feature_to_unique_identity(
+    identity_to_feature: Sequence[int] | None,
+) -> torch.Tensor | None:
+    """Build the strict feature-to-identity lookup once for an evaluation run."""
+    if identity_to_feature is None:
+        return None
+
+    # Own a contiguous copy so read-only NumPy arrays/memmaps are safe to use
+    # and the lookup cannot change if the caller mutates its mapping later.
+    mapping = torch.tensor(identity_to_feature, dtype=torch.long).reshape(-1)
+    valid_identity_ids = torch.nonzero(mapping >= 0, as_tuple=False).view(-1)
+    valid_feature_ids = mapping.index_select(0, valid_identity_ids)
+    max_feature = (
+        int(valid_feature_ids.max().item())
+        if valid_identity_ids.numel()
+        else NONE_CLASS_INDEX
+    )
+    inverse = torch.full((max_feature + 1,), -1, dtype=torch.long)
+    if valid_identity_ids.numel():
+        feature_counts = torch.bincount(valid_feature_ids, minlength=max_feature + 1)
+        unique_rows = feature_counts.index_select(0, valid_feature_ids) == 1
+        inverse[valid_feature_ids[unique_rows]] = valid_identity_ids[unique_rows]
+
+    # Class zero is the explicit no-edit sentinel in both spaces, even if a
+    # malformed mapping also assigns another identity to feature zero.
+    inverse[NONE_CLASS_INDEX] = NONE_CLASS_INDEX
+    return inverse
+
+
 def _feature_to_unique_identity(
     values: torch.Tensor,
     identity_to_feature: Sequence[int] | None,
+    *,
+    feature_identity_lookup: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if identity_to_feature is None:
+    inverse = feature_identity_lookup
+    if inverse is None:
+        inverse = _build_feature_to_unique_identity(identity_to_feature)
+    if inverse is None:
         return values.to(dtype=torch.long).clone()
-    max_feature = max((int(value) for value in identity_to_feature), default=0)
-    inverse = torch.full((max_feature + 1,), -1, dtype=torch.long)
-    ambiguous: set[int] = set()
-    for identity_id, feature_id_raw in enumerate(identity_to_feature):
-        feature_id = int(feature_id_raw)
-        if feature_id < 0:
-            continue
-        if inverse[feature_id] < 0:
-            inverse[feature_id] = int(identity_id)
-        elif int(inverse[feature_id]) != identity_id:
-            ambiguous.add(feature_id)
-    for feature_id in ambiguous:
-        inverse[feature_id] = -1
-    inverse[NONE_CLASS_INDEX] = NONE_CLASS_INDEX
+
     result = torch.full_like(values, -1, dtype=torch.long)
     valid = (values >= 0) & (values < inverse.numel())
     result[valid] = inverse[values[valid].to(dtype=torch.long)]
@@ -405,14 +427,18 @@ def _maybe_prepare_repair_support(
     *,
     split: str,
     none_class: int,
+    interim_base: Path | None = None,
 ) -> RepairSupport | None:
     variant_dir = dataset_variant
     suffix = f"_minocc{min_occurrence}"
     if not variant_dir.endswith(suffix):
         variant_dir = f"{variant_dir}{suffix}"
 
-    interim_base = Path("data/interim") / variant_dir
+    canonical_interim_base = Path("data/interim") / variant_dir
+    interim_base = Path(interim_base) if interim_base is not None else canonical_interim_base
     identity_encoder_path = encoder_path(interim_base, identity=True)
+    if not identity_encoder_path.exists() and interim_base != canonical_interim_base:
+        identity_encoder_path = encoder_path(canonical_interim_base, identity=True)
 
     contexts = load_violation_contexts(interim_base, split, none_class=none_class)
     placeholder_ids = load_placeholder_ids(identity_encoder_path)
@@ -439,14 +465,18 @@ def _maybe_prepare_global_support(
     constraint_scope: str = "local",
     strict: bool = False,
     registry_dataset: str | None = None,
+    interim_base: Path | None = None,
 ) -> GlobalMetricsSupport | None:
     variant_dir = dataset_variant
     suffix = f"_minocc{min_occurrence}"
     if not variant_dir.endswith(suffix):
         variant_dir = f"{variant_dir}{suffix}"
 
-    interim_base = Path("data/interim") / variant_dir
+    canonical_interim_base = Path("data/interim") / variant_dir
+    interim_base = Path(interim_base) if interim_base is not None else canonical_interim_base
     identity_encoder_path = encoder_path(interim_base, identity=True)
+    if not identity_encoder_path.exists() and interim_base != canonical_interim_base:
+        identity_encoder_path = encoder_path(canonical_interim_base, identity=True)
     registry_candidates = []
     if registry_dataset:
         registry_candidates.append(registry_dataset)
@@ -495,6 +525,10 @@ def _maybe_prepare_global_support(
     encoder.load(identity_encoder_path)
     encoder.freeze()
 
+    class_hierarchy_path = interim_base / CLASS_HIERARCHY_FILENAME
+    if not class_hierarchy_path.exists() and interim_base != canonical_interim_base:
+        class_hierarchy_path = canonical_interim_base / CLASS_HIERARCHY_FILENAME
+
     try:
         evaluator = CandidateConstraintEvaluator(
             str(registry_path),
@@ -502,7 +536,7 @@ def _maybe_prepare_global_support(
             assume_complete=True,
             constraint_scope=constraint_scope,
             use_encoded_ids=True,
-            class_hierarchy_path=interim_base / CLASS_HIERARCHY_FILENAME,
+            class_hierarchy_path=class_hierarchy_path,
         )
     except Exception as exc:
         if strict:
@@ -578,7 +612,7 @@ def _metrics_from_counts(counts: TripleCounts) -> dict[str, float]:
 
 @torch.no_grad()
 def eval(
-    model: BaseGraphModel | None,
+    model: torch.nn.Module | None,
     test_data,
     batch_size: int = 16,
     device: torch.device | str = torch.device("cpu"),
@@ -615,13 +649,15 @@ def eval(
     identity_targets: list[torch.Tensor] = []
     feature_targets: list[torch.Tensor] = []
     representable_masks: list[torch.Tensor] = []
+    feature_identity_lookup: torch.Tensor | None = None
     output_logged = False
     for data in tqdm(test_loader, desc="Test Batches"):
         batch_graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
         kinds.extend((getattr(graph, "constraint_type", None) or "UNKNOWN") for graph in batch_graphs)
         if precomputed_predictions is None:
             data = data.to(device)
-            out = model(data)  # raw logits expected
+            out = model(data)  # raw logits or direct identity indices
+            direct_identity_indices = None
             if isinstance(out, dict):
                 if not output_logged:
                     logging.info("Model forward returned dict outputs; using edit_logits.")
@@ -632,10 +668,15 @@ def eval(
                     raise KeyError("Model output dict missing 'edit_logits'.")
             else:
                 if not output_logged:
-                    logging.info("Model forward returned tensor outputs.")
+                    if out.ndim == 2 and out.size(-1) == 6:
+                        logging.info("Model forward returned direct edit indices.")
+                    else:
+                        logging.info("Model forward returned tensor outputs.")
                     output_logged = True
                 logits = out
                 graph_emb = None
+                if logits.ndim == 2 and logits.size(-1) == 6:
+                    direct_identity_indices = logits.to(dtype=torch.long)
             if policy_support is not None:
                 if graph_emb is None:
                     raise RuntimeError("Policy choice requires graph_emb from model outputs.")
@@ -753,14 +794,36 @@ def eval(
                     batch_feature_preds.append(list(selected.feature_slots))
                 identity_predictions.append(torch.tensor(batch_identity_preds, dtype=torch.long))
                 feature_predictions.append(torch.tensor(batch_feature_preds, dtype=torch.long))
+            elif direct_identity_indices is not None:
+                identity_batch = direct_identity_indices.detach().cpu()
+                identity_predictions.append(identity_batch)
+                feature_predictions.append(
+                    _identity_to_feature_values(identity_batch, identity_to_feature)
+                )
             else:
+                if logits.ndim != 3:
+                    raise ValueError(
+                        "Model tensor output must contain direct edit indices with shape (B,6) "
+                        f"or logits with shape (B,6,C); got {tuple(logits.shape)}."
+                    )
                 out = logits.argmax(dim=-1)  # class predictions per action
                 feature_batch = out.cpu()
                 feature_predictions.append(feature_batch)
+                if feature_identity_lookup is None and identity_to_feature is not None:
+                    feature_identity_lookup = _build_feature_to_unique_identity(identity_to_feature)
+                    assert feature_identity_lookup is not None
+                    logging.info(
+                        "Built strict feature-to-identity lookup with %d feature IDs.",
+                        feature_identity_lookup.numel(),
+                    )
                 identity_predictions.append(
-                    _feature_to_unique_identity(feature_batch, identity_to_feature)
+                    _feature_to_unique_identity(
+                        feature_batch,
+                        identity_to_feature,
+                        feature_identity_lookup=feature_identity_lookup,
+                    )
                 )
-        feature_target = data.y.cpu()
+        feature_target = getattr(data, "y_feature", data.y).cpu()
         identity_target = getattr(data, "y_identity", data.y).cpu()
         representable = getattr(data, "target_representable_mask", None)
         if representable is None:
@@ -1403,7 +1466,12 @@ def _smoke_check_global_metrics(
     logging.info("Global metrics smoke check passed for %d samples.", sample_count)
 
 
-def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[Data], int]:
+def load_baseline_split_from_parquet(
+    base_path: Path,
+    split: str,
+    *,
+    unknown_feature_id: int | None = None,
+) -> tuple[list[Data], int]:
     """Load baseline data from parquet, returning lightweight graphs and the max node index."""
     path = base_path / f"df_{split}.parquet"
     dataframe = pd.read_parquet(path)
@@ -1412,16 +1480,33 @@ def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[
     max_index = NONE_CLASS_INDEX
 
     for row in dataframe.itertuples(index=False):
-        y = torch.tensor(
+        target_columns = (
+            "add_subject",
+            "add_predicate",
+            "add_object",
+            "del_subject",
+            "del_predicate",
+            "del_object",
+        )
+        identity_targets = [int(getattr(row, column)) for column in target_columns]
+        feature_targets = []
+        for column, identity_value in zip(target_columns, identity_targets):
+            feature_value = getattr(row, f"{column}_feature", None)
+            if feature_value is None or (
+                isinstance(feature_value, float) and math.isnan(feature_value)
+            ):
+                feature_value = identity_value
+            feature_targets.append(int(feature_value))
+        y = torch.tensor(identity_targets, dtype=torch.long).unsqueeze(0)
+        y_feature = torch.tensor(feature_targets, dtype=torch.long).unsqueeze(0)
+        target_representable = torch.tensor(
             [
-                int(row.add_subject),
-                int(row.add_predicate),
-                int(row.add_object),
-                int(row.del_subject),
-                int(row.del_predicate),
-                int(row.del_object),
+                identity_value == NONE_CLASS_INDEX
+                or unknown_feature_id is None
+                or feature_value != unknown_feature_id
+                for identity_value, feature_value in zip(identity_targets, feature_targets)
             ],
-            dtype=torch.long,
+            dtype=torch.bool,
         ).unsqueeze(0)
 
         focus_triple = torch.tensor(
@@ -1434,6 +1519,9 @@ def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[
             edge_index=torch.empty((2, 0), dtype=torch.long),
             y=y,
         )
+        graph.y_identity = y
+        graph.y_feature = y_feature
+        graph.target_representable_mask = target_representable
         graph.focus_triple = focus_triple
         shape_id_value = getattr(row, "constraint_id", None)
         if isinstance(shape_id_value, float) and math.isnan(shape_id_value):
@@ -1515,15 +1603,48 @@ def load_baseline_split_from_parquet(base_path: Path, split: str) -> tuple[list[
     return data_list, max_index
 
 
+_BASELINE_FACTOR_FIELDS = frozenset(
+    {
+        "factor_constraint_ids",
+        "factor_checkable_pre",
+        "factor_satisfied_pre",
+    }
+)
+
+
+def _baseline_splits_have_factor_fields(base_path: Path) -> bool:
+    """Return whether both baseline splits already carry factor supervision."""
+    for split in ("train", "test"):
+        split_path = base_path / f"df_{split}.parquet"
+        if not split_path.exists():
+            return False
+        if not _BASELINE_FACTOR_FIELDS.issubset(pq.read_schema(split_path).names):
+            return False
+    return True
+
+
 def _resolve_baseline_interim_paths(dataset: str, min_occurrence: int) -> tuple[Path, Path]:
     variant = dataset_variant_name(dataset, min_occurrence)
     base_path = Path("data/interim") / variant
     labeled_path = Path("data/interim") / f"{variant}_labeled"
-    data_path = labeled_path if (labeled_path / "df_train.parquet").exists() else base_path
-    encoder_path = labeled_path / "globalintencoder.txt"
-    if not encoder_path.exists():
-        encoder_path = base_path / "globalintencoder.txt"
-    return data_path, encoder_path
+
+    # Schema-v2 paper datasets may already be filtered and factor-labeled in the
+    # canonical variant. Prefer that artifact over a potentially stale legacy
+    # ``_labeled`` sibling. Fall back to the sibling only for unlabeled bases.
+    labeled_splits_exist = all(
+        (labeled_path / f"df_{split}.parquet").exists() for split in ("train", "test")
+    )
+    if _baseline_splits_have_factor_fields(base_path):
+        data_path = base_path
+    elif labeled_splits_exist:
+        data_path = labeled_path
+    else:
+        data_path = base_path
+
+    resolved_encoder_path = encoder_path(data_path, identity=True)
+    if not resolved_encoder_path.exists() and data_path != base_path:
+        resolved_encoder_path = encoder_path(base_path, identity=True)
+    return data_path, resolved_encoder_path
 
 
 def load_placeholder_ids(encoder_path: Path) -> dict[str, int]:
@@ -1543,6 +1664,16 @@ def load_placeholder_ids(encoder_path: Path) -> dict[str, int]:
             placeholders[token] = idx
 
     return placeholders
+
+
+def _load_encoder_token_id(resolved_encoder_path: Path, token: str) -> int | None:
+    if not resolved_encoder_path.exists():
+        return None
+    encoder = GlobalIntEncoder()
+    encoder.load(resolved_encoder_path)
+    encoder.freeze()
+    value = encoder.encode(token)
+    return int(value) if value else None
 
 
 def _checkpoint_has_chooser_state(state_dict: dict[str, object]) -> bool:
@@ -2148,21 +2279,50 @@ def main():
             args.min_occurrence,
         )
         variant = dataset_variant_name(args.dataset, args.min_occurrence)
-        base_path, encoder_path = _resolve_baseline_interim_paths(args.dataset, args.min_occurrence)
+        base_path, identity_encoder_path = _resolve_baseline_interim_paths(
+            args.dataset,
+            args.min_occurrence,
+        )
         logging.info("Baseline parquet source: %s", base_path)
 
-        train_data, train_max = load_baseline_split_from_parquet(base_path, "train")
-        test_data, test_max = load_baseline_split_from_parquet(base_path, "test")
+        canonical_interim_base = Path("data/interim") / variant
+        mapping_base = base_path
+        if not (mapping_base / IDENTITY_TO_FEATURE_FILENAME).exists():
+            mapping_base = canonical_interim_base
+        identity_to_feature = _load_identity_to_feature(mapping_base)
+
+        feature_encoder_path = encoder_path(mapping_base, identity=False)
+        if not feature_encoder_path.exists() and mapping_base != canonical_interim_base:
+            feature_encoder_path = encoder_path(canonical_interim_base, identity=False)
+        unknown_feature_id = _load_encoder_token_id(feature_encoder_path, "unknown")
+
+        train_data, train_max = load_baseline_split_from_parquet(
+            base_path,
+            "train",
+            unknown_feature_id=unknown_feature_id,
+        )
+        test_data, test_max = load_baseline_split_from_parquet(
+            base_path,
+            "test",
+            unknown_feature_id=unknown_feature_id,
+        )
         num_graph_nodes = max(train_max, test_max, NONE_CLASS_INDEX) + 1
 
-        placeholder_ids = load_placeholder_ids(encoder_path)
+        placeholder_ids = load_placeholder_ids(identity_encoder_path)
 
         repair_support = _maybe_prepare_repair_support(
             args.dataset,
             args.min_occurrence,
             split="test",
             none_class=NONE_CLASS_INDEX,
+            interim_base=base_path,
         )
+        if repair_support and len(repair_support.contexts) != len(test_data):
+            raise RuntimeError(
+                "Baseline evaluation source mismatch before inference: "
+                f"loaded {len(test_data)} test samples but {len(repair_support.contexts)} "
+                f"repair contexts from {base_path}."
+            )
 
         global_support = None
         strict_global = bool(args.strict_global_metrics)
@@ -2180,6 +2340,7 @@ def main():
                 none_class=NONE_CLASS_INDEX,
                 strict=strict_global,
                 registry_dataset=args.registry_dataset,
+                interim_base=base_path,
             )
             if not global_support:
                 if strict_global:
@@ -2188,6 +2349,12 @@ def main():
                         "Verify registry/encoder availability and factor fields."
                     )
                 logging.warning("Global metrics requested but could not be prepared; skipping.")
+            elif len(global_support.rows) != len(test_data):
+                raise RuntimeError(
+                    "Baseline evaluation source mismatch before inference: "
+                    f"loaded {len(test_data)} test samples but {len(global_support.rows)} "
+                    f"global-metric rows from {base_path}."
+                )
 
         repair_builder = None
         if repair_support or global_support:
@@ -2213,12 +2380,18 @@ def main():
 
                 return postprocess, combined_state
 
-        def save_run(name: str, model: BaseGraphModel) -> dict[str, object]:
+        def save_run(name: str, model: torch.nn.Module) -> dict[str, object]:
             postprocess = None
             state: dict[str, object] | None = None
             if repair_builder:
                 postprocess, state = repair_builder()
-            metrics = eval(model, test_data, device=device, postprocess=postprocess)
+            metrics = eval(
+                model,
+                test_data,
+                device=device,
+                postprocess=postprocess,
+                identity_to_feature=identity_to_feature,
+            )
             if state and "repair_metrics" in state:
                 metrics["repair_metrics"] = state["repair_metrics"]
             if state and "global_metrics" in state:

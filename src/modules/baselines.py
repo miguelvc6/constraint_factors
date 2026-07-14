@@ -10,7 +10,6 @@ import torch
 from torch_geometric.data import Data
 
 from modules.model_store import baseline_dir
-from modules.models import BaseGraphModel
 
 logger = logging.getLogger(__name__)
 
@@ -366,32 +365,26 @@ class ConstraintFamilyMajorityBaseline(_PerKeyMajorityBaseline):
 
 
 # ----------------------------
-# Adapter: make any Baseline look like a nn.Module that returns logits
+# Adapter: make any Baseline look like a lightweight nn.Module
 # ----------------------------
 
 
-class BaselineAdapter(BaseGraphModel):
+class BaselineAdapter(torch.nn.Module):
     """
-    Wraps a Baseline so it exposes forward(data)->logits of shape (B, 6, num_graph_nodes),
-    with one-hot-like logits: chosen index has 0.0, all others a large negative number.
-    This lets you reuse the existing eval() that calls .argmax().
+    Wrap a baseline as a module returning direct identity indices of shape ``(B, 6)``.
+
+    Dense one-hot-like logits scale with the identity vocabulary and can require
+    gigabytes per batch for schema-v2 datasets. The evaluator recognizes this
+    direct-index output explicitly.
     """
 
     def __init__(self, baseline: Baseline) -> None:
-        super().__init__(
-            baseline.num_graph_nodes,
-            num_embedding_size=1,
-            num_layers=1,
-            hidden=1,
-            use_node_embeddings=False,
-        )
+        super().__init__()
         self.baseline = baseline
-
-    def create_conv_layer(self, in_channels: int, out_channels: int) -> torch.nn.Module: ...
 
     @property
     def num_graph_nodes(self) -> int:
-        return self.num_input_graph_nodes
+        return self.baseline.num_graph_nodes
 
     def forward(self, data) -> torch.Tensor:
         # data is a batched PyG Data; split into a list of graph-level Data objects.
@@ -404,13 +397,8 @@ class BaselineAdapter(BaseGraphModel):
 
         idx = self.baseline.predict_batch(dlist)  # (B, 6)
         assert idx.ndim == 2 and idx.shape[1] == 6, f"Baseline must return (B,6) indices, got {idx.shape}"
-
-        B = idx.shape[0]
-        device = next(self.parameters()).device
-        idx = idx.to(device)
-        logits = torch.full((B, 6, self.num_graph_nodes), fill_value=-1e9, device=device)
-        logits.scatter_(2, idx.unsqueeze(-1), 0.0)
-        return logits
+        device = data.y.device if hasattr(data, "y") and isinstance(data.y, torch.Tensor) else idx.device
+        return idx.to(device)
 
 
 def _maybe_load_json(path: Optional[str]) -> Optional[Any]:
@@ -485,7 +473,7 @@ def evaluate_baselines(
     fit_csm_on_train: bool,
     train_data: Optional[Iterable[Data]],
     device: torch.device,
-    save_run: Callable[[str, BaseGraphModel], Dict[str, float]],
+    save_run: Callable[[str, torch.nn.Module], Dict[str, float]],
     results_dir: Path | None = None,
     placeholders: Optional[Mapping[str, int]] = None,
 ) -> Dict[str, Dict[str, float]]:

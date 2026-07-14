@@ -269,11 +269,11 @@ uv run src/09_eval.py \
   --strict-global-metrics \
   --per-constraint-csv
 
-uv run src/10_scheduler.py --only b0_eswc_reproduction --paper-suite --seed 42 --force-retrain
-uv run src/10_scheduler.py --only a1_factorized_imitation --paper-suite --seed 42 --force-retrain
-uv run src/10_scheduler.py --only m1c_safe_factor_chooser --paper-suite --seed 42 --force-retrain
-uv run src/10_scheduler.py --only m1d_safe_factor_direct --paper-suite --seed 42 --force-retrain
-uv run src/10_scheduler.py --only g0_globalfix_reference --paper-suite --seed 42 --force-retrain
+uv run src/10_scheduler.py --only b0_eswc_reproduction --paper-suite --seed 42
+uv run src/10_scheduler.py --only a1_factorized_imitation --paper-suite --seed 42
+uv run src/10_scheduler.py --only m1c_safe_factor_chooser --paper-suite --seed 42
+uv run src/10_scheduler.py --only m1d_safe_factor_direct --paper-suite --seed 42
+uv run src/10_scheduler.py --only g0_globalfix_reference --paper-suite --seed 42
 ```
 
 Run G0 only after the promoted A1 checkpoint has passed run validation.

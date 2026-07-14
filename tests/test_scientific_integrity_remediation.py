@@ -114,6 +114,47 @@ def test_feature_predictions_only_resolve_unique_identities() -> None:
     assert identities.tolist() == [[0, -1, 3]]
 
 
+def test_evaluation_builds_feature_identity_lookup_once(monkeypatch) -> None:
+    mapping = [0, 1, 1, 2]
+    graphs = []
+    for _ in range(2):
+        graph = ConstraintGraphData(
+            x=torch.tensor([1], dtype=torch.long),
+            edge_index=torch.empty((2, 0), dtype=torch.long),
+            y=torch.full((1, 6), 3, dtype=torch.long),
+        )
+        graph.y_identity = graph.y.clone()
+        graph.y_feature = torch.full((1, 6), 2, dtype=torch.long)
+        graph.constraint_type = "single"
+        graphs.append(graph)
+
+    class DenseFeatureModel(torch.nn.Module):
+        def forward(self, data):
+            logits = torch.zeros((data.num_graphs, 6, 3), dtype=torch.float32)
+            logits[:, :, 2] = 1.0
+            return logits
+
+    original_builder = EVAL._build_feature_to_unique_identity
+    build_count = 0
+
+    def tracked_builder(identity_to_feature):
+        nonlocal build_count
+        build_count += 1
+        return original_builder(identity_to_feature)
+
+    monkeypatch.setattr(EVAL, "_build_feature_to_unique_identity", tracked_builder)
+    metrics = EVAL.eval(
+        DenseFeatureModel(),
+        graphs,
+        batch_size=1,
+        device="cpu",
+        identity_to_feature=mapping,
+    )
+
+    assert build_count == 1
+    assert metrics["micro_f1"] == 1.0
+
+
 def _details(*, secondary_count: int, regressions: int, primary_checkable_post: bool = True):
     pre_checkable = [True] * (secondary_count + 1)
     pre_satisfied = [0] + [1] * secondary_count

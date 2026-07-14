@@ -7,6 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import Data
@@ -16,6 +17,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from modules.baselines import BaselineAdapter, DeleteFocusBaseline
 from modules.data_encoders import dataset_variant_name
 
 
@@ -44,10 +46,13 @@ def _write_text(path: Path, content: str) -> None:
 
 
 EVAL_MODULE = _load_module(ROOT / "src" / "09_eval.py", "eval_09_for_test")
+TRAIN_MODULE = _load_module(ROOT / "src" / "07_train.py", "train_07_for_test")
 _resolve_baseline_interim_paths = EVAL_MODULE._resolve_baseline_interim_paths
 load_baseline_split_from_parquet = EVAL_MODULE.load_baseline_split_from_parquet
 _strict_global_requires_factor_fields = EVAL_MODULE._strict_global_requires_factor_fields
 GlobalMetricsSupport = EVAL_MODULE.GlobalMetricsSupport
+evaluate = EVAL_MODULE.eval
+_load_identity_to_feature_mapping = TRAIN_MODULE._load_identity_to_feature_mapping
 
 
 def test_baseline_resolution_prefers_labeled_and_loads_factor_fields() -> None:
@@ -66,6 +71,12 @@ def test_baseline_resolution_prefers_labeled_and_loads_factor_fields() -> None:
             "del_subject": 4,
             "del_predicate": 5,
             "del_object": 6,
+            "add_subject_feature": 11,
+            "add_predicate_feature": 12,
+            "add_object_feature": 99,
+            "del_subject_feature": 14,
+            "del_predicate_feature": 15,
+            "del_object_feature": 16,
             "subject": 7,
             "predicate": 8,
             "object": 9,
@@ -90,7 +101,11 @@ def test_baseline_resolution_prefers_labeled_and_loads_factor_fields() -> None:
             assert data_path.resolve() == labeled_dir.resolve()
             assert encoder_path.resolve() == (labeled_dir / "globalintencoder.txt").resolve()
 
-            graphs, max_index = load_baseline_split_from_parquet(data_path, "test")
+            graphs, max_index = load_baseline_split_from_parquet(
+                data_path,
+                "test",
+                unknown_feature_id=99,
+            )
 
         assert len(graphs) == 1
         graph = graphs[0]
@@ -101,7 +116,51 @@ def test_baseline_resolution_prefers_labeled_and_loads_factor_fields() -> None:
         assert graph.factor_checkable_post_gold.tolist() == [True, False]
         assert graph.factor_satisfied_post_gold.tolist() == [1, 0]
         assert graph.primary_factor_index == 0
+        assert graph.y_identity.tolist() == [[1, 2, 3, 4, 5, 6]]
+        assert graph.y_feature.tolist() == [[11, 12, 99, 14, 15, 16]]
+        assert graph.target_representable_mask.tolist() == [[True, True, False, True, True, True]]
         assert max_index == 9
+
+
+def test_training_loads_identity_to_feature_mapping(tmp_path: Path) -> None:
+    expected = np.asarray([0, 3, 7, 2], dtype=np.int64)
+    np.save(tmp_path / "identity_to_feature.npy", expected)
+
+    loaded = _load_identity_to_feature_mapping(tmp_path)
+
+    assert loaded is not None
+    assert np.array_equal(loaded, expected)
+    assert _load_identity_to_feature_mapping(tmp_path / "missing") is None
+
+
+def test_baseline_resolution_prefers_factor_labeled_base_and_identity_encoder() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        variant = dataset_variant_name("full", 100)
+        base_dir = root / "data" / "interim" / variant
+        labeled_dir = root / "data" / "interim" / f"{variant}_labeled"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        labeled_dir.mkdir(parents=True, exist_ok=True)
+
+        base_row = {
+            "factor_constraint_ids": [17],
+            "factor_checkable_pre": [True],
+            "factor_satisfied_pre": [False],
+        }
+        stale_row = {"factor_constraint_ids": [99]}
+        for split in ("train", "test"):
+            pd.DataFrame([base_row]).to_parquet(base_dir / f"df_{split}.parquet", index=False)
+            pd.DataFrame([stale_row, stale_row]).to_parquet(
+                labeled_dir / f"df_{split}.parquet", index=False
+            )
+
+        _write_text(base_dir / "globalintencoder.txt", "subject\t1\n")
+        _write_text(base_dir / "identity_encoder.txt", "subject\t2\n")
+
+        with _pushd(root):
+            data_path, resolved_encoder_path = _resolve_baseline_interim_paths("full", 100)
+            assert data_path.resolve() == base_dir.resolve()
+            assert resolved_encoder_path.resolve() == (base_dir / "identity_encoder.txt").resolve()
 
 
 def test_baseline_resolution_falls_back_to_unlabeled() -> None:
@@ -132,6 +191,64 @@ def test_baseline_resolution_falls_back_to_unlabeled() -> None:
             data_path, encoder_path = _resolve_baseline_interim_paths("full", 100)
             assert data_path.resolve() == base_dir.resolve()
             assert encoder_path.resolve() == (base_dir / "globalintencoder.txt").resolve()
+
+
+def test_baseline_adapter_returns_direct_identity_indices_and_feature_metrics() -> None:
+    graph = Data(
+        x=torch.zeros((1, 1), dtype=torch.float32),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        y=torch.tensor([[0, 0, 0, 7, 8, 9]], dtype=torch.long),
+    )
+    graph.y_identity = graph.y.clone()
+    graph.y_feature = torch.tensor([[0, 0, 0, 2, 3, 4]], dtype=torch.long)
+    graph.focus_triple = torch.tensor([7, 8, 9], dtype=torch.long)
+    graph.constraint_type = "single"
+
+    model = BaselineAdapter(DeleteFocusBaseline(num_graph_nodes=10_000_000))
+    direct = model([graph])
+
+    assert tuple(direct.shape) == (1, 6)
+    assert direct.tolist() == [[0, 0, 0, 7, 8, 9]]
+    assert sum(parameter.numel() for parameter in model.parameters()) == 0
+
+    metrics = evaluate(
+        model,
+        [graph],
+        batch_size=1,
+        device="cpu",
+        identity_to_feature=[0, 1, 1, 1, 1, 1, 1, 2, 3, 4],
+    )
+    assert metrics["micro_f1"] == 1.0
+    assert metrics["feature_space_micro"]["f1"] == 1.0
+
+
+def test_baseline_main_keeps_encoder_resolver_callable(monkeypatch, tmp_path: Path) -> None:
+    data_path = tmp_path / "interim"
+    data_path.mkdir()
+    identity_encoder_path = data_path / "identity_encoder.txt"
+
+    monkeypatch.setattr(
+        EVAL_MODULE,
+        "_resolve_baseline_interim_paths",
+        lambda dataset, min_occurrence: (data_path, identity_encoder_path),
+    )
+    monkeypatch.setattr(EVAL_MODULE, "_load_identity_to_feature", lambda path: None)
+    monkeypatch.setattr(EVAL_MODULE, "_load_encoder_token_id", lambda path, token: None)
+    monkeypatch.setattr(
+        EVAL_MODULE,
+        "load_baseline_split_from_parquet",
+        lambda path, split, unknown_feature_id=None: ([], 0),
+    )
+    monkeypatch.setattr(EVAL_MODULE, "load_placeholder_ids", lambda path: {})
+    monkeypatch.setattr(EVAL_MODULE, "_maybe_prepare_repair_support", lambda *args, **kwargs: None)
+    monkeypatch.setattr(EVAL_MODULE, "evaluate_baselines", lambda **kwargs: {})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["09_eval.py", "--run-baselines", "--dataset", "full", "--no-global-metrics"],
+    )
+
+    EVAL_MODULE.main()
 
 
 def test_strict_global_factor_field_requirement_is_representation_aware() -> None:
