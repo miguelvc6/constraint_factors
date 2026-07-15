@@ -3,6 +3,7 @@
 ## Objective
 - Create a fixed derived benchmark variant from interim parquet splits without changing the raw corpus or encoder.
 - Reduce the paper dataset size by deterministic stratified sampling while preserving split boundaries, primary constraint-family coverage, and local constraint-density coverage.
+- Emit each sampled split in a deterministic mixed order so streamed graph training does not consume one constraint-family block at a time.
 
 ## Inputs & Outputs
 **Inputs**
@@ -52,7 +53,14 @@ strata using deterministic largest-remainder allocation, subject to one row per
 represented stratum. The output total is exact. `--sample-fraction` remains
 available but is mutually exclusive with `--target-rows`.
 
-The sampled row order is preserved within each split, and row selection is deterministic for a fixed seed.
+Row membership and order are deterministic for a fixed seed. After selection,
+the sampler orders rows by a seeded SplitMix64 key derived from the source row
+index. It performs this as a 64-bucket external sort, so the one-million-row
+benchmark does not need to fit in memory. The source family-block order is
+intentionally not preserved: streamed graph datasets cannot use DataLoader
+shuffling, and preserving those blocks caused each epoch to train on long runs
+of a single family. `sampling_metadata.json` and `dataset_manifest.json` record
+the row-order method, seed, and bucket count.
 
 ## Pipeline Position
 For paper-facing schema-v2 data, run this stage after `05_constraint_labeler.py`

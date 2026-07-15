@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -135,8 +136,53 @@ def test_stratified_sampler_is_deterministic_and_preserves_reports(tmp_path: Pat
     assert sorted(train_report["sampled_count"].tolist()) == [1, 1, 1]
     assert set(train_report["attached_constraint_bin"]) == {"1-32", "108", "33-64"}
 
+    metadata = json.loads((first / "sampling_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["row_order"]["method"] == "splitmix64_source_index_v1"
+    assert metadata["row_order"]["seed"] == 42
+
+
+def test_stratified_sampler_mixes_family_block_order(tmp_path: Path) -> None:
+    interim_root = tmp_path / "data" / "interim"
+    _write_source_variant(interim_root)
+    source_path = interim_root / "full_minocc100" / "df_train.parquet"
+    template = pd.read_parquet(source_path).iloc[0].to_dict()
+    rows = []
+    for family_index, family in enumerate(("typeA", "typeB", "typeC")):
+        for offset in range(40):
+            payload = dict(template)
+            payload.update(
+                {
+                    "row_id": family_index * 1000 + offset,
+                    "constraint_type": family,
+                    "local_constraint_ids": [offset],
+                    "local_constraint_ids_focus": [offset],
+                }
+            )
+            rows.append(payload)
+    pd.DataFrame(rows).to_parquet(source_path, index=False)
+
+    first = _run_sampler(interim_root, "mixed_a")
+    second = _run_sampler(interim_root, "mixed_b")
+    first_train = pd.read_parquet(first / "df_train.parquet")
+    second_train = pd.read_parquet(second / "df_train.parquet")
+
+    assert first_train["row_id"].tolist() == second_train["row_id"].tolist()
+    assert first_train["constraint_type"].value_counts().to_dict() == {
+        "typeA": 20,
+        "typeB": 20,
+        "typeC": 20,
+    }
+    family_order = first_train["constraint_type"].tolist()
+    family_transitions = sum(
+        current != previous
+        for previous, current in zip(family_order, family_order[1:])
+    )
+    assert family_transitions > 10
+
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmpdir:
         test_stratified_sampler_is_deterministic_and_preserves_reports(Path(tmpdir))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_stratified_sampler_mixes_family_block_order(Path(tmpdir))
     print("stratified benchmark sampler tests passed")

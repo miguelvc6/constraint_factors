@@ -194,3 +194,24 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
         assert cfg["model_config"]["pressure_module_sharing"] == "per_type"
         cfg = json.loads((models / "h2_a1_no_factor_loss__toy_minocc100__node_id" / "config.json").read_text())
         assert cfg["training_config"]["factor_loss"]["enabled"] is False
+
+        stale_path = models / "h2_a1_no_factor_loss__toy_minocc100__node_id" / "config.json"
+        stale_cfg = json.loads(stale_path.read_text(encoding="utf-8"))
+        stale_cfg["training_config"]["num_epochs"] = 1
+        stale_path.write_text(json.dumps(stale_cfg), encoding="utf-8")
+        try:
+            sys.argv = [
+                "make_experiment_configs.py",
+                "--processed-root",
+                str(root / "data" / "processed"),
+                "--models-root",
+                str(models),
+                "--include-h2-ablations",
+                "--overwrite-existing",
+            ]
+            module.main()
+        finally:
+            sys.argv = argv_backup
+        refreshed_cfg = json.loads(stale_path.read_text(encoding="utf-8"))
+        assert refreshed_cfg["training_config"]["num_epochs"] == 15
+        assert refreshed_cfg["training_config"]["validation_subset_size"] is None

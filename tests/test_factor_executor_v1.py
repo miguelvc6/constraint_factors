@@ -173,6 +173,14 @@ def test_passive_representation_skips_factor_heads_without_factor_types() -> Non
 
     assert outputs["factor_logits_pre"] is None
     assert outputs["factor_logits_post_gold"] is None
+    assert model._num_factor_executor_modules == 0
+    assert model._factor_executors is None
+    assert model._factor_post_heads is None
+    assert model._gold_edit_embeddings is None
+    assert not any(
+        name.startswith(("_factor_executors.", "_factor_post_heads.", "_gold_edit_embeddings."))
+        for name, _parameter in model.named_parameters()
+    )
 
 
 if __name__ == "__main__":

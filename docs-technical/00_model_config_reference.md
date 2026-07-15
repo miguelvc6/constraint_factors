@@ -85,7 +85,7 @@ Core optimization fields:
 Generator defaults for the paper-facing proposal configs:
 
 - `batch_size: 256`
-- `num_epochs: 10`
+- `num_epochs: 15`
 - `early_stopping_rounds: 2`
 - `grad_clip: 0.5`
 - `learning_rate: 1e-4`
@@ -94,11 +94,13 @@ Generator defaults for the paper-facing proposal configs:
 - `num_workers: 2`
 - `pin_memory: false`
 
-These defaults are intentionally conservative for the large streamed graph artifacts under `data/processed/`. The shorter schedule is meant to stop soon after the best validation checkpoint on runs that otherwise diverge after several good epochs.
+These defaults are intentionally conservative for the large streamed graph artifacts under `data/processed/`. Fifteen epochs is the maximum; early stopping still restores the best checkpoint when representative validation loss stops improving.
 
-The paper-facing reranker generator uses the same cheaper schedule (`num_epochs: 10`, `early_stopping_rounds: 2`, `learning_rate: 1e-4`, `grad_clip: 0.5`, `scheduler_patience: 0`) with its own reranker batch size.
+The paper-facing reranker generator uses the same schedule (`num_epochs: 15`, `early_stopping_rounds: 2`, `learning_rate: 1e-4`, `grad_clip: 0.5`, `scheduler_patience: 0`) with its own reranker batch size.
 
-Set `validation_subset_size` to a positive integer for development runs that should validate on only the first N validation graphs each epoch. Leave it unset or `null` for full validation. For streamed graph artifacts, subset validation uses a single validation worker so the stream produces one global prefix rather than one prefix per worker.
+`make_experiment_configs.py` normally preserves existing optional H2 and primary-query config files. Pass `--overwrite-existing` during an intentional full rerun so those files are refreshed to the current schedule instead of retaining an older policy.
+
+Paper-facing generated configs set `validation_subset_size: null` so scheduler and early-stopping decisions use the complete validation split. Set it to a positive integer only for development runs that should validate on the first N validation graphs each epoch. For streamed graph artifacts, subset validation uses a single validation worker so the stream produces one global prefix rather than one prefix per worker, and training rejects a prefix that omits a constraint family observed in training.
 
 Set `train_subset_size` to a positive integer for bounded execution runs that should train on only the first N training graphs each epoch. Leave it unset or `null` for full training. For streamed graph artifacts, subset training also uses a single worker so each epoch consumes one deterministic global prefix.
 

@@ -31,6 +31,10 @@ from modules.data_encoders import (
 
 
 SPLITS: tuple[str, ...] = ("train", "val", "test")
+ROW_ORDER_METHOD = "splitmix64_source_index_v1"
+ROW_ORDER_BUCKET_BITS = 6
+ROW_ORDER_BUCKET_COUNT = 1 << ROW_ORDER_BUCKET_BITS
+ROW_ORDER_KEY_COLUMN = "__sample_row_order_key"
 DEFAULT_BINS: tuple[tuple[int, int | None, str], ...] = (
     (1, 32, "1-32"),
     (33, 64, "33-64"),
@@ -207,6 +211,32 @@ def _sample_indices(
     return selected_by_split, report_rows
 
 
+def _deterministic_row_order_keys(
+    source_indices: np.ndarray,
+    *,
+    split: str,
+    seed: int,
+) -> np.ndarray:
+    """Return a deterministic pseudo-random permutation key per source row.
+
+    SplitMix64 is a bijection over uint64 values.  Adding a stable split/seed
+    salt before applying it therefore gives every source index a unique key,
+    without holding an in-memory permutation of the sampled split.
+    """
+
+    salt_bytes = hashlib.sha256(
+        f"{ROW_ORDER_METHOD}:{seed}:{split}".encode("utf-8")
+    ).digest()[:8]
+    salt = np.uint64(int.from_bytes(salt_bytes, byteorder="little", signed=False))
+    values = np.asarray(source_indices, dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        mixed = values + salt + np.uint64(0x9E3779B97F4A7C15)
+        mixed = (mixed ^ (mixed >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        mixed = (mixed ^ (mixed >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        mixed = mixed ^ (mixed >> np.uint64(31))
+    return mixed
+
+
 def _write_sampled_splits(
     source_root: Path,
     output_root: Path,
@@ -214,6 +244,7 @@ def _write_sampled_splits(
     selected_by_split: dict[str, set[int]],
     column: str,
     batch_size: int,
+    seed: int,
 ) -> tuple[Counter[int], dict[str, Counter[int]], dict[str, int]]:
     combined_hist: Counter[int] = Counter()
     split_hist: dict[str, Counter[int]] = {split: Counter() for split in SPLITS}
@@ -222,23 +253,62 @@ def _write_sampled_splits(
     for split, parquet_path in _iter_split_paths(source_root):
         selected = selected_by_split.get(split, set())
         output_path = output_root / f"df_{split}.parquet"
+        incomplete_path = output_root / f".{output_path.name}.incomplete"
+        shuffle_root = output_root / f".{split}_row_order"
         parquet_file = pq.ParquetFile(parquet_path)
-        writer: pq.ParquetWriter | None = None
+        source_schema = parquet_file.schema_arrow
+        if ROW_ORDER_KEY_COLUMN in source_schema.names:
+            raise ValueError(
+                f"Reserved sampler column {ROW_ORDER_KEY_COLUMN!r} already exists in {parquet_path}"
+            )
+        shuffle_schema = source_schema.append(pa.field(ROW_ORDER_KEY_COLUMN, pa.uint64()))
+        bucket_writers: dict[int, pq.ParquetWriter] = {}
         row_offset = 0
         split_written = 0
+        shuffle_root.mkdir(parents=True, exist_ok=False)
         try:
-            writer = pq.ParquetWriter(output_path, parquet_file.schema_arrow)
             for batch in parquet_file.iter_batches(batch_size=batch_size):
-                mask_values = [
-                    (row_offset + local_idx) in selected
-                    for local_idx in range(batch.num_rows)
-                ]
+                batch_start = row_offset
+                mask_values = np.fromiter(
+                    (
+                        (row_offset + local_idx) in selected
+                        for local_idx in range(batch.num_rows)
+                    ),
+                    dtype=np.bool_,
+                    count=batch.num_rows,
+                )
                 row_offset += batch.num_rows
-                if not any(mask_values):
+                if not bool(mask_values.any()):
                     continue
                 table = pa.Table.from_batches([batch])
-                filtered = table.filter(pa.array(mask_values))
-                writer.write_table(filtered)
+                filtered = table.filter(pa.array(mask_values, type=pa.bool_()))
+                source_indices = np.arange(
+                    batch_start,
+                    batch_start + batch.num_rows,
+                    dtype=np.uint64,
+                )[mask_values]
+                order_keys = _deterministic_row_order_keys(
+                    source_indices,
+                    split=split,
+                    seed=seed,
+                )
+                shuffled = filtered.append_column(
+                    ROW_ORDER_KEY_COLUMN,
+                    pa.array(order_keys, type=pa.uint64()),
+                )
+                bucket_ids = (
+                    order_keys >> np.uint64(64 - ROW_ORDER_BUCKET_BITS)
+                ).astype(np.uint8, copy=False)
+                for bucket_id in np.unique(bucket_ids).tolist():
+                    bucket = int(bucket_id)
+                    positions = np.flatnonzero(bucket_ids == bucket)
+                    bucket_table = shuffled.take(pa.array(positions, type=pa.int64()))
+                    writer = bucket_writers.get(bucket)
+                    if writer is None:
+                        bucket_path = shuffle_root / f"bucket-{bucket:03d}.parquet"
+                        writer = pq.ParquetWriter(bucket_path, shuffle_schema)
+                        bucket_writers[bucket] = writer
+                    writer.write_table(bucket_table)
                 split_written += filtered.num_rows
 
                 if column in filtered.column_names:
@@ -249,9 +319,34 @@ def _write_sampled_splits(
                         int_count = int(count)
                         combined_hist[int_value] += int_count
                         split_hist[split][int_value] += int_count
-        finally:
-            if writer is not None:
+            for writer in bucket_writers.values():
                 writer.close()
+            bucket_writers.clear()
+
+            if split_written != len(selected):
+                raise RuntimeError(
+                    f"Selected/written row mismatch for {split}: "
+                    f"selected={len(selected):,}, written={split_written:,}"
+                )
+
+            final_writer = pq.ParquetWriter(incomplete_path, source_schema)
+            try:
+                for bucket in range(ROW_ORDER_BUCKET_COUNT):
+                    bucket_path = shuffle_root / f"bucket-{bucket:03d}.parquet"
+                    if not bucket_path.exists():
+                        continue
+                    bucket_table = pq.read_table(bucket_path)
+                    ordered = bucket_table.sort_by([(ROW_ORDER_KEY_COLUMN, "ascending")])
+                    final_writer.write_table(ordered.drop_columns([ROW_ORDER_KEY_COLUMN]))
+            finally:
+                final_writer.close()
+            incomplete_path.replace(output_path)
+        finally:
+            for writer in bucket_writers.values():
+                writer.close()
+            if incomplete_path.exists():
+                incomplete_path.unlink()
+            shutil.rmtree(shuffle_root, ignore_errors=True)
         sampled_counts[split] = split_written
 
     return combined_hist, split_hist, sampled_counts
@@ -362,6 +457,7 @@ def _write_reports(
             f"- sample_fraction: `{sample_fraction if sample_fraction is not None else 'allocated'}`",
             f"- target_rows: `{target_rows if target_rows is not None else 'not set'}`",
             f"- seed: `{seed}`",
+            f"- row_order: `{ROW_ORDER_METHOD}`",
             f"- source_rows: `{source_total_rows:,}`",
             f"- sampled_rows: `{sampled_total:,}`",
             f"- sampled_by_split: {by_split}",
@@ -383,6 +479,11 @@ def _write_reports(
         "sample_fraction": sample_fraction,
         "target_rows": target_rows,
         "seed": seed,
+        "row_order": {
+            "method": ROW_ORDER_METHOD,
+            "seed": seed,
+            "external_sort_buckets": ROW_ORDER_BUCKET_COUNT,
+        },
         "source_total_rows": source_total_rows,
         "sampled_total_rows": sampled_total,
         "sampled_counts": sampled_counts,
@@ -446,6 +547,11 @@ def _write_dataset_manifest(
             "seed": int(seed),
             "target_rows": target_rows,
             "sample_fraction": sample_fraction,
+            "row_order": {
+                "method": ROW_ORDER_METHOD,
+                "seed": int(seed),
+                "external_sort_buckets": ROW_ORDER_BUCKET_COUNT,
+            },
             "primary_validation_by_constraint": sample_validation_by_constraint,
             "gold_repair_by_constraint": sample_gold_repair_by_constraint,
         },
@@ -544,6 +650,7 @@ def main() -> None:
         selected_by_split=selected_by_split,
         column=column,
         batch_size=args.batch_size,
+        seed=int(args.seed),
     )
 
     _write_histogram_csv(combined_hist, output_root / f"hist_{column}.csv")

@@ -499,8 +499,18 @@ class BaseGraphModel(nn.Module, ABC):
         self._pressure_residual_scale = float(pressure_residual_scale)
         self._factor_state_dim = head_hidden
         self._factor_scope_feature_dim = (hidden_mp * 4) + 3
-        self._num_factor_executor_modules = max(1, self._num_factor_types)
-        if self._factor_executor_impl == "legacy_shared":
+        self._num_factor_executor_modules = (
+            max(1, self._num_factor_types)
+            if self._constraint_representation == "factorized"
+            else 0
+        )
+        if self._constraint_representation != "factorized":
+            self.factor_type_embeddings = None
+            self.factor_pre_head = None
+            self._factor_executors = None
+            self._factor_post_heads = None
+            self._gold_edit_embeddings = None
+        elif self._factor_executor_impl == "legacy_shared":
             if self._num_factor_types > 0 and self._factor_type_embedding_dim > 0:
                 self.factor_type_embeddings = nn.Embedding(
                     self._num_factor_types, self._factor_type_embedding_dim

@@ -44,7 +44,7 @@ Reproducibility notes:
 - every new checkpoint writes `run_manifest.json`; paper result validation requires it.
 - heuristic baselines are deterministic.
 - do not mix encodings or dataset variants inside the same paper table.
-- keep `training_config.validation_subset_size: 25000` for the paper proposal runs. This is the frozen validation policy for the current paper line, not a development-only shortcut.
+- final paper proposal and reranker configs use `training_config.validation_subset_size: null`; scheduler and early-stopping decisions must see the complete validation split. A bounded prefix is development-only and must cover every trained constraint family.
 - do not edit configs once training starts; generate configs once, then only make one explicit “locked” hyperparameter update after the short search.
 
 Recommended run ledger:
@@ -311,8 +311,8 @@ Recommended search budget:
 - default: `5` configs max
 - one seed only
 - no repeated sweeps
-- keep `training_config.validation_subset_size: 25000` in the generated configs and in the final paper-facing proposal configs. This keeps search and final runs on the same validation policy and bounds validation cost consistently.
-- generated `M1C` configs use the conservative stability schedule: `learning_rate=1e-4`, `grad_clip=0.5`, `num_epochs=10`, `early_stopping_rounds=2`, `scheduler_patience=0`, and `chooser.loss_weight=0.25`
+- the bounded search generator may retain `training_config.validation_subset_size: 25000` and `num_epochs=10` as a development budget, but that prefix must cover every trained family. Do not copy its subset policy into final configs.
+- final configs from `make_experiment_configs.py` use full validation and the conservative stability schedule: `learning_rate=1e-4`, `grad_clip=0.5`, `num_epochs=15`, `early_stopping_rounds=2`, `scheduler_patience=0`, and `chooser.loss_weight=0.25`
 
 Run the short search with the scheduler:
 

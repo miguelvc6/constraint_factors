@@ -104,6 +104,51 @@ def _max_abs_value(tensor: torch.Tensor | None) -> float:
     return float(torch.nan_to_num(tensor.detach(), nan=0.0, posinf=float("inf"), neginf=float("-inf")).abs().max().item())
 
 
+def _max_abs_unmasked_value(
+    tensor: torch.Tensor | None,
+    *,
+    mask_fill_value: float = -1e9,
+) -> float:
+    """Measure logits without counting the fixed invalid-class mask value."""
+
+    if tensor is None or tensor.numel() == 0:
+        return 0.0
+    detached = tensor.detach()
+    represented_mask_fill = torch.as_tensor(
+        mask_fill_value,
+        dtype=detached.dtype,
+        device=detached.device,
+    )
+    unmasked = detached[detached != represented_mask_fill]
+    return _max_abs_value(unmasked)
+
+
+def _missing_validation_constraint_types(
+    train_metrics: dict[str, Any],
+    val_metrics: dict[str, Any],
+) -> list[str]:
+    return sorted(set(train_metrics) - set(val_metrics))
+
+
+def _assert_validation_subset_constraint_coverage(
+    train_metrics: dict[str, Any],
+    val_metrics: dict[str, Any],
+    *,
+    validation_subset_size: int | None,
+) -> None:
+    if validation_subset_size is None:
+        return
+    missing = _missing_validation_constraint_types(train_metrics, val_metrics)
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            f"validation_subset_size={validation_subset_size} omits constraint types "
+            f"observed in training: {missing_text}. Scheduler and early-stopping decisions "
+            "would use an unrepresentative validation prefix; set validation_subset_size "
+            "to null for full validation or construct a subset covering every type."
+        )
+
+
 def _scalar_float(value: float | torch.Tensor) -> float:
     if torch.is_tensor(value):
         return float(value.detach().cpu().item())
@@ -1226,7 +1271,10 @@ def train(
             assert out.dim() == 3 and out.size(1) == NUM_SLOTS and out.size(2) == model.num_target_ids, (
                 f"Expected out (batch_size,{NUM_SLOTS},{model.num_target_ids}), got {tuple(out.shape)}"
             )
-            train_edit_logit_abs_max = max(train_edit_logit_abs_max, _max_abs_value(out))
+            train_edit_logit_abs_max = max(
+                train_edit_logit_abs_max,
+                _max_abs_unmasked_value(out),
+            )
 
             out_flat = out.reshape(-1, out.size(-1))
             targets_flat = targets.reshape(-1)
@@ -2036,7 +2084,10 @@ def train(
                 assert out.dim() == 3 and out.size(1) == NUM_SLOTS and out.size(2) == model.num_target_ids, (
                     f"Expected out (B,{NUM_SLOTS},{model.num_target_ids}), got {tuple(out.shape)}"
                 )
-                val_edit_logit_abs_max = max(val_edit_logit_abs_max, _max_abs_value(out))
+                val_edit_logit_abs_max = max(
+                    val_edit_logit_abs_max,
+                    _max_abs_unmasked_value(out),
+                )
 
                 out_flat = out.reshape(-1, out.size(-1))
                 targets_flat = targets.reshape(-1)
@@ -2706,6 +2757,11 @@ def train(
             100 * val_slot_correct_slots[idx] / max(val_slot_counts[idx], 1) for idx in range(NUM_SLOTS)
         ]
         val_per_constraint = val_constraint_metrics.as_epoch_metrics()
+        _assert_validation_subset_constraint_coverage(
+            train_per_constraint,
+            val_per_constraint,
+            validation_subset_size=validation_subset_size,
+        )
         val_factor_loss = val_factor_loss_sum / max(val_factor_count, 1)
         val_factor_acc = 100 * val_factor_correct / max(val_factor_count, 1)
         val_chooser_loss = val_chooser_loss_sum / max(val_chooser_count, 1)

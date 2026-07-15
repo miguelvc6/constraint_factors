@@ -39,8 +39,8 @@ PASSIVE_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)\.pkl$"
 PASSIVE_SHARD_RE = re.compile(r"^train_graph_repr-eswc_passive-(?P<encoding>.+)-shard\d+\.(?:pkl|pt)$")
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
-VALIDATION_SUBSET_SIZE = 25_000
-CHEAPER_NUM_EPOCHS = 10
+PAPER_VALIDATION_SUBSET_SIZE: int | None = None
+PAPER_NUM_EPOCHS = 15
 CHEAPER_EARLY_STOPPING_ROUNDS = 2
 CHEAPER_LEARNING_RATE = 1e-4
 CHEAPER_GRAD_CLIP = 0.5
@@ -247,7 +247,7 @@ def _proposal_config_payload(
         "model_config": model_config,
         "training_config": {
             "batch_size": 256,
-            "num_epochs": CHEAPER_NUM_EPOCHS,
+            "num_epochs": PAPER_NUM_EPOCHS,
             "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
             "learning_rate": CHEAPER_LEARNING_RATE,
             "weight_decay": LOCKED_WEIGHT_DECAY,
@@ -257,7 +257,7 @@ def _proposal_config_payload(
             "num_workers": SAFE_STREAMING_NUM_WORKERS,
             "pin_memory": SAFE_STREAMING_PIN_MEMORY,
             "validate_factor_labels": exp.validate_factor_labels,
-            "validation_subset_size": VALIDATION_SUBSET_SIZE,
+            "validation_subset_size": PAPER_VALIDATION_SUBSET_SIZE,
             "constraint_loss": {
                 "dynamic_reweighting": {
                     "enabled": exp.dynamic_reweighting_enabled,
@@ -317,14 +317,14 @@ def _reranker_config_payload(
         "reranker_config": {},
         "training_config": {
             "batch_size": 64,
-            "num_epochs": CHEAPER_NUM_EPOCHS,
+            "num_epochs": PAPER_NUM_EPOCHS,
             "early_stopping_rounds": CHEAPER_EARLY_STOPPING_ROUNDS,
             "learning_rate": CHEAPER_LEARNING_RATE,
             "weight_decay": 1e-4,
             "grad_clip": CHEAPER_GRAD_CLIP,
             "scheduler_factor": CHEAPER_SCHEDULER_FACTOR,
             "scheduler_patience": CHEAPER_SCHEDULER_PATIENCE,
-            "validation_subset_size": VALIDATION_SUBSET_SIZE,
+            "validation_subset_size": PAPER_VALIDATION_SUBSET_SIZE,
             "objective": exp.objective,
             "regression_weight": 0.5,
             "topk_candidates": 20,
@@ -360,6 +360,11 @@ def main() -> None:
         "--include-primary-query-ablations",
         action="store_true",
         help="Emit the three A1 primary-query ablation configs for full_strat1m_minocc100/node_id.",
+    )
+    parser.add_argument(
+        "--overwrite-existing",
+        action="store_true",
+        help="Overwrite existing optional and canonical config.json files selected by this invocation.",
     )
     args = parser.parse_args()
 
@@ -570,8 +575,12 @@ def main() -> None:
             )
             if exp.name == "x2_factor_loss_only_appendix":
                 payload["training_config"]["factor_loss"]["enabled"] = True
-            overwrite = not args.include_h2_ablations
-            if args.include_primary_query_ablations and exp.name not in primary_query_names:
+            overwrite = args.overwrite_existing or not args.include_h2_ablations
+            if (
+                not args.overwrite_existing
+                and args.include_primary_query_ablations
+                and exp.name not in primary_query_names
+            ):
                 overwrite = False
             if _write_json(cfg_path, payload, overwrite=overwrite):
                 created += 1
@@ -588,8 +597,8 @@ def main() -> None:
                 num_factor_types=num_factor_types,
                 proposal_config_tag=proposal_config_tag,
             )
-            overwrite = not args.include_h2_ablations
-            if args.include_primary_query_ablations:
+            overwrite = args.overwrite_existing or not args.include_h2_ablations
+            if not args.overwrite_existing and args.include_primary_query_ablations:
                 overwrite = False
             if _write_json(cfg_path, payload, overwrite=overwrite):
                 created += 1

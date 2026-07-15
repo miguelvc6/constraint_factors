@@ -4,6 +4,7 @@ Technical docs describe repository behavior, artifact contracts, commands, and
 developer-facing operations.
 
 - [Scientific integrity remediation](09_scientific_integrity_remediation.md): implemented audit fixes, invalidated artifacts, mandatory reruns, commands, and acceptance gate.
+- [Temporary paper-artifact rerun commands](TEMP_paper_artifact_rerun_after_order_fix.md): post-order-fix rebuild commands; remove after the successful rerun is recorded in the paper ledger.
 - [Model and evaluation matrix](00_models_and_evaluation_matrix.md): canonical paper-facing systems and metric surface.
 - [Training and evaluation plan](00_training_and_evaluation_execution_plan.md): detailed experiment order and diagnostics.
 - [Model config reference](00_model_config_reference.md): supported model/training configuration fields.
@@ -19,4 +20,3 @@ developer-facing operations.
 
 Research rationale and paper claims belong in the
 [conceptual documentation](../docs-conceptual/README.md).
-

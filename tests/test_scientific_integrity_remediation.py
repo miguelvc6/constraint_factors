@@ -749,6 +749,23 @@ def test_canonical_a1_configuration_uses_shared_pressure() -> None:
         num_factor_types=3,
     )
     assert payload["model_config"]["pressure_module_sharing"] == "shared"
+    assert payload["training_config"]["num_epochs"] == 15
+    assert payload["training_config"]["validation_subset_size"] is None
+
+    reranker_payload = CONFIG_GENERATOR._reranker_config_payload(
+        exp=CONFIG_GENERATOR.RerankerExperiment(
+            name="g0_globalfix_reference",
+            objective="global_fix",
+            proposal_name="a1_factorized_imitation",
+        ),
+        variant="toy_minocc2",
+        encoding="node_id",
+        min_occurrence=2,
+        num_factor_types=3,
+        proposal_config_tag="a1_factorized_imitation",
+    )
+    assert reranker_payload["training_config"]["num_epochs"] == 15
+    assert reranker_payload["training_config"]["validation_subset_size"] is None
 
 
 def test_run_provenance_hashes_effective_artifacts(tmp_path: Path) -> None:
