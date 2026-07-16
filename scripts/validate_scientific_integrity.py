@@ -398,6 +398,18 @@ def validate_run(run_directory: Path, report: ValidationReport) -> None:
         return
     config = _read_json(config_path)
     model_config = ModelConfig.from_mapping(config.get("model_config", {}))
+    if model_config.factor_executor_impl == "per_type_grouped_v2":
+        active_ids = tuple(model_config.active_factor_type_ids or ())
+        report.require(
+            bool(active_ids)
+            and active_ids == tuple(sorted(set(active_ids)))
+            and active_ids[-1] < model_config.num_factor_types,
+            f"{run_directory.name}: compact factor mapping is explicit and valid",
+        )
+        report.require(
+            model_config.gold_edit_embedding_mode == "compact",
+            f"{run_directory.name}: grouped-v2 uses compact gold-edit embeddings",
+        )
     if run_directory.name.startswith("a1_factorized_imitation"):
         report.require(
             model_config.pressure_module_sharing == "shared",
@@ -432,6 +444,19 @@ def validate_run(run_directory: Path, report: ValidationReport) -> None:
             report.require(
                 0 < role_parameters <= 1_500_000,
                 "canonical A1 shared role-pressure component is at most 1.5M parameters",
+            )
+        if model_config.factor_executor_impl == "per_type_grouped_v2":
+            report.require(
+                0 < int(by_component.get("_factor_executors", 0)) <= 8_100_000,
+                f"{run_directory.name}: compact per-type executors allocate only active types",
+            )
+            report.require(
+                0 < int(by_component.get("_factor_post_heads", 0)) <= 3_300_000,
+                f"{run_directory.name}: compact post heads allocate only active types",
+            )
+            report.require(
+                0 < int(by_component.get("_gold_edit_embeddings", 0)) <= 1_700_000,
+                f"{run_directory.name}: compact gold-edit table uses reachable targets",
             )
         if str(model_config.model).upper() == "RERANKER" or "proposal_config" in config:
             extra = manifest.get("extra", {})

@@ -35,6 +35,7 @@ from modules.data_encoders import (
     discover_graph_artifacts,
     graph_dataset_filename,
 )
+from modules.factor_types import dataset_factor_type_ids
 
 SAFE_STREAMING_NUM_WORKERS = 2
 SAFE_STREAMING_PIN_MEMORY = False
@@ -147,6 +148,7 @@ class HP:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--processed-root", type=Path, default=Path("data/processed"))
+    ap.add_argument("--interim-root", type=Path, default=Path("data/interim"))
     ap.add_argument("--models-root", type=Path, default=Path("models"))
     ap.add_argument("--encoding", type=str, default="node_id")
     ap.add_argument("--num-configs", type=int, default=5)
@@ -174,6 +176,10 @@ def main() -> None:
     if num_factor_types <= 0:
         sample = _load_first_data_obj(artifacts[0].path)
         num_factor_types = _infer_num_factor_types(sample)
+    active_factor_type_ids = dataset_factor_type_ids(
+        args.interim_root / variant,
+        splits=("train", "val"),
+    )
 
     # ---- Focused shortlist (5 configs) ----
     # These are the selected candidates for constrained-budget model selection.
@@ -208,7 +214,8 @@ def main() -> None:
                 "encoding": encoding,
                 "min_occurrence": min_occ,
                 "model": "GIN_PRESSURE",
-                "factor_executor_impl": "per_type_v1",
+                "factor_executor_impl": "per_type_grouped_v2",
+                "gold_edit_embedding_mode": "compact",
                 # backbone (inspired by ESWC best, adapted)
                 "num_layers": hp.num_layers,
                 "hidden_channels": hp.hidden,
@@ -222,6 +229,7 @@ def main() -> None:
                 "num_role_types": 6,
                 # factors / pressure
                 "num_factor_types": int(num_factor_types),
+                "active_factor_type_ids": list(active_factor_type_ids),
                 "pressure_enabled": True,
                 "pressure_type_conditioning": hp.pressure_mode,  # concat|gate
                 "pressure_residual_scale": 0.1,

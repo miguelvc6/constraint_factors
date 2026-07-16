@@ -26,6 +26,7 @@ from modules.candidates import (
     score_candidates_from_logits,
 )
 from modules.config import ModelConfig, TrainingConfig
+from modules.factor_types import dataset_factor_type_ids
 from modules.data_encoders import (
     GlobalIntEncoder,
     GraphStreamDataset,
@@ -426,7 +427,11 @@ def _assert_factor_labels_batch(data: Data) -> None:
         _assert_factor_labels(graph, idx)
 
 
-def _assert_factor_type_ids_supported(data: Data, num_factor_types: int) -> None:
+def _assert_factor_type_ids_supported(
+    data: Data,
+    num_factor_types: int,
+    active_factor_type_ids: torch.Tensor | None = None,
+) -> None:
     if num_factor_types <= 0:
         return
     graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
@@ -438,16 +443,23 @@ def _assert_factor_type_ids_supported(data: Data, num_factor_types: int) -> None
         if factor_types_tensor.numel() == 0:
             continue
         invalid_mask = (factor_types_tensor < 0) | (factor_types_tensor >= num_factor_types)
+        if active_factor_type_ids is not None and active_factor_type_ids.numel() > 0:
+            allowed = active_factor_type_ids.to(
+                device=factor_types_tensor.device,
+                dtype=torch.long,
+            )
+            invalid_mask |= ~torch.isin(factor_types_tensor.to(dtype=torch.long), allowed)
         if not torch.any(invalid_mask):
             continue
-        invalid_values = sorted({int(v) for v in factor_types_tensor[invalid_mask].tolist()})
+        invalid_values = sorted(
+            {int(v) for v in factor_types_tensor[invalid_mask].detach().cpu().tolist()}
+        )
         preview = ", ".join(str(v) for v in invalid_values[:8])
         if len(invalid_values) > 8:
             preview += ", ..."
         raise AssertionError(
-            f"graph[{idx}] contains factor_types outside [0, {num_factor_types}) "
-            f"(invalid values: {preview}). Rebuild the constraint registry, labeled parquet, and graphs "
-            "so factor_types use dense compact constraint_type_item indices."
+            f"graph[{idx}] contains factor_types outside the configured active stable-id mapping "
+            f"(invalid values: {preview}). Regenerate the experiment config from the labeled parquet."
         )
 
 
@@ -1139,6 +1151,11 @@ def train(
         "val_factor_logit_abs_max": [],
         "train_chooser_score_abs_max": [],
         "val_chooser_score_abs_max": [],
+        "train_epoch_seconds": [],
+        "val_epoch_seconds": [],
+        "epoch_seconds": [],
+        "train_graphs_per_second": [],
+        "val_graphs_per_second": [],
     }
 
     chooser_loss_mode = chooser_cfg.loss_mode
@@ -1233,7 +1250,11 @@ def train(
             phase_t0 = time.perf_counter() if timing_enabled else 0.0
             if not data_on_device:
                 data = data.to(device, non_blocking=True)
-            _assert_factor_type_ids_supported(data, int(getattr(model, "_num_factor_types", 0)))
+            _assert_factor_type_ids_supported(
+                data,
+                int(getattr(model, "_num_factor_types", 0)),
+                getattr(model, "factor_type_ids_compact_to_stable", None),
+            )
             if train_cfg.validate_factor_labels:
                 _assert_factor_labels_batch(data)
             targets = data.y.long()
@@ -2048,6 +2069,7 @@ def train(
         val_edit_logit_abs_max = 0.0
         val_factor_logit_abs_max = 0.0
         val_chooser_score_abs_max = 0.0
+        train_epoch_seconds = time.perf_counter() - train_epoch_start
         val_epoch_start = time.perf_counter()
         val_timing_window = _new_timing_bucket(val_timing_keys)
         val_timing_epoch = _new_timing_bucket(val_timing_keys)
@@ -2061,7 +2083,11 @@ def train(
                 phase_t0 = time.perf_counter() if timing_enabled else 0.0
                 if not data_on_device:
                     data = data.to(device, non_blocking=True)
-                _assert_factor_type_ids_supported(data, int(getattr(model, "_num_factor_types", 0)))
+                _assert_factor_type_ids_supported(
+                    data,
+                    int(getattr(model, "_num_factor_types", 0)),
+                    getattr(model, "factor_type_ids_compact_to_stable", None),
+                )
                 if train_cfg.validate_factor_labels:
                     _assert_factor_labels_batch(data)
                 targets = data.y.long()
@@ -2797,6 +2823,8 @@ def train(
             val_total,
         )
 
+        val_epoch_seconds = time.perf_counter() - val_epoch_start
+        epoch_seconds = train_epoch_seconds + val_epoch_seconds
         current_lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step(avg_val_loss)
 
@@ -2818,6 +2846,11 @@ def train(
         history["val_factor_logit_abs_max"].append(val_factor_logit_abs_max)
         history["train_chooser_score_abs_max"].append(train_chooser_score_abs_max)
         history["val_chooser_score_abs_max"].append(val_chooser_score_abs_max)
+        history["train_epoch_seconds"].append(train_epoch_seconds)
+        history["val_epoch_seconds"].append(val_epoch_seconds)
+        history["epoch_seconds"].append(epoch_seconds)
+        history["train_graphs_per_second"].append(train_total / max(train_epoch_seconds, 1e-9))
+        history["val_graphs_per_second"].append(val_total / max(val_epoch_seconds, 1e-9))
         history.setdefault("train_chooser_loss", []).append(train_chooser_loss)
         history.setdefault("val_chooser_loss", []).append(val_chooser_loss)
         history.setdefault("train_direct_safety_loss", []).append(train_direct_safety_loss)
@@ -2912,6 +2945,14 @@ def train(
             val_acc_all6,
             train_acc_slot,
             val_acc_slot,
+        )
+        logger.info(
+            "Epoch %s throughput | train=%.1f graphs/s (%.1fs) val=%.1f graphs/s (%.1fs)",
+            epoch + 1,
+            train_total / max(train_epoch_seconds, 1e-9),
+            train_epoch_seconds,
+            val_total / max(val_epoch_seconds, 1e-9),
+            val_epoch_seconds,
         )
         logger.info(
             "Epoch %s stability | lr=%.3g grad_norm_mean=%.4f grad_norm_max=%.4f "
@@ -3118,6 +3159,26 @@ def main():
                 if num_factor_types > 0:
                     model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
                     logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
+        if model_cfg.factor_executor_impl == "per_type_grouped_v2":
+            if model_cfg.active_factor_type_ids is None:
+                raise ValueError(
+                    "per_type_grouped_v2 requires explicit model_config.active_factor_type_ids"
+                )
+            observed_factor_type_ids = dataset_factor_type_ids(
+                Path("data/interim") / dataset_variant,
+                splits=("train", "val"),
+            )
+            configured_factor_type_ids = tuple(model_cfg.active_factor_type_ids)
+            if configured_factor_type_ids != observed_factor_type_ids:
+                raise ValueError(
+                    "active_factor_type_ids does not match the exact train/val parquet vocabulary: "
+                    f"configured={configured_factor_type_ids}, observed={observed_factor_type_ids}"
+                )
+            logger.info(
+                "Using compact active factor ids (%s): %s",
+                len(configured_factor_type_ids),
+                ", ".join(str(value) for value in configured_factor_type_ids),
+            )
     elif model_cfg.num_factor_types != 0:
         logger.info(
             "Clearing num_factor_types=%s for passive constraint representation.",
@@ -3472,6 +3533,10 @@ def main():
         estimated_train_batches=estimated_train_batches,
         estimated_val_batches=estimated_val_batches,
     )
+    if device.type == "cuda":
+        history["peak_cuda_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
+        history["peak_cuda_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
+    history["factor_dispatch_backend"] = getattr(model, "factor_dispatch_backend", "unknown")
 
     if device.type == "cuda":
         log_cuda_memory("Post-training state", device)
@@ -3511,6 +3576,28 @@ def main():
             "dataset_variant": dataset_variant,
             "encoding": model_cfg.encoding,
             "constraint_representation": model_cfg.constraint_representation,
+            "factor_type_mapping": {
+                "stable_address_space": int(model_cfg.num_factor_types),
+                "active_factor_type_ids": list(model_cfg.active_factor_type_ids or ()),
+                "sha256": canonical_json_hash(list(model_cfg.active_factor_type_ids or ())),
+            },
+            "gold_edit_embedding": {
+                "mode": model_cfg.gold_edit_embedding_mode,
+                "rows": int(getattr(model, "gold_edit_class_ids", torch.empty(0)).numel())
+                if model_cfg.gold_edit_embedding_mode == "compact"
+                else int(model.num_target_ids),
+                "class_ids_sha256": canonical_json_hash(
+                    getattr(model, "gold_edit_class_ids", torch.empty(0))
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                if model_cfg.gold_edit_embedding_mode == "compact"
+                else None,
+            },
+            "factor_dispatch_backend": getattr(model, "factor_dispatch_backend", "unknown"),
+            "peak_cuda_allocated_bytes": history.get("peak_cuda_allocated_bytes"),
+            "peak_cuda_reserved_bytes": history.get("peak_cuda_reserved_bytes"),
         },
     )
     manifest_path = write_run_manifest(run_directory, run_manifest)

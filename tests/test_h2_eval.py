@@ -190,6 +190,9 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
         ]
         cfg = json.loads((models / "h2_a1_gold_scalar_pressure__toy_minocc100__node_id" / "config.json").read_text())
         assert cfg["model_config"]["pressure_oracle_input"] == "gold_pre_scalar"
+        assert cfg["model_config"]["factor_executor_impl"] == "per_type_grouped_v2"
+        assert cfg["model_config"]["active_factor_type_ids"] == [0, 1]
+        assert cfg["model_config"]["gold_edit_embedding_mode"] == "compact"
         cfg = json.loads((models / "h2_a1_per_type_pressure__toy_minocc100__node_id" / "config.json").read_text())
         assert cfg["model_config"]["pressure_module_sharing"] == "per_type"
         cfg = json.loads((models / "h2_a1_no_factor_loss__toy_minocc100__node_id" / "config.json").read_text())

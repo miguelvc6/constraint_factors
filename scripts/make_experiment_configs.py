@@ -25,6 +25,7 @@ import torch
 import pandas as pd
 
 from modules.data_encoders import base_dataset_name, graph_dataset_filename
+from modules.factor_types import dataset_factor_type_ids
 
 VARIANT_MINOCC_RE = re.compile(r"minocc(\d+)", re.IGNORECASE)
 FACTORIZED_RE = re.compile(r"^train_graph-(?P<encoding>.+)\.pkl$")
@@ -105,6 +106,19 @@ def _infer_num_factor_types(sample_data: Any) -> int:
             except Exception:
                 pass
     return 0
+
+
+def _infer_active_factor_type_ids(sample_data: Any) -> tuple[int, ...]:
+    if sample_data is None:
+        return ()
+    observed: set[int] = set()
+    for attr in ("factor_types", "factor_type_id", "factor_type_ids"):
+        values = getattr(sample_data, attr, None)
+        if values is None:
+            continue
+        tensor = torch.as_tensor(values, dtype=torch.long).view(-1)
+        observed.update(int(value) for value in tensor.tolist())
+    return tuple(sorted(observed))
 
 
 def _infer_num_factor_types_from_registry(dataset_variant: str, interim_root: Path = Path("data/interim")) -> int:
@@ -191,7 +205,7 @@ class ProposalExperiment:
     # Shared blocks are the canonical A1-family architecture. Per-type blocks
     # remain available only when an ablation explicitly requests them.
     pressure_module_sharing: str = "shared"
-    factor_executor_impl: str = "per_type_v1"
+    factor_executor_impl: str = "per_type_grouped_v2"
     pressure_oracle_input: str = "none"
     factor_loss_enabled: bool | None = None
     primary_constraint_mode: str = "executable_factor"
@@ -212,6 +226,7 @@ def _proposal_config_payload(
     encoding: str,
     min_occurrence: int,
     num_factor_types: int,
+    active_factor_type_ids: tuple[int, ...],
 ) -> dict[str, Any]:
     model_config = {
         "dataset_variant": variant,
@@ -221,6 +236,12 @@ def _proposal_config_payload(
         "constraint_representation": exp.constraint_representation,
         "primary_constraint_mode": exp.primary_constraint_mode,
         "factor_executor_impl": exp.factor_executor_impl,
+        "gold_edit_embedding_mode": (
+            "compact"
+            if exp.constraint_representation == "factorized"
+            and exp.factor_executor_impl != "legacy_shared"
+            else "full"
+        ),
         "use_edge_attributes": True,
         "use_edge_subtraction": False,
         "use_role_embeddings": True,
@@ -231,6 +252,12 @@ def _proposal_config_payload(
         "pressure_residual_scale": LOCKED_PRESSURE_RESIDUAL_SCALE,
         "pressure_oracle_input": exp.pressure_oracle_input,
         "num_factor_types": int(num_factor_types),
+        "active_factor_type_ids": (
+            list(active_factor_type_ids)
+            if exp.constraint_representation == "factorized"
+            and exp.factor_executor_impl != "per_type_v1"
+            else None
+        ),
         "enable_policy_choice": exp.enable_policy_choice,
         "policy_num_classes": 6,
     }
@@ -346,6 +373,7 @@ def _reranker_config_payload(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--processed-root", type=Path, default=Path("data/processed"))
+    parser.add_argument("--interim-root", type=Path, default=Path("data/interim"))
     parser.add_argument("--models-root", type=Path, default=Path("models"))
     parser.add_argument("--limit", type=int, default=0, help="Limit variant/encoding pairs (0 = no limit).")
     parser.add_argument("--variant", default=None, help="Only generate configs for this processed variant name.")
@@ -548,6 +576,20 @@ def main() -> None:
         if num_factor_types <= 0:
             sample = _load_first_data_obj(factorized_path) or _load_first_data_obj(passive_path)
             num_factor_types = _infer_num_factor_types(sample)
+        else:
+            sample = None
+        interim_directory = args.interim_root / variant
+        if all((interim_directory / f"df_{split}.parquet").exists() for split in ("train", "val")):
+            active_factor_type_ids = dataset_factor_type_ids(
+                interim_directory,
+                splits=("train", "val"),
+            )
+        else:
+            if sample is None:
+                sample = _load_first_data_obj(factorized_path) or _load_first_data_obj(passive_path)
+            active_factor_type_ids = _infer_active_factor_type_ids(sample)
+        if not active_factor_type_ids and num_factor_types > 0:
+            active_factor_type_ids = tuple(range(num_factor_types))
 
         proposal_experiments = list(canonical_proposals)
         reranker_experiments = list(canonical_rerankers)
@@ -572,6 +614,7 @@ def main() -> None:
                 encoding=encoding,
                 min_occurrence=min_occurrence,
                 num_factor_types=num_factor_types,
+                active_factor_type_ids=active_factor_type_ids,
             )
             if exp.name == "x2_factor_loss_only_appendix":
                 payload["training_config"]["factor_loss"]["enabled"] = True

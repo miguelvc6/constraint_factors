@@ -747,6 +747,7 @@ def test_canonical_a1_configuration_uses_shared_pressure() -> None:
         encoding="node_id",
         min_occurrence=2,
         num_factor_types=3,
+        active_factor_type_ids=(0, 1, 2),
     )
     assert payload["model_config"]["pressure_module_sharing"] == "shared"
     assert payload["training_config"]["num_epochs"] == 15

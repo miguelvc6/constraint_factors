@@ -31,7 +31,10 @@ Core fields:
 - `entity_class_ids`
 - `predicate_class_ids`
 - `num_factor_types`
+- `active_factor_type_ids`
 - `factor_type_embedding_dim`
+- `factor_executor_impl`
+- `gold_edit_embedding_mode`
 - `pressure_enabled`
 - `pressure_type_conditioning`
 - `pressure_module_sharing`
@@ -63,6 +66,20 @@ Paper-facing additions:
   - allowed values: `none`, `gold_pre_scalar`
   - default: `none`
   - `gold_pre_scalar` appends the gold pre-repair factor violation scalar to per-type pressure messages; use this only for the H2 gold-scalar oracle ablation
+
+- `active_factor_type_ids`
+  - sorted stable registry ids allocated by compact factor executors
+  - paper dataset value: `[0, 2, 3, 4, 5, 9, 12, 14, 15, 16]`
+  - `num_factor_types` remains the stable registry address-space bound (`29`); it is not the compact module count
+
+- `factor_executor_impl`
+  - `per_type_v1`: legacy dense `ModuleList` layout retained for old checkpoints
+  - `per_type_grouped_v2`: architecture-equivalent compact per-type executor using grouped BF16 CUDA dispatch with a segmented fallback
+  - `legacy_shared`: historical shared executor ablation
+
+- `gold_edit_embedding_mode`
+  - `full`: legacy raw-id-sized embedding table
+  - `compact`: embedding rows are the sorted union of reachable entity and predicate target ids, including `NONE=0`
 
 ## `training_config` for proposal runs
 

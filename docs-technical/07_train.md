@@ -76,6 +76,27 @@ This makes bottlenecks explicit (for example, chooser-heavy runs where `chooser`
 - If `training_config.validate_factor_labels` is enabled, training asserts that factor label tensors exist and align with `factor_constraint_ids` (useful for upcoming factor supervision).
 - Models receive `model_config.constraint_representation` at construction time. Passive models do not allocate or execute factor heads, post-edit heads, or gold-edit embeddings even if the passive graph contains constraint/factor nodes; factorized models remain strict and require dense `factor_types` whenever per-type factor execution is reached.
 
+## Compact Factor Execution
+
+`per_type_grouped_v2` preserves stable factor ids in graph artifacts while
+mapping them to a compact model-local vocabulary. Paper configs record
+`active_factor_type_ids=[0,2,3,4,5,9,12,14,15,16]`; training scans the
+train/validation parquet factor columns and rejects a mapping that is missing
+or adds an id. The stable registry address-space bound remains
+`num_factor_types=29`.
+
+On BF16 CUDA devices with SM80 or newer, the compact executor and per-type
+pressure banks use ragged grouped matrix multiplication. CPU, unsupported GPU,
+and full-precision evaluation use a segmented linear fallback. Shared pressure
+dispatches all edges for a role through its one shared module without a
+per-type loop.
+
+With `gold_edit_embedding_mode="compact"`, gold-edit embeddings are indexed
+through the reachable entity/predicate target union rather than `max_id + 1`.
+The mapping and class ids are checkpoint buffers and run-provenance fields.
+Unknown stable factor ids and unreachable gold targets fail instead of being
+silently clamped.
+
 ## Dynamic Weighting per constraint type
 
 `DynamicConstraintWeighter` keeps per‑constraint weights so the trainer can emphasize underperforming constraint types. Its behaviour can be specified from the configs json files: you can toggle it on/off, choose update_frequency (epoch uses validation metrics, batch reacts after every batch), decide which metrics drive “difficulty” (target_metrics defaults to loss but can include accuracies).
