@@ -24,6 +24,8 @@ from modules.models import (
     GroupedFactorPostEditHead,
     GroupedFactorTypeExecutor,
     RepairGINFactorPressure,
+    SharedAdapterFactorPostEditHead,
+    SharedAdapterFactorTypeExecutor,
 )
 
 
@@ -123,6 +125,18 @@ def test_model_config_validates_explicit_active_mapping() -> None:
         ModelConfig.from_mapping(
             {"num_factor_types": 3, "active_factor_type_ids": [0, 3]}
         )
+    shared = ModelConfig.from_mapping(
+        {
+            "num_factor_types": 3,
+            "active_factor_type_ids": [0, 2],
+            "factor_executor_impl": "shared_adapter_v1",
+            "factor_adapter_rank": 4,
+            "gold_edit_embedding_mode": "compact",
+        }
+    )
+    assert shared.factor_adapter_rank == 4
+    with pytest.raises(ValueError, match="factor_adapter_rank must be positive"):
+        ModelConfig.from_mapping({"factor_adapter_rank": 0})
 
 
 def test_compact_model_allocates_only_active_types_and_reachable_gold_ids() -> None:
@@ -187,6 +201,88 @@ def test_grouped_executor_and_post_match_legacy_modules_on_cpu() -> None:
     torch.testing.assert_close(actual_post, expected_post)
 
 
+def test_shared_adapter_executor_starts_from_shared_trunk_and_routes_type_heads() -> None:
+    torch.manual_seed(13)
+    executor = SharedAdapterFactorTypeExecutor(
+        num_types=2,
+        input_dim=7,
+        state_dim=5,
+        adapter_rank=3,
+    )
+    assert torch.count_nonzero(executor.adapter_up.weight) == 0
+    assert torch.count_nonzero(executor.adapter_up.bias) == 0
+
+    repeated = torch.randn(1, 7).repeat(2, 1)
+    dispatch = build_grouped_dispatch(torch.tensor([0, 1]), num_types=2)
+    states, logits = executor(repeated, dispatch)
+    torch.testing.assert_close(states[0], states[1])
+    assert logits.shape == (2,)
+
+    loss = states.square().mean() + logits.square().mean()
+    loss.backward()
+    assert executor.input_layer.weight.grad is not None
+    assert executor.adapter_up.weight.grad is not None
+    assert executor.pre_head.weight.grad is not None
+
+
+def test_shared_adapter_post_head_is_vectorized_and_trainable() -> None:
+    torch.manual_seed(17)
+    post = SharedAdapterFactorPostEditHead(
+        num_types=2,
+        state_dim=6,
+        edit_dim=6,
+        adapter_rank=2,
+    )
+    compact_types = torch.tensor([1, 0, 1, 0], dtype=torch.long)
+    dispatch = build_grouped_dispatch(compact_types, num_types=2)
+    states = torch.randn(4, 6, requires_grad=True)
+    edits = torch.randn(4, 6)
+    logits = post(states, edits, dispatch)
+    assert logits.shape == (4,)
+    logits.square().mean().backward()
+    assert post.hidden.weight.grad is not None
+    assert post.adapter_up.weight.grad is not None
+    assert post.output.weight.grad is not None
+
+
+def test_shared_adapter_model_is_smaller_than_compact_per_type_model() -> None:
+    per_type = _compact_model()
+    shared = RepairGINFactorPressure(
+        num_input_graph_nodes=16,
+        num_embedding_size=8,
+        num_layers=2,
+        hidden=8,
+        head_hidden=8,
+        dropout=0.0,
+        use_node_embeddings=True,
+        use_edge_attributes=False,
+        entity_class_ids=(0, 2, 7),
+        predicate_class_ids=(0, 5),
+        num_factor_types=3,
+        active_factor_type_ids=ACTIVE_IDS,
+        factor_executor_impl="shared_adapter_v1",
+        factor_adapter_rank=2,
+        gold_edit_embedding_mode="compact",
+        pressure_enabled=True,
+        pressure_module_sharing="shared",
+    )
+    per_type_factor_parameters = sum(
+        parameter.numel()
+        for name, parameter in per_type.named_parameters()
+        if name.startswith(("_factor_executors", "_factor_post_heads"))
+    )
+    shared_factor_parameters = sum(
+        parameter.numel()
+        for name, parameter in shared.named_parameters()
+        if name.startswith(("_factor_executors", "_factor_post_heads"))
+    )
+    assert shared_factor_parameters < per_type_factor_parameters
+    outputs = shared(_factor_graph(2))
+    assert outputs["factor_logits_pre"] is not None
+    assert outputs["factor_logits_post_gold"] is not None
+    assert shared.factor_dispatch_backend == "segmented_linear"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_grouped_executor_uses_bf16_grouped_mm_on_sm80_cuda() -> None:
     major, _minor = torch.cuda.get_device_capability()
@@ -202,6 +298,33 @@ def test_grouped_executor_uses_bf16_grouped_mm_on_sm80_cuda() -> None:
     loss.backward()
     assert executor.last_backend == "grouped_mm_bf16"
     assert executor.input_layer.weight.grad is not None
+
+    shared = SharedAdapterFactorTypeExecutor(2, 13, 8, adapter_rank=4).cuda()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        shared_states, shared_logits = shared(inputs, dispatch)
+        shared_loss = (
+            shared_states.float().square().mean()
+            + shared_logits.float().square().mean()
+        )
+    shared_loss.backward()
+    assert shared.last_backend == "segmented_linear"
+    assert shared.adapter_up.weight.grad is not None
+
+    aligned_shared = SharedAdapterFactorTypeExecutor(
+        2,
+        13,
+        8,
+        adapter_rank=16,
+    ).cuda()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        aligned_states, aligned_logits = aligned_shared(inputs, dispatch)
+        aligned_loss = (
+            aligned_states.float().square().mean()
+            + aligned_logits.float().square().mean()
+        )
+    aligned_loss.backward()
+    assert aligned_shared.last_backend == "grouped_mm_bf16"
+    assert aligned_shared.adapter_up.weight.grad is not None
 
 
 def test_compact_gold_embedding_matches_full_table_for_reachable_ids() -> None:

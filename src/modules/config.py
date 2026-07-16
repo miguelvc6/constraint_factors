@@ -394,7 +394,9 @@ class ModelConfig:
     primary_constraint_mode: PrimaryConstraintMode = "executable_factor"
     """How the primary violated constraint is exposed to factorized models."""
     factor_executor_impl: str = "per_type_v1"
-    """Factor executor implementation: per_type_v1, per_type_grouped_v2, or legacy_shared."""
+    """Factor executor implementation: per_type_v1, per_type_grouped_v2, shared_adapter_v1, or legacy_shared."""
+    factor_adapter_rank: int = 16
+    """Rank of the compact type-specific residual adapters."""
     gold_edit_embedding_mode: str = "full"
     """Gold-edit embedding storage: full or compact."""
 
@@ -446,6 +448,11 @@ class ModelConfig:
             filtered["active_factor_type_ids"] = active_ids
         if "factor_type_embedding_dim" in filtered and filtered["factor_type_embedding_dim"] is not None:
             filtered["factor_type_embedding_dim"] = int(filtered["factor_type_embedding_dim"])
+        if "factor_adapter_rank" in filtered and filtered["factor_adapter_rank"] is not None:
+            value = int(filtered["factor_adapter_rank"])
+            if value <= 0:
+                raise ValueError("factor_adapter_rank must be positive")
+            filtered["factor_adapter_rank"] = value
         if "pressure_enabled" in filtered and filtered["pressure_enabled"] is not None:
             filtered["pressure_enabled"] = bool(filtered["pressure_enabled"])
         if "pressure_type_conditioning" in filtered and filtered["pressure_type_conditioning"] is not None:
@@ -489,10 +496,15 @@ class ModelConfig:
             filtered["primary_constraint_mode"] = value
         if "factor_executor_impl" in filtered and filtered["factor_executor_impl"] is not None:
             value = str(filtered["factor_executor_impl"]).lower()
-            if value not in {"per_type_v1", "per_type_grouped_v2", "legacy_shared"}:
+            if value not in {
+                "per_type_v1",
+                "per_type_grouped_v2",
+                "shared_adapter_v1",
+                "legacy_shared",
+            }:
                 raise ValueError(
                     "factor_executor_impl must be 'per_type_v1', 'per_type_grouped_v2', "
-                    "or 'legacy_shared'"
+                    "'shared_adapter_v1', or 'legacy_shared'"
                 )
             filtered["factor_executor_impl"] = value
         if "gold_edit_embedding_mode" in filtered and filtered["gold_edit_embedding_mode"] is not None:

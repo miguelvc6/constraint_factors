@@ -138,6 +138,78 @@ class GroupedFactorPostEditHead(nn.Module):
         return logits.index_select(0, dispatch.inverse_order)
 
 
+class SharedAdapterFactorTypeExecutor(nn.Module):
+    """Shared executor trunk with compact type-specific low-rank residuals."""
+
+    def __init__(
+        self,
+        num_types: int,
+        input_dim: int,
+        state_dim: int,
+        adapter_rank: int,
+    ):
+        super().__init__()
+        self.input_layer = nn.Linear(input_dim, state_dim)
+        self.state_layer = nn.Linear(state_dim, state_dim)
+        self.adapter_down = GroupedLinearBank(num_types, state_dim, adapter_rank)
+        self.adapter_up = GroupedLinearBank(num_types, adapter_rank, state_dim)
+        self.pre_head = GroupedLinearBank(num_types, state_dim, 1)
+        nn.init.zeros_(self.adapter_up.weight)
+        nn.init.zeros_(self.adapter_up.bias)
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        dispatch: GroupedDispatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sorted_inputs = inputs.index_select(0, dispatch.order)
+        state = F.relu(self.input_layer(sorted_inputs))
+        state = F.relu(self.state_layer(state))
+        adapter = F.relu(self.adapter_down.forward_sorted(state, dispatch))
+        state = F.relu(state + self.adapter_up.forward_sorted(adapter, dispatch))
+        logits = self.pre_head.forward_sorted(state, dispatch).squeeze(-1)
+        return (
+            state.index_select(0, dispatch.inverse_order),
+            logits.index_select(0, dispatch.inverse_order),
+        )
+
+    @property
+    def last_backend(self) -> str:
+        return self.adapter_down.last_backend
+
+
+class SharedAdapterFactorPostEditHead(nn.Module):
+    """Shared post-edit trunk with compact type-specific low-rank residuals."""
+
+    def __init__(
+        self,
+        num_types: int,
+        state_dim: int,
+        edit_dim: int,
+        adapter_rank: int,
+    ):
+        super().__init__()
+        self.hidden = nn.Linear(state_dim + edit_dim, state_dim)
+        self.adapter_down = GroupedLinearBank(num_types, state_dim, adapter_rank)
+        self.adapter_up = GroupedLinearBank(num_types, adapter_rank, state_dim)
+        self.output = GroupedLinearBank(num_types, state_dim, 1)
+        nn.init.zeros_(self.adapter_up.weight)
+        nn.init.zeros_(self.adapter_up.bias)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        edit_repr: torch.Tensor,
+        dispatch: GroupedDispatch,
+    ) -> torch.Tensor:
+        joint = torch.cat([state, edit_repr], dim=-1).index_select(0, dispatch.order)
+        hidden = F.relu(self.hidden(joint))
+        adapter = F.relu(self.adapter_down.forward_sorted(hidden, dispatch))
+        hidden = F.relu(hidden + self.adapter_up.forward_sorted(adapter, dispatch))
+        logits = self.output.forward_sorted(hidden, dispatch).squeeze(-1)
+        return logits.index_select(0, dispatch.inverse_order)
+
+
 class GroupedPressureRole(nn.Module):
     def __init__(self, num_types: int, input_dim: int, hidden_dim: int):
         super().__init__()
@@ -431,6 +503,7 @@ class BaseGraphModel(nn.Module, ABC):
         active_factor_type_ids: Sequence[int] | torch.Tensor | None = None,
         factor_type_embedding_dim: int = 8,
         factor_executor_impl: str = "per_type_v1",
+        factor_adapter_rank: int = 16,
         gold_edit_embedding_mode: str = "full",
         constraint_representation: str = "factorized",
         pressure_enabled: bool = False,
@@ -506,16 +579,21 @@ class BaseGraphModel(nn.Module, ABC):
         if self._factor_executor_impl not in {
             "per_type_v1",
             "per_type_grouped_v2",
+            "shared_adapter_v1",
             "legacy_shared",
         }:
             raise ValueError(
                 "factor_executor_impl must be 'per_type_v1', 'per_type_grouped_v2', "
-                "or 'legacy_shared'"
+                "'shared_adapter_v1', or 'legacy_shared'"
             )
+        self._factor_adapter_rank = int(factor_adapter_rank)
+        if self._factor_adapter_rank <= 0:
+            raise ValueError("factor_adapter_rank must be positive")
         normalized_active_factor_type_ids = normalize_active_factor_type_ids(
             active_factor_type_ids,
             num_factor_types=self._num_factor_types,
-            require_explicit=self._factor_executor_impl == "per_type_grouped_v2",
+            require_explicit=self._factor_executor_impl
+            in {"per_type_grouped_v2", "shared_adapter_v1"},
         )
         if self._factor_executor_impl == "per_type_v1" and normalized_active_factor_type_ids != tuple(
             range(max(self._num_factor_types, 0))
@@ -728,6 +806,30 @@ class BaseGraphModel(nn.Module, ABC):
                 gold_embedding_rows,
                 self._factor_state_dim,
             )
+        elif self._factor_executor_impl == "shared_adapter_v1":
+            self.factor_type_embeddings = None
+            self.factor_pre_head = None
+            self._factor_executors = SharedAdapterFactorTypeExecutor(
+                self._num_factor_executor_modules,
+                self._factor_scope_feature_dim,
+                self._factor_state_dim,
+                self._factor_adapter_rank,
+            )
+            self._factor_post_heads = SharedAdapterFactorPostEditHead(
+                self._num_factor_executor_modules,
+                self._factor_state_dim,
+                self._factor_state_dim,
+                self._factor_adapter_rank,
+            )
+            gold_embedding_rows = (
+                int(gold_edit_class_ids.numel())
+                if self._gold_edit_embedding_mode == "compact"
+                else self.num_target_ids
+            )
+            self._gold_edit_embeddings = nn.Embedding(
+                gold_embedding_rows,
+                self._factor_state_dim,
+            )
         else:
             self.factor_type_embeddings = None
             self.factor_pre_head = None
@@ -797,7 +899,10 @@ class BaseGraphModel(nn.Module, ABC):
     @property
     def factor_dispatch_backend(self) -> str:
         executors = self._factor_executors
-        if isinstance(executors, GroupedFactorTypeExecutor):
+        if isinstance(
+            executors,
+            (GroupedFactorTypeExecutor, SharedAdapterFactorTypeExecutor),
+        ):
             return executors.last_backend
         if isinstance(executors, nn.ModuleList):
             return "module_loop"
@@ -941,7 +1046,10 @@ class BaseGraphModel(nn.Module, ABC):
         if self._factor_executors is None:
             raise RuntimeError("Per-type factor executors are not initialized.")
         inputs = self._factor_scope_features(runtime)
-        if isinstance(self._factor_executors, GroupedFactorTypeExecutor):
+        if isinstance(
+            self._factor_executors,
+            (GroupedFactorTypeExecutor, SharedAdapterFactorTypeExecutor),
+        ):
             return self._factor_executors(inputs, runtime.factor_dispatch)
         states = inputs.new_zeros((inputs.size(0), self._factor_state_dim))
         logits = inputs.new_zeros((inputs.size(0),))
@@ -962,7 +1070,10 @@ class BaseGraphModel(nn.Module, ABC):
     ) -> torch.Tensor:
         if self._factor_post_heads is None:
             raise RuntimeError("Per-type factor post heads are not initialized.")
-        if isinstance(self._factor_post_heads, GroupedFactorPostEditHead):
+        if isinstance(
+            self._factor_post_heads,
+            (GroupedFactorPostEditHead, SharedAdapterFactorPostEditHead),
+        ):
             return self._factor_post_heads(
                 factor_states,
                 edit_repr,
@@ -1481,6 +1592,7 @@ class RepairGINFactorPressure(BaseGraphModel):
         if self._pressure_oracle_input != "none" and self._factor_executor_impl not in {
             "per_type_v1",
             "per_type_grouped_v2",
+            "shared_adapter_v1",
         }:
             raise ValueError(
                 "pressure_oracle_input is only supported with a per-type factor executor"
@@ -1505,7 +1617,11 @@ class RepairGINFactorPressure(BaseGraphModel):
             self._pressure_type_gate = nn.Linear(self._pressure_type_dim, self.hidden_channels)
         else:
             self._pressure_type_gate = None
-        if self._factor_executor_impl in {"per_type_v1", "per_type_grouped_v2"}:
+        if self._factor_executor_impl in {
+            "per_type_v1",
+            "per_type_grouped_v2",
+            "shared_adapter_v1",
+        }:
             pressure_modules_per_role = (
                 self._num_factor_executor_modules
                 if self._pressure_module_sharing == "per_type"
@@ -1517,7 +1633,8 @@ class RepairGINFactorPressure(BaseGraphModel):
                 + (1 if self._pressure_oracle_input == "gold_pre_scalar" else 0)
             )
             if (
-                self._factor_executor_impl == "per_type_grouped_v2"
+                self._factor_executor_impl
+                in {"per_type_grouped_v2", "shared_adapter_v1"}
                 and self._pressure_module_sharing == "per_type"
             ):
                 self._pressure_role_modules = nn.ModuleDict(
@@ -1571,7 +1688,11 @@ class RepairGINFactorPressure(BaseGraphModel):
     def _apply_pressure(self, x: torch.Tensor, data) -> torch.Tensor:
         if not self._pressure_enabled or self._constraint_representation != "factorized":
             return x
-        if self._factor_executor_impl in {"per_type_v1", "per_type_grouped_v2"}:
+        if self._factor_executor_impl in {
+            "per_type_v1",
+            "per_type_grouped_v2",
+            "shared_adapter_v1",
+        }:
             runtime = self._build_factor_scope_runtime(x, data)
             if runtime is None:
                 return x
@@ -1939,6 +2060,7 @@ def build_model(model_name: str, num_input_graph_nodes: int, config: ModelConfig
         active_factor_type_ids=getattr(config, "active_factor_type_ids", None),
         factor_type_embedding_dim=config.factor_type_embedding_dim,
         factor_executor_impl=getattr(config, "factor_executor_impl", "per_type_v1"),
+        factor_adapter_rank=getattr(config, "factor_adapter_rank", 16),
         gold_edit_embedding_mode=getattr(config, "gold_edit_embedding_mode", "full"),
         constraint_representation=getattr(config, "constraint_representation", "factorized"),
         pressure_enabled=config.pressure_enabled,

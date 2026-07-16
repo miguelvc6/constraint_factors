@@ -97,6 +97,43 @@ The mapping and class ids are checkpoint buffers and run-provenance fields.
 Unknown stable factor ids and unreachable gold targets fail instead of being
 silently clamped.
 
+## Shared-Adapter Executor Comparison
+
+`shared_adapter_v1` replaces the independent per-type executor matrices with
+one shared `1603 -> 400 -> 400` trunk. Each active factor type receives a
+rank-16 residual adapter and an independent scalar precondition head. The
+post-edit path uses the same pattern: one shared `800 -> 400` projection,
+rank-16 residual adapters, and independent scalar heads. Adapter output
+projections start at zero so optimization begins from the shared trunk rather
+than a random type-specific residual.
+
+Generate the two neutral seed-42 comparison configs without overwriting the
+canonical A1 config:
+
+```bash
+uv run scripts/make_experiment_configs.py \
+  --variant full_strat1m_minocc100 \
+  --encoding node_id \
+  --include-executor-comparison
+```
+
+Run both complete directory names in one scheduler pass:
+
+```bash
+uv run src/10_scheduler.py \
+  --only-exact a1_factorized_imitation_per_type_compact__full_strat1m_minocc100__node_id \
+  --only-exact a1_factorized_imitation_shared_adapter__full_strat1m_minocc100__node_id \
+  --paper-suite \
+  --seed 42 \
+  --force-retrain
+```
+
+`--only-exact` is repeatable and matches complete scheduler directory names;
+it cannot be combined with the legacy substring `--only` filter. After both
+standard evaluations, run `src/09_eval.py --h2-eval` for each directory and
+use `scripts/compare_a1_executors.py` to verify matched configuration/data
+provenance and write JSON, Markdown, per-constraint, and H2 delta artifacts.
+
 ## Dynamic Weighting per constraint type
 
 `DynamicConstraintWeighter` keeps per‑constraint weights so the trainer can emphasize underperforming constraint types. Its behaviour can be specified from the configs json files: you can toggle it on/off, choose update_frequency (epoch uses validation metrics, batch reacts after every batch), decide which metrics drive “difficulty” (target_metrics defaults to loss but can include accuracies).

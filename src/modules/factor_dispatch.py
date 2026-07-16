@@ -80,13 +80,16 @@ class GroupedLinearBank(nn.Module):
             nn.init.uniform_(self.bias[type_index], -bound, bound)
 
     @staticmethod
-    def _grouped_cuda_supported(inputs: torch.Tensor) -> bool:
+    def _bf16_cuda_supported(inputs: torch.Tensor) -> bool:
         if not inputs.is_cuda or not hasattr(F, "grouped_mm"):
             return False
         major, _minor = torch.cuda.get_device_capability(inputs.device)
         return major >= 8 and (
             inputs.dtype == torch.bfloat16 or torch.is_autocast_enabled("cuda")
         )
+
+    def _grouped_cuda_supported(self, inputs: torch.Tensor) -> bool:
+        return self.output_dim % 8 == 0 and self._bf16_cuda_supported(inputs)
 
     def forward_sorted(
         self,
@@ -103,7 +106,7 @@ class GroupedLinearBank(nn.Module):
             return inputs.new_empty((0, self.output_dim))
 
         if self.output_dim == 1:
-            use_bf16 = self._grouped_cuda_supported(inputs)
+            use_bf16 = self._bf16_cuda_supported(inputs)
             compute_inputs = inputs.to(dtype=torch.bfloat16) if use_bf16 else inputs
             selected_weight = self.weight[:, 0, :].index_select(
                 0,

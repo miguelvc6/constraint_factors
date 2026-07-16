@@ -41,6 +41,18 @@ def discover_model_directories(root: Path) -> List[Path]:
     return sorted({cfg.parent for cfg in configs})
 
 
+def matches_selection(
+    experiment_name: str,
+    *,
+    substring: str | None,
+    exact_names: Iterable[str],
+) -> bool:
+    exact = tuple(exact_names)
+    if exact:
+        return experiment_name in exact
+    return substring is None or substring in experiment_name
+
+
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -195,6 +207,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional substring filter to run only matching experiment directories.",
     )
     parser.add_argument(
+        "--only-exact",
+        action="append",
+        default=[],
+        metavar="EXPERIMENT",
+        help=(
+            "Run exactly this complete experiment-directory name. Repeat the "
+            "option to schedule multiple exact experiments in one pass."
+        ),
+    )
+    parser.add_argument(
         "--keep-going",
         action="store_true",
         help="Continue running remaining experiments after failures.",
@@ -230,6 +252,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.only and args.only_exact:
+        raise SystemExit("--only and --only-exact cannot be combined.")
     configure_logging(verbose=args.verbose)
     logger = logging.getLogger("scheduler")
 
@@ -259,6 +283,12 @@ def main() -> int:
             continue
         if cfg.get("disabled") is True:
             continue
+        if not matches_selection(
+            model_dir.name,
+            substring=args.only,
+            exact_names=args.only_exact,
+        ):
+            continue
         planned.append(model_dir.name)
     if planned:
         logger.info("Planned runs (first %s): %s", min(5, len(planned)), ", ".join(planned[:5]))
@@ -269,8 +299,15 @@ def main() -> int:
 
         logger.info("[%s/%s] Processing %s", index, len(model_dirs), model_dir.name)
 
-        if args.only and args.only not in model_dir.name:
-            logger.info("Skipping %s (filter --only=%s)", model_dir.name, args.only)
+        if not matches_selection(
+            model_dir.name,
+            substring=args.only,
+            exact_names=args.only_exact,
+        ):
+            if args.only_exact:
+                logger.info("Skipping %s (not selected by --only-exact)", model_dir.name)
+            else:
+                logger.info("Skipping %s (filter --only=%s)", model_dir.name, args.only)
             continue
 
         if checkpoint_path.exists() and not args.force_retrain:

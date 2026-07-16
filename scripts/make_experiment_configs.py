@@ -55,6 +55,7 @@ LOCKED_WEIGHT_DECAY = 1.1e-4
 LOCKED_PRESSURE_RESIDUAL_SCALE = 0.1
 LOCKED_FACTOR_LOSS_WEIGHT_PRE = 0.1
 LOCKED_FACTOR_LOSS_WEIGHT_POST_GOLD = 0.1
+LOCKED_FACTOR_ADAPTER_RANK = 16
 LOCKED_CHOOSER_TOPK_CANDIDATES = 20
 LOCKED_CHOOSER_MAX_CANDIDATES_TOTAL = 80
 
@@ -206,6 +207,7 @@ class ProposalExperiment:
     # remain available only when an ablation explicitly requests them.
     pressure_module_sharing: str = "shared"
     factor_executor_impl: str = "per_type_grouped_v2"
+    factor_adapter_rank: int = LOCKED_FACTOR_ADAPTER_RANK
     pressure_oracle_input: str = "none"
     factor_loss_enabled: bool | None = None
     primary_constraint_mode: str = "executable_factor"
@@ -236,6 +238,7 @@ def _proposal_config_payload(
         "constraint_representation": exp.constraint_representation,
         "primary_constraint_mode": exp.primary_constraint_mode,
         "factor_executor_impl": exp.factor_executor_impl,
+        "factor_adapter_rank": exp.factor_adapter_rank,
         "gold_edit_embedding_mode": (
             "compact"
             if exp.constraint_representation == "factorized"
@@ -390,6 +393,15 @@ def main() -> None:
         help="Emit the three A1 primary-query ablation configs for full_strat1m_minocc100/node_id.",
     )
     parser.add_argument(
+        "--include-executor-comparison",
+        action="store_true",
+        help=(
+            "Emit the neutral compact-per-type and rank-16 shared-adapter A1 "
+            "comparison configs for full_strat1m_minocc100/node_id. Existing "
+            "configs are left untouched."
+        ),
+    )
+    parser.add_argument(
         "--overwrite-existing",
         action="store_true",
         help="Overwrite existing optional and canonical config.json files selected by this invocation.",
@@ -534,6 +546,28 @@ def main() -> None:
         ),
     ]
     primary_query_names = {exp.name for exp in primary_query_proposals}
+    executor_comparison_proposals: list[ProposalExperiment] = [
+        ProposalExperiment(
+            name="a1_factorized_imitation_per_type_compact",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            factor_executor_impl="per_type_grouped_v2",
+            factor_adapter_rank=LOCKED_FACTOR_ADAPTER_RANK,
+            validate_factor_labels=True,
+        ),
+        ProposalExperiment(
+            name="a1_factorized_imitation_shared_adapter",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            factor_executor_impl="shared_adapter_v1",
+            factor_adapter_rank=LOCKED_FACTOR_ADAPTER_RANK,
+            validate_factor_labels=True,
+        ),
+    ]
 
     experimental_proposals: list[ProposalExperiment] = [
         ProposalExperiment(
@@ -572,7 +606,10 @@ def main() -> None:
             encoding,
             constraint_representation="eswc_passive",
         )
-        num_factor_types = _infer_num_factor_types_from_registry(variant)
+        num_factor_types = _infer_num_factor_types_from_registry(
+            variant,
+            interim_root=args.interim_root,
+        )
         if num_factor_types <= 0:
             sample = _load_first_data_obj(factorized_path) or _load_first_data_obj(passive_path)
             num_factor_types = _infer_num_factor_types(sample)
@@ -601,6 +638,12 @@ def main() -> None:
             and encoding == "node_id"
         ):
             proposal_experiments.extend(primary_query_proposals)
+        if (
+            args.include_executor_comparison
+            and variant == "full_strat1m_minocc100"
+            and encoding == "node_id"
+        ):
+            proposal_experiments.extend(executor_comparison_proposals)
         if args.include_experimental:
             proposal_experiments.extend(experimental_proposals)
             reranker_experiments.extend(experimental_rerankers)
@@ -618,7 +661,9 @@ def main() -> None:
             )
             if exp.name == "x2_factor_loss_only_appendix":
                 payload["training_config"]["factor_loss"]["enabled"] = True
-            overwrite = args.overwrite_existing or not args.include_h2_ablations
+            overwrite = args.overwrite_existing or not (
+                args.include_h2_ablations or args.include_executor_comparison
+            )
             if (
                 not args.overwrite_existing
                 and args.include_primary_query_ablations
@@ -640,7 +685,9 @@ def main() -> None:
                 num_factor_types=num_factor_types,
                 proposal_config_tag=proposal_config_tag,
             )
-            overwrite = args.overwrite_existing or not args.include_h2_ablations
+            overwrite = args.overwrite_existing or not (
+                args.include_h2_ablations or args.include_executor_comparison
+            )
             if not args.overwrite_existing and args.include_primary_query_ablations:
                 overwrite = False
             if _write_json(cfg_path, payload, overwrite=overwrite):

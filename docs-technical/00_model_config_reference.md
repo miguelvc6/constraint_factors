@@ -34,6 +34,7 @@ Core fields:
 - `active_factor_type_ids`
 - `factor_type_embedding_dim`
 - `factor_executor_impl`
+- `factor_adapter_rank`
 - `gold_edit_embedding_mode`
 - `pressure_enabled`
 - `pressure_type_conditioning`
@@ -75,7 +76,13 @@ Paper-facing additions:
 - `factor_executor_impl`
   - `per_type_v1`: legacy dense `ModuleList` layout retained for old checkpoints
   - `per_type_grouped_v2`: architecture-equivalent compact per-type executor using grouped BF16 CUDA dispatch with a segmented fallback
+  - `shared_adapter_v1`: shared two-layer executor/post-edit trunks plus compact type-specific low-rank residual adapters and scalar heads
   - `legacy_shared`: historical shared executor ablation
+
+- `factor_adapter_rank`
+  - positive adapter bottleneck width for `shared_adapter_v1`
+  - locked comparison value: `16`
+  - ignored by executor implementations that do not allocate adapters
 
 - `gold_edit_embedding_mode`
   - `full`: legacy raw-id-sized embedding table

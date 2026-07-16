@@ -398,7 +398,10 @@ def validate_run(run_directory: Path, report: ValidationReport) -> None:
         return
     config = _read_json(config_path)
     model_config = ModelConfig.from_mapping(config.get("model_config", {}))
-    if model_config.factor_executor_impl == "per_type_grouped_v2":
+    if model_config.factor_executor_impl in {
+        "per_type_grouped_v2",
+        "shared_adapter_v1",
+    }:
         active_ids = tuple(model_config.active_factor_type_ids or ())
         report.require(
             bool(active_ids)
@@ -408,7 +411,12 @@ def validate_run(run_directory: Path, report: ValidationReport) -> None:
         )
         report.require(
             model_config.gold_edit_embedding_mode == "compact",
-            f"{run_directory.name}: grouped-v2 uses compact gold-edit embeddings",
+            f"{run_directory.name}: compact executor uses compact gold-edit embeddings",
+        )
+    if model_config.factor_executor_impl == "shared_adapter_v1":
+        report.require(
+            model_config.factor_adapter_rank == 16,
+            f"{run_directory.name}: shared-adapter comparison uses locked rank 16",
         )
     if run_directory.name.startswith("a1_factorized_imitation"):
         report.require(
@@ -453,6 +461,19 @@ def validate_run(run_directory: Path, report: ValidationReport) -> None:
             report.require(
                 0 < int(by_component.get("_factor_post_heads", 0)) <= 3_300_000,
                 f"{run_directory.name}: compact post heads allocate only active types",
+            )
+            report.require(
+                0 < int(by_component.get("_gold_edit_embeddings", 0)) <= 1_700_000,
+                f"{run_directory.name}: compact gold-edit table uses reachable targets",
+            )
+        if model_config.factor_executor_impl == "shared_adapter_v1":
+            report.require(
+                0 < int(by_component.get("_factor_executors", 0)) <= 1_100_000,
+                f"{run_directory.name}: shared executor uses compact rank-16 adapters",
+            )
+            report.require(
+                0 < int(by_component.get("_factor_post_heads", 0)) <= 500_000,
+                f"{run_directory.name}: shared post head uses compact rank-16 adapters",
             )
             report.require(
                 0 < int(by_component.get("_gold_edit_embeddings", 0)) <= 1_700_000,

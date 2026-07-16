@@ -161,6 +161,8 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
                 "make_experiment_configs.py",
                 "--processed-root",
                 str(root / "data" / "processed"),
+                "--interim-root",
+                str(root / "data" / "interim"),
                 "--models-root",
                 str(models),
             ]
@@ -173,6 +175,8 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
                 "make_experiment_configs.py",
                 "--processed-root",
                 str(root / "data" / "processed"),
+                "--interim-root",
+                str(root / "data" / "interim"),
                 "--models-root",
                 str(models),
                 "--include-h2-ablations",
@@ -207,6 +211,8 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
                 "make_experiment_configs.py",
                 "--processed-root",
                 str(root / "data" / "processed"),
+                "--interim-root",
+                str(root / "data" / "interim"),
                 "--models-root",
                 str(models),
                 "--include-h2-ablations",
@@ -218,3 +224,80 @@ def test_h2_ablation_config_generation_is_opt_in() -> None:
         refreshed_cfg = json.loads(stale_path.read_text(encoding="utf-8"))
         assert refreshed_cfg["training_config"]["num_epochs"] == 15
         assert refreshed_cfg["training_config"]["validation_subset_size"] is None
+
+
+def test_executor_comparison_configs_are_neutral_and_opt_in() -> None:
+    module = _load_module(
+        ROOT / "scripts" / "make_experiment_configs.py",
+        "make_configs_executor_comparison_test",
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        variant = "full_strat1m_minocc100"
+        processed = root / "data" / "processed" / variant
+        processed.mkdir(parents=True)
+        torch.save([_factor_graph()], processed / "train_graph-node_id-shard000.pt")
+        models = root / "models"
+
+        argv_backup = list(sys.argv)
+        try:
+            sys.argv = [
+                "make_experiment_configs.py",
+                "--processed-root",
+                str(root / "data" / "processed"),
+                "--interim-root",
+                str(root / "data" / "interim"),
+                "--models-root",
+                str(models),
+            ]
+            module.main()
+            canonical_path = (
+                models
+                / f"a1_factorized_imitation__{variant}__node_id"
+                / "config.json"
+            )
+            canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
+            canonical["training_config"]["num_epochs"] = 99
+            canonical_path.write_text(json.dumps(canonical), encoding="utf-8")
+
+            sys.argv = [
+                "make_experiment_configs.py",
+                "--processed-root",
+                str(root / "data" / "processed"),
+                "--interim-root",
+                str(root / "data" / "interim"),
+                "--models-root",
+                str(models),
+                "--include-executor-comparison",
+            ]
+            module.main()
+        finally:
+            sys.argv = argv_backup
+
+        assert json.loads(canonical_path.read_text(encoding="utf-8"))["training_config"][
+            "num_epochs"
+        ] == 99
+        per_type_path = (
+            models
+            / f"a1_factorized_imitation_per_type_compact__{variant}__node_id"
+            / "config.json"
+        )
+        shared_path = (
+            models
+            / f"a1_factorized_imitation_shared_adapter__{variant}__node_id"
+            / "config.json"
+        )
+        per_type = json.loads(per_type_path.read_text(encoding="utf-8"))
+        shared = json.loads(shared_path.read_text(encoding="utf-8"))
+        assert per_type["model_config"]["factor_executor_impl"] == "per_type_grouped_v2"
+        assert shared["model_config"]["factor_executor_impl"] == "shared_adapter_v1"
+        assert shared["model_config"]["factor_adapter_rank"] == 16
+        assert per_type["model_config"]["active_factor_type_ids"] == [0, 1]
+        assert shared["model_config"]["active_factor_type_ids"] == [0, 1]
+
+        per_type_model = dict(per_type["model_config"])
+        shared_model = dict(shared["model_config"])
+        per_type_model.pop("factor_executor_impl")
+        shared_model.pop("factor_executor_impl")
+        assert per_type_model == shared_model
+        assert per_type["training_config"] == shared["training_config"]

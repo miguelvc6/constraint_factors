@@ -3159,10 +3159,14 @@ def main():
                 if num_factor_types > 0:
                     model_cfg = model_cfg.updated(num_factor_types=num_factor_types)
                     logger.info("Inferred num_factor_types=%s from dataset scan.", num_factor_types)
-        if model_cfg.factor_executor_impl == "per_type_grouped_v2":
+        if model_cfg.factor_executor_impl in {
+            "per_type_grouped_v2",
+            "shared_adapter_v1",
+        }:
             if model_cfg.active_factor_type_ids is None:
                 raise ValueError(
-                    "per_type_grouped_v2 requires explicit model_config.active_factor_type_ids"
+                    f"{model_cfg.factor_executor_impl} requires explicit "
+                    "model_config.active_factor_type_ids"
                 )
             observed_factor_type_ids = dataset_factor_type_ids(
                 Path("data/interim") / dataset_variant,
@@ -3596,6 +3600,11 @@ def main():
                 else None,
             },
             "factor_dispatch_backend": getattr(model, "factor_dispatch_backend", "unknown"),
+            "factor_adapter_rank": (
+                int(model_cfg.factor_adapter_rank)
+                if model_cfg.factor_executor_impl == "shared_adapter_v1"
+                else None
+            ),
             "peak_cuda_allocated_bytes": history.get("peak_cuda_allocated_bytes"),
             "peak_cuda_reserved_bytes": history.get("peak_cuda_reserved_bytes"),
         },
