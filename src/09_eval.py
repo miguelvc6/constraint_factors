@@ -656,7 +656,12 @@ def eval(
         kinds.extend((getattr(graph, "constraint_type", None) or "UNKNOWN") for graph in batch_graphs)
         if precomputed_predictions is None:
             data = data.to(device)
-            out = model(data)  # raw logits or direct identity indices
+            inference_forward = getattr(model, "forward_for_evaluation", None)
+            out = (
+                inference_forward(data)
+                if callable(inference_forward)
+                else model(data)
+            )  # raw logits or direct identity indices
             direct_identity_indices = None
             if isinstance(out, dict):
                 if not output_logged:

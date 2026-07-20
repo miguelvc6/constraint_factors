@@ -1122,7 +1122,13 @@ class BaseGraphModel(nn.Module, ABC):
         edit_emb = self._gold_edit_embeddings(embedding_ids).mean(dim=1)
         return edit_emb.index_select(0, factor_graph_index)
 
-    def _compute_factor_outputs(self, node_emb: torch.Tensor, data) -> dict[str, torch.Tensor | None]:
+    def _compute_factor_outputs(
+        self,
+        node_emb: torch.Tensor,
+        data,
+        *,
+        compute_post_gold: bool = True,
+    ) -> dict[str, torch.Tensor | None]:
         factor_mask_pre = None
         factor_checkable = getattr(data, "factor_checkable_pre", None)
         if factor_checkable is not None:
@@ -1197,7 +1203,7 @@ class BaseGraphModel(nn.Module, ABC):
 
         factor_states, factor_logits_pre = self._run_per_type_factor_executors(runtime)
         targets = getattr(data, "y", None)
-        if targets is not None:
+        if compute_post_gold and targets is not None:
             gold_edit_repr = self._gold_edit_representation(
                 torch.as_tensor(targets, device=node_emb.device),
                 runtime.factor_graph_index,
@@ -1350,7 +1356,7 @@ class BaseGraphModel(nn.Module, ABC):
         """Return a torch_geometric convolution layer."""
         raise NotImplementedError
 
-    def forward(self, data):
+    def forward(self, data, *, compute_factor_post_gold: bool = True):
         # Extract data
         x, batch = data.x, data.batch
         if self.use_edge_attributes:
@@ -1459,7 +1465,11 @@ class BaseGraphModel(nn.Module, ABC):
             6,
             self.num_target_ids,
         ), f"Expected {(graph_emb.shape[0], 6, self.num_target_ids)}, got {prediction.shape}"
-        factor_outputs = self._compute_factor_outputs(node_emb, data)
+        factor_outputs = self._compute_factor_outputs(
+            node_emb,
+            data,
+            compute_post_gold=compute_factor_post_gold,
+        )
 
         return {
             "edit_logits": prediction,
@@ -1471,6 +1481,10 @@ class BaseGraphModel(nn.Module, ABC):
             "factor_graph_index": factor_outputs["factor_graph_index"],
             "policy_logits": policy_logits,
         }
+
+    def forward_for_evaluation(self, data):
+        """Run edit inference without evaluating the gold-conditioned auxiliary head."""
+        return self(data, compute_factor_post_gold=False)
 
     @staticmethod
     def _prepare_class_ids(
@@ -1902,7 +1916,7 @@ class RepairGINFactorPressure(BaseGraphModel):
 
         return violation.unsqueeze(-1)
 
-    def forward(self, data):
+    def forward(self, data, *, compute_factor_post_gold: bool = True):
         x, batch = data.x, data.batch
         if self.use_edge_attributes:
             edge_index = data.edge_index_non_flattened
@@ -1997,7 +2011,11 @@ class RepairGINFactorPressure(BaseGraphModel):
             self.num_target_ids,
         ), f"Expected {(graph_emb.shape[0], 6, self.num_target_ids)}, got {prediction.shape}"
 
-        factor_outputs = self._compute_factor_outputs(node_emb, data)
+        factor_outputs = self._compute_factor_outputs(
+            node_emb,
+            data,
+            compute_post_gold=compute_factor_post_gold,
+        )
 
         return {
             "edit_logits": prediction,

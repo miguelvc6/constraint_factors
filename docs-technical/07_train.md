@@ -95,7 +95,12 @@ With `gold_edit_embedding_mode="compact"`, gold-edit embeddings are indexed
 through the reachable entity/predicate target union rather than `max_id + 1`.
 The mapping and class ids are checkpoint buffers and run-provenance fields.
 Unknown stable factor ids and unreachable gold targets fail instead of being
-silently clamped.
+silently clamped when the gold-conditioned post-edit auxiliary head is
+requested. Standard `src/09_eval.py` edit inference skips that unused
+gold-conditioned head, so test-only target identities cannot be read as model
+inputs or invalidate fidelity evaluation merely because they are outside the
+training vocabulary. Training/validation and explicit H2 post-gold diagnostics
+continue to request the auxiliary head.
 
 ## Shared-Adapter Executor Comparison
 

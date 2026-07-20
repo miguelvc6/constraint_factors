@@ -356,6 +356,20 @@ def test_compact_gold_embedding_matches_full_table_for_reachable_ids() -> None:
         )
 
 
+def test_compact_model_evaluation_does_not_access_oov_gold_edits() -> None:
+    model = _compact_model()
+    graph = _factor_graph(2)
+    graph.y = torch.tensor([[1, 0, 0, 0, 0, 0]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="compact target vocabulary"):
+        model(graph)
+
+    outputs = model.forward_for_evaluation(graph)
+    assert outputs["edit_logits"].shape == (1, 6, model.num_target_ids)
+    assert outputs["factor_logits_pre"] is not None
+    assert outputs["factor_logits_post_gold"] is None
+
+
 def test_legacy_v1_state_dict_remains_strictly_loadable() -> None:
     kwargs = {
         "num_input_graph_nodes": 16,
