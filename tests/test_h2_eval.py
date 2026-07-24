@@ -287,8 +287,14 @@ def test_executor_comparison_configs_are_neutral_and_opt_in() -> None:
             / f"a1_factorized_imitation_shared_adapter__{variant}__node_id"
             / "config.json"
         )
+        no_factor_loss_path = (
+            models
+            / f"a1_factorized_imitation_per_type_compact_no_factor_loss__{variant}__node_id"
+            / "config.json"
+        )
         per_type = json.loads(per_type_path.read_text(encoding="utf-8"))
         shared = json.loads(shared_path.read_text(encoding="utf-8"))
+        no_factor_loss = json.loads(no_factor_loss_path.read_text(encoding="utf-8"))
         assert per_type["model_config"]["factor_executor_impl"] == "per_type_grouped_v2"
         assert shared["model_config"]["factor_executor_impl"] == "shared_adapter_v1"
         assert shared["model_config"]["factor_adapter_rank"] == 16
@@ -301,3 +307,12 @@ def test_executor_comparison_configs_are_neutral_and_opt_in() -> None:
         shared_model.pop("factor_executor_impl")
         assert per_type_model == shared_model
         assert per_type["training_config"] == shared["training_config"]
+
+        assert no_factor_loss["model_config"] == per_type["model_config"]
+        assert no_factor_loss["training_config"]["factor_loss"]["enabled"] is False
+        normalized_no_factor_training = dict(no_factor_loss["training_config"])
+        normalized_no_factor_training["factor_loss"] = dict(
+            normalized_no_factor_training["factor_loss"]
+        )
+        normalized_no_factor_training["factor_loss"]["enabled"] = True
+        assert normalized_no_factor_training == per_type["training_config"]

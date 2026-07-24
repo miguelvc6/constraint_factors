@@ -558,6 +558,17 @@ def main() -> None:
             validate_factor_labels=True,
         ),
         ProposalExperiment(
+            name="a1_factorized_imitation_per_type_compact_no_factor_loss",
+            model_name="GIN_PRESSURE",
+            constraint_representation="factorized",
+            pressure_enabled=True,
+            pressure_type_conditioning="concat",
+            factor_executor_impl="per_type_grouped_v2",
+            factor_adapter_rank=LOCKED_FACTOR_ADAPTER_RANK,
+            factor_loss_enabled=False,
+            validate_factor_labels=True,
+        ),
+        ProposalExperiment(
             name="a1_factorized_imitation_shared_adapter",
             model_name="GIN_PRESSURE",
             constraint_representation="factorized",

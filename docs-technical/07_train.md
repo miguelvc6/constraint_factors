@@ -139,6 +139,20 @@ standard evaluations, run `src/09_eval.py --h2-eval` for each directory and
 use `scripts/compare_a1_executors.py` to verify matched configuration/data
 provenance and write JSON, Markdown, per-constraint, and H2 delta artifacts.
 
+The confirmatory no-factor-loss run uses a separate compact-per-type slug so
+the earlier legacy H2 run remains immutable:
+
+```bash
+uv run src/10_scheduler.py \
+  --only-exact a1_factorized_imitation_per_type_compact_no_factor_loss__full_strat1m_minocc100__node_id \
+  --paper-suite --seed 42 --force-retrain
+```
+
+Generate it with `scripts/make_experiment_configs.py
+--include-executor-comparison`. Its model configuration is identical to
+`a1_factorized_imitation_per_type_compact`; only
+`training_config.factor_loss.enabled=false` differs.
+
 ## Dynamic Weighting per constraint type
 
 `DynamicConstraintWeighter` keeps per‑constraint weights so the trainer can emphasize underperforming constraint types. Its behaviour can be specified from the configs json files: you can toggle it on/off, choose update_frequency (epoch uses validation metrics, batch reacts after every batch), decide which metrics drive “difficulty” (target_metrics defaults to loss but can include accuracies).
