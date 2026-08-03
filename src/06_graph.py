@@ -79,6 +79,12 @@ from modules.data_encoders import (
     dump_stream,
     iter_stream,
 )
+from modules.graph_manifest import (
+    atomic_write_json,
+    file_sha256,
+    graph_incomplete_marker_path,
+    graph_manifest_path,
+)
 
 
 LITERAL_ID = 0
@@ -1376,7 +1382,7 @@ def _profile_dropped_fields(persistence_profile: str) -> list[str]:
 
 
 def _manifest_path_for_split(output_path: Path) -> Path:
-    return output_path.with_suffix(output_path.suffix + ".manifest.json")
+    return graph_manifest_path(output_path)
 
 
 def _load_existing_vocab_targets(vocab_path: Path, split: str) -> dict[str, list[int]] | None:
@@ -1435,9 +1441,9 @@ def _load_resume_state(
     split_predicate_targets: set[int],
     total_entity_targets: set[int],
     total_predicate_targets: set[int],
-) -> tuple[int, int]:
+) -> tuple[int, int, list[ArtifactWriteResult]]:
     if not shard_paths:
-        return 0, 0
+        return 0, 0, []
     indexed_paths: list[tuple[int, Path]] = []
     for shard_path in shard_paths:
         index = _extract_shard_index(shard_path)
@@ -1455,6 +1461,7 @@ def _load_resume_state(
 
     existing_graphs = 0
     next_shard = indices[-1] + 1
+    artifact_writes: list[ArtifactWriteResult] = []
     for pos, (index, shard_path) in enumerate(indexed_paths):
         try:
             shard_objects = _load_shard_payload(shard_path)
@@ -1470,6 +1477,14 @@ def _load_resume_state(
             next_shard = index
             break
         existing_graphs += len(shard_objects)
+        artifact_writes.append(
+            ArtifactWriteResult(
+                path=shard_path,
+                bytes_written=shard_path.stat().st_size,
+                checksum=file_sha256(shard_path),
+                object_count=len(shard_objects),
+            )
+        )
         for graph in shard_objects:
             y = getattr(graph, "y", None)
             if y is None:
@@ -1488,7 +1503,7 @@ def _load_resume_state(
                 split_predicate_targets.add(int(idx))
                 total_predicate_targets.add(int(idx))
         del shard_objects
-    return existing_graphs, next_shard
+    return existing_graphs, next_shard, artifact_writes
 
 
 def _log_free_space_estimate(
@@ -1539,6 +1554,10 @@ def _write_split_manifest(
     constraint_scope: str,
     constraint_representation: str,
     primary_constraint_mode: str,
+    dataset_manifest_path: Path,
+    parquet_path: Path,
+    source_row_count: int,
+    build_limit: int | None,
 ) -> None:
     manifest = {
         "graph_schema_version": GRAPH_SCHEMA_VERSION,
@@ -1548,6 +1567,17 @@ def _write_split_manifest(
         "constraint_scope": constraint_scope,
         "constraint_representation": constraint_representation,
         "primary_constraint_mode": primary_constraint_mode,
+        "build_limit": build_limit,
+        "dataset_manifest": {
+            "path": str(dataset_manifest_path.resolve()),
+            "sha256": file_sha256(dataset_manifest_path),
+        },
+        "source_parquet": {
+            "path": str(parquet_path.resolve()),
+            "sha256": file_sha256(parquet_path),
+            "row_count": int(source_row_count),
+        },
+        "derivation": None,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "graph_count": int(graph_count),
         "shard_count": int(shard_count),
@@ -1560,17 +1590,16 @@ def _write_split_manifest(
         "dropped_fields": _profile_dropped_fields(persistence_profile),
         "artifacts": [
             {
-                "path": str(artifact.path),
+                "path": str(artifact.path.resolve()),
                 "bytes": int(artifact.bytes_written),
-                "checksum": artifact.checksum,
-                "checksum_mode": "sha256_prefix_16mb",
+                "object_count": int(artifact.object_count),
+                "sha256": artifact.checksum,
             }
             for artifact in artifact_writes
         ],
     }
     manifest_path = _manifest_path_for_split(output_path)
-    with manifest_path.open("w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2)
+    atomic_write_json(manifest_path, manifest)
     logging.info("Wrote split manifest to %s", manifest_path)
 
 
@@ -1630,7 +1659,8 @@ def main(
         logging.info("Processing %s split", split)
 
         parquet_path = INTERIM_DATA_PATH / parquet_name
-        split_total_rows = _parquet_num_rows(parquet_path)
+        source_row_count = _parquet_num_rows(parquet_path)
+        split_total_rows = source_row_count
         if max_instances and max_instances > 0:
             limit = min(max_instances, split_total_rows)
             logging.info("Limiting %s split to first %s instances", split, limit)
@@ -1665,6 +1695,19 @@ def main(
         )
         existing_artifacts = discover_graph_artifacts(output_path)
         if overwrite_mode == OVERWRITE_MODE_SKIP and existing_artifacts:
+            existing_manifest = _manifest_path_for_split(output_path)
+            existing_incomplete = graph_incomplete_marker_path(output_path)
+            if existing_incomplete.exists() or not existing_manifest.exists():
+                raise RuntimeError(
+                    "Refusing --overwrite skip for an incomplete/unmanifested graph split: "
+                    f"{output_path}"
+                )
+            with existing_manifest.open("r", encoding="utf-8") as handle:
+                existing_manifest_payload = json.load(handle)
+            if int(existing_manifest_payload.get("graph_schema_version", 0)) != GRAPH_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Refusing --overwrite skip for stale graph schema at {existing_manifest}"
+                )
             logging.info(
                 "Skipping %s split because artifacts already exist and overwrite mode is 'skip'.",
                 split,
@@ -1688,14 +1731,37 @@ def main(
             }
             continue
 
+        dataset_manifest_path = INTERIM_DATA_PATH / "dataset_manifest.json"
+        if not dataset_manifest_path.exists():
+            raise FileNotFoundError(
+                f"Dataset manifest required for graph lineage: {dataset_manifest_path}"
+            )
+        manifest_path = _manifest_path_for_split(output_path)
+        incomplete_marker = graph_incomplete_marker_path(output_path)
+        manifest_path.unlink(missing_ok=True)
+        atomic_write_json(
+            incomplete_marker,
+            {
+                "graph_schema_version": GRAPH_SCHEMA_VERSION,
+                "split": split,
+                "dataset_variant": dataset_variant,
+                "encoding": encoding,
+                "constraint_representation": constraint_representation,
+                "primary_constraint_mode": primary_constraint_mode,
+                "status": "incomplete",
+                "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
         resume_skip_rows = 0
         start_shard = 0
         existing_shard_count = 0
         existing_split_shards: list[Path] = []
+        resumed_artifact_writes: list[ArtifactWriteResult] = []
         if resume_partial_shards and shard_size > 0:
             existing_split_shards = _discover_split_shards(output_path, use_torch_save=use_torch_save)
             if existing_split_shards:
-                resume_skip_rows, start_shard = _load_resume_state(
+                resume_skip_rows, start_shard, resumed_artifact_writes = _load_resume_state(
                     existing_split_shards,
                     split_entity_targets=split_entity_targets,
                     split_predicate_targets=split_predicate_targets,
@@ -1766,6 +1832,7 @@ def main(
             )
             shard_count += existing_shard_count
             total_objects += resume_skip_rows
+            artifact_writes = [*resumed_artifact_writes, *artifact_writes]
         else:
             total_objects, stream_artifact = dump_stream(
                 generator,
@@ -1773,7 +1840,9 @@ def main(
                 atomic_write=atomic_write,
             )
             artifact_writes = [stream_artifact]
-            shard_count = 1 if total_objects else 0
+            # ``dump_stream`` publishes one payload even for an empty split, so
+            # its manifest must still describe one artifact.
+            shard_count = 1
 
         logging.info(
             "Finished writing %s split (%s graphs across %s shard%s)",
@@ -1782,23 +1851,6 @@ def main(
             shard_count,
             "s" if shard_count != 1 else "",
         )
-        _write_split_manifest(
-            split=split,
-            output_path=output_path,
-            artifact_writes=artifact_writes,
-            graph_count=total_objects,
-            shard_count=shard_count,
-            shard_size=shard_size,
-            use_torch_save=use_torch_save,
-            persistence_profile=persistence_profile,
-            overwrite_mode=overwrite_mode,
-            encoding=encoding,
-            dataset_variant=dataset_variant,
-            constraint_scope=constraint_scope,
-            constraint_representation=constraint_representation,
-            primary_constraint_mode=primary_constraint_mode,
-        )
-
         del generator
 
         # Sanity check
@@ -1814,6 +1866,28 @@ def main(
         else:
             logging.warning("No data available for sanity checking %s split", split)
         del sample_graphs
+
+        _write_split_manifest(
+            split=split,
+            output_path=output_path,
+            artifact_writes=artifact_writes,
+            graph_count=total_objects,
+            shard_count=shard_count,
+            shard_size=shard_size,
+            use_torch_save=use_torch_save,
+            persistence_profile=persistence_profile,
+            overwrite_mode=overwrite_mode,
+            encoding=encoding,
+            dataset_variant=dataset_variant,
+            constraint_scope=constraint_scope,
+            constraint_representation=constraint_representation,
+            primary_constraint_mode=primary_constraint_mode,
+            dataset_manifest_path=dataset_manifest_path,
+            parquet_path=parquet_path,
+            source_row_count=source_row_count,
+            build_limit=int(max_instances) if max_instances > 0 else None,
+        )
+        incomplete_marker.unlink(missing_ok=True)
 
         outputs[split] = output_path
         gc.collect()

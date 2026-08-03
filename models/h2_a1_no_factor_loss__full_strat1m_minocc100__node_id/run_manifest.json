@@ -1,0 +1,109 @@
+{
+  "checkpoint": {
+    "path": "models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id/checkpoint.pth",
+    "sha256": "8aad841c9a3076ac06081f4ed9ae1ccfd872d5568141567b8219a6673047e921",
+    "size_bytes": 388223941
+  },
+  "command": [
+    "/home/mvazquez/constraint_factors/.venv/bin/python3",
+    "src/07_train.py",
+    "--experiment-config",
+    "models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id/config.json",
+    "--seed",
+    "42"
+  ],
+  "config": {
+    "model_config_sha256": "dd4d47c1763ed705fe248e3d24263e5209c6d17e984ae4adcf551a8c0b5c3131",
+    "path": "models/h2_a1_no_factor_loss__full_strat1m_minocc100__node_id/config.json",
+    "sha256": "a9c92111036d93d55a7be45b06aa9af39fa39650155b4f5956272043d821b142",
+    "training_config_sha256": "c44e363bac4bc16c7a6ba53d50a5331915b7db96e03ad17e2ac11c9f72db764d"
+  },
+  "created_at_utc": "2026-07-23T22:26:58.841834+00:00",
+  "dataset_manifest": {
+    "path": "data/interim/full_strat1m_minocc100/dataset_manifest.json",
+    "sha256": "9d828c5a909ee9c8e2eaeb38f65d2b87aac1005c58bf0611e13e10348c25d241"
+  },
+  "environment": {
+    "cuda_available": true,
+    "cuda_version": "12.8",
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": true,
+    "deterministic_algorithms": true,
+    "deterministic_warn_only": true,
+    "packages": {
+      "numpy": "2.4.1",
+      "pandas": "3.0.0",
+      "pyarrow": "23.0.0",
+      "torch": "2.10.0",
+      "torch-geometric": "2.7.0"
+    },
+    "platform": "Linux-6.8.12-23-pve-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "extra": {
+    "constraint_representation": "factorized",
+    "dataset_variant": "full_strat1m_minocc100",
+    "encoding": "node_id",
+    "factor_adapter_rank": null,
+    "factor_dispatch_backend": "module_loop",
+    "factor_type_mapping": {
+      "active_factor_type_ids": [],
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "stable_address_space": 29
+    },
+    "gold_edit_embedding": {
+      "class_ids_sha256": null,
+      "mode": "full",
+      "rows": 102380
+    },
+    "peak_cuda_allocated_bytes": 10371118080,
+    "peak_cuda_reserved_bytes": 19486736384
+  },
+  "graph_manifests": [
+    {
+      "path": "data/processed/full_strat1m_minocc100/train_graph-node_id.pkl.manifest.json",
+      "sha256": "12457afaae5ba45104b0aa6849f77cb73ea6ab945f619d08fed333dd164759c4"
+    },
+    {
+      "path": "data/processed/full_strat1m_minocc100/val_graph-node_id.pkl.manifest.json",
+      "sha256": "9402d62ceaf895eff27218b07892dee46b381b49e6ea7267916b510933d062d7"
+    }
+  ],
+  "parameters": {
+    "by_component": {
+      "_factor_executors": 23269629,
+      "_factor_post_heads": 9303229,
+      "_gold_edit_embeddings": 40952000,
+      "_pressure_mlp": 487600,
+      "_pressure_role_embeddings": 24,
+      "_pressure_role_modules": 1442400,
+      "_pressure_violation_head": 401,
+      "edge_mlp": 320800,
+      "initialization": 218400,
+      "mp_layers": 964800,
+      "node_embeddings": 13104768,
+      "object_add_head": 1475279,
+      "object_branch": 160400,
+      "object_del_head": 1475279,
+      "predicate_add_head": 198896,
+      "predicate_branch": 160400,
+      "predicate_del_head": 198896,
+      "role_embeddings": 128,
+      "shared_projection": 160400,
+      "subject_add_head": 1475279,
+      "subject_branch": 160400,
+      "subject_del_head": 1475279
+    },
+    "total": 97004687,
+    "trainable": 97004687
+  },
+  "schema_version": 1,
+  "seed": 42,
+  "source": {
+    "commit": "a3e8fe1b0ff510b740f1ea24e35f9352c1500136",
+    "dirty": true,
+    "source_diff_sha256": "e94b9e38304fe6e427424aa453a06f05a54e5fa3ff692aeb81730ab39d3ad972",
+    "source_tree_sha256": "98474c344df3ccdb475a8468477512d605d7a7892b1c95c7f275b92367805751",
+    "status_sha256": "3c9233838c73157498cdaed0a67f3890eb8c338642c894923d3c547efc0a0603"
+  }
+}

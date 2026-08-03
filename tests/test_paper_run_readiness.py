@@ -6,9 +6,11 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 from torch_geometric.data import Data
 
@@ -19,6 +21,7 @@ if str(SRC) not in sys.path:
 
 from modules.baselines import BaselineAdapter, DeleteFocusBaseline
 from modules.data_encoders import dataset_variant_name
+from modules.repair_eval import load_global_eval_rows
 
 
 def _load_module(module_path: Path, module_name: str):
@@ -294,6 +297,136 @@ def test_global_support_ignores_passive_graph_factor_ids_without_labels() -> Non
     overall = state["global_metrics"]["overall"]
     assert overall["srr_denom_total"] == 1
     assert overall["srr_total"] == 1
+
+
+def test_global_eval_rows_preserve_declared_correction_transition(
+    tmp_path: Path,
+) -> None:
+    row = {
+        "constraint_id": 17,
+        "constraint_type": "single",
+        "add_subject": 1,
+        "add_predicate": 2,
+        "add_object": 3,
+        "del_subject": 4,
+        "del_predicate": 5,
+        "del_object": 6,
+    }
+    pd.DataFrame([row]).to_parquet(tmp_path / "df_test.parquet", index=False)
+
+    loaded = load_global_eval_rows(tmp_path, "test")
+
+    assert len(loaded) == 1
+    assert (
+        loaded[0].add_subject,
+        loaded[0].add_predicate,
+        loaded[0].add_object,
+        loaded[0].del_subject,
+        loaded[0].del_predicate,
+        loaded[0].del_object,
+    ) == (1, 2, 3, 4, 5, 6)
+
+    pd.DataFrame([{key: value for key, value in row.items() if key != "add_object"}]).to_parquet(
+        tmp_path / "df_test.parquet",
+        index=False,
+    )
+    with pytest.raises(ValueError, match="correction-transition columns"):
+        load_global_eval_rows(tmp_path, "test")
+
+
+def test_strict_global_support_uses_parquet_pre_labels_for_passive_graphs() -> None:
+    graph = Data(x=torch.zeros((1,), dtype=torch.long))
+    graph.factor_constraint_ids = torch.tensor([123, 456], dtype=torch.long)
+    graph.primary_factor_index = 0
+    row = SimpleNamespace(
+        factor_constraint_ids=[123, 456],
+        factor_checkable_pre=[True, True],
+        factor_satisfied_pre=[0, 1],
+        primary_factor_index=0,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    class DummyEvaluator:
+        def evaluate_full(
+            self,
+            row,
+            *,
+            candidate_slots,
+            primary_factor_index=None,
+            factor_constraint_ids=None,
+        ):
+            del row, candidate_slots
+            calls.append(
+                {
+                    "primary_factor_index": primary_factor_index,
+                    "factor_constraint_ids": factor_constraint_ids,
+                }
+            )
+            return {
+                "local_constraint_ids": [123, 456],
+                "primary_factor_index": 0,
+                "pre_checkable": [True, True],
+                "pre_satisfied": [0, 1],
+                "post_checkable": [True, True],
+                "post_satisfied": [1, 1],
+            }
+
+    support = GlobalMetricsSupport(
+        rows=[row],
+        evaluator=DummyEvaluator(),
+        require_pre_state_labels=True,
+    )
+    postprocess, state = support.build_postprocess([graph])
+    predictions = torch.tensor([[0, 0, 0, 0, 0, 0]], dtype=torch.long)
+    postprocess(predictions, predictions, ["single"])
+
+    assert calls == [
+        {
+            "primary_factor_index": 0,
+            "factor_constraint_ids": [123, 456],
+        }
+    ]
+    global_metrics = state["global_metrics"]
+    assert global_metrics["overall"]["primary_fix_denom_total"] == 1
+    assert global_metrics["pre_state_validation"] == {
+        "checked_rows": 1,
+        "mismatch_count": 0,
+        "source_counts": {"parquet": 1},
+    }
+
+
+def test_global_support_rejects_pre_state_semantic_mismatch() -> None:
+    graph = Data(x=torch.zeros((1,), dtype=torch.long))
+    row = SimpleNamespace(
+        factor_constraint_ids=[123],
+        factor_checkable_pre=[True],
+        factor_satisfied_pre=[0],
+        primary_factor_index=0,
+    )
+
+    class DummyEvaluator:
+        def evaluate_full(self, *args, **kwargs):
+            del args, kwargs
+            return {
+                "local_constraint_ids": [123],
+                "primary_factor_index": 0,
+                "pre_checkable": [True],
+                "pre_satisfied": [1],
+                "post_checkable": [True],
+                "post_satisfied": [1],
+            }
+
+    support = GlobalMetricsSupport(
+        rows=[row],
+        evaluator=DummyEvaluator(),
+        require_pre_state_labels=True,
+    )
+    postprocess, _ = support.build_postprocess([graph])
+    predictions = torch.tensor([[0, 0, 0, 0, 0, 0]], dtype=torch.long)
+
+    with pytest.raises(AssertionError, match="PRE-state semantic mismatch"):
+        postprocess(predictions, predictions, ["single"])
 
 
 def test_make_experiment_configs_empty_processed_root_message() -> None:

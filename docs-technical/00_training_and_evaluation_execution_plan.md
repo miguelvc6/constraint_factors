@@ -278,9 +278,10 @@ If `AMB` is not used in the final main table, keep it as appendix support.
 Code note:
 
 - `src/09_eval.py --run-baselines` uses `data/interim/<variant>/` directly when its train and test parquet schemas already contain factor supervision. It falls back to the legacy `data/interim/<variant>_labeled/` sibling only when the base parquet is unlabeled. Repair contexts and global-metric rows are loaded from the same selected source, their counts are checked before inference, and schema-v2 identity targets use the identity encoder rather than the feature encoder.
+- Global-metric rows retain the declared add/delete transition columns so the evaluator can reconstruct PRE before applying a candidate repair. Strict evaluation compares every recomputed PRE factor vector with the authoritative parquet/graph labels; passive graphs fall back to parquet labels because they intentionally do not store factor supervision. Any mismatch aborts evaluation before replacing the result JSON.
 - Baseline adapters return direct identity indices instead of allocating dense logits over the identity vocabulary. Feature-space metrics use the parquet's `*_feature` targets and `identity_to_feature.npy` mapping; representability excludes active targets mapped to the feature encoder's `unknown` class, matching graph construction.
 - Learned-model evaluation builds the unique feature-to-identity lookup once and reuses it across inference batches. This keeps strict identity metrics lossless without rescanning the full identity vocabulary for every batch.
-- This is the paper-safe path for getting heuristic `GFR`, `SRR`, `SIR`, and disruption metrics from factor-labeled parquet files.
+- This is the paper-safe path for getting heuristic `GFR`, `SRR`, `SIR`, and disruption metrics from factor-labeled parquet files. The acceptance validator requires the primary-fix denominator, per-family denominator sum, and PRE-state parity audit to cover every retained evaluation row.
 
 ### Step 3. Run a brief `M1C` hyperparameter search
 

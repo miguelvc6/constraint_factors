@@ -1,6 +1,5 @@
 import logging
 import pickle
-from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable, Iterator, NamedTuple
 
@@ -10,9 +9,10 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 from torch_geometric.data import Data
 
+from modules.graph_manifest import GRAPH_SCHEMA_VERSION, file_sha256
+
 
 DATASET_SCHEMA_VERSION = 2
-GRAPH_SCHEMA_VERSION = 2
 FEATURE_COLUMN_SUFFIX = "_feature"
 IDENTITY_ENCODER_FILENAME = "identity_encoder.txt"
 FEATURE_ENCODER_FILENAME = "feature_encoder.txt"
@@ -46,6 +46,7 @@ class ArtifactWriteResult(NamedTuple):
     path: Path
     bytes_written: int
     checksum: str
+    object_count: int
 
 
 class GraphArtifactInfo(NamedTuple):
@@ -570,10 +571,15 @@ def _write_shard(
             pickle.dump(buf, f, protocol=5)
     if atomic_write:
         destination.replace(shard_path)
-    digest = _compute_prefix_sha256(shard_path)
+    digest = file_sha256(shard_path)
     size_bytes = shard_path.stat().st_size
     logging.debug("Wrote shard %s", shard_path)
-    return ArtifactWriteResult(path=shard_path, bytes_written=size_bytes, checksum=digest)
+    return ArtifactWriteResult(
+        path=shard_path,
+        bytes_written=size_bytes,
+        checksum=digest,
+        object_count=len(buf),
+    )
 
 
 def dump_stream(
@@ -593,10 +599,15 @@ def dump_stream(
             count += 1
     if atomic_write:
         destination.replace(path)
-    digest = _compute_prefix_sha256(path)
+    digest = file_sha256(path)
     size_bytes = path.stat().st_size
     logging.info("Wrote %s graph objects to %s", count, path)
-    return count, ArtifactWriteResult(path=path, bytes_written=size_bytes, checksum=digest)
+    return count, ArtifactWriteResult(
+        path=path,
+        bytes_written=size_bytes,
+        checksum=digest,
+        object_count=count,
+    )
 
 
 def _compute_prefix_sha256(
@@ -604,17 +615,10 @@ def _compute_prefix_sha256(
     chunk_size: int = 8 * 1024 * 1024,
     max_bytes: int = 16 * 1024 * 1024,
 ) -> str:
-    hasher = sha256()
-    consumed = 0
-    with path.open("rb") as handle:
-        while consumed < max_bytes:
-            remaining = max_bytes - consumed
-            block = handle.read(min(chunk_size, remaining))
-            if not block:
-                break
-            hasher.update(block)
-            consumed += len(block)
-    return hasher.hexdigest()
+    """Compatibility alias; graph artifacts now always receive a full hash."""
+
+    del chunk_size, max_bytes
+    return file_sha256(path)
 
 
 class GraphStreamDataset(IterableDataset):

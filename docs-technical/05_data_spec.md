@@ -142,6 +142,7 @@ re-run.
 - Passive files: `{split}_graph_repr-eswc_passive-<encoding>.pkl`
 - Sharded variants: the same base names with `-shardNNN.pt` or `.pkl`
 - Per-split manifest: `<graph_filename>.manifest.json`
+- Incomplete-build marker: `<graph_filename>.incomplete` (present only until a build or conversion publishes a valid manifest)
 - `target_vocabs.json` (class-id vocabularies for labels)
 - Optional visuals: `graph_visualization.png`, `graph_visualization-non_flattened.png`
 
@@ -189,6 +190,17 @@ re-run.
 - Factor label tensors (`factor_checkable_*`, `factor_satisfied_*`, `factor_types`) are 1-D and must align with
   `factor_constraint_ids` length. In non-default primary modes, these executable factors exclude the primary.
 - Eval label tensors (`eval_factor_checkable_*`, `eval_factor_satisfied_*`, `eval_factor_types`) are 1-D and must align with `eval_factor_constraint_ids`; strict global metrics prefer these fields and fall back to `factor_*` for old artifacts.
+
+**Graph manifest schema v3**
+
+Each split manifest records the dataset-manifest path/full SHA-256, split
+parquet path/full SHA-256/source row count, exact graph mode fields, explicit
+build limit, graph count, and one artifact record per payload. Artifact records
+contain `path`, `bytes`, `object_count`, and a full `sha256`. Converted modes
+also contain a `derivation` block with the source graph-manifest path/hash,
+source/target primary modes, method (`rewrite` or `hard_link`), and per-artifact
+lineage. The manifest is immutable provenance and remains after optional
+post-acceptance payload pruning.
 
 ## 7) Labeled Constraint Factors (`05_constraint_labeler.py`)
 **Location:** `data/interim/<variant>_labeled/`

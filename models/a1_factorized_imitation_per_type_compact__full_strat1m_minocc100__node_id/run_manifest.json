@@ -1,0 +1,120 @@
+{
+  "checkpoint": {
+    "path": "models/a1_factorized_imitation_per_type_compact__full_strat1m_minocc100__node_id/checkpoint.pth",
+    "sha256": "3294cbb26581810cd9db080ff3cbbfc0af85930a2f6ca85cad67fe4e862579e3",
+    "size_bytes": 146472117
+  },
+  "command": [
+    "/home/mvazquez/constraint_factors/.venv/bin/python3",
+    "src/07_train.py",
+    "--experiment-config",
+    "models/a1_factorized_imitation_per_type_compact__full_strat1m_minocc100__node_id/config.json",
+    "--seed",
+    "42"
+  ],
+  "config": {
+    "model_config_sha256": "f798f6668a5e15c44f935a30f74cc82dd234eb2f7ff8709a8d41b1ddda63d7c3",
+    "path": "models/a1_factorized_imitation_per_type_compact__full_strat1m_minocc100__node_id/config.json",
+    "sha256": "18aa4ca89467d80ae2fa4f3438212a6ff0bfc73e95682fc7be78131a63607857",
+    "training_config_sha256": "56c54e5c2360e60fe8a3d89819abbaa502b457882f642a2006091c1cb66dcdce"
+  },
+  "created_at_utc": "2026-07-18T10:35:52.165735+00:00",
+  "dataset_manifest": {
+    "path": "data/interim/full_strat1m_minocc100/dataset_manifest.json",
+    "sha256": "9d828c5a909ee9c8e2eaeb38f65d2b87aac1005c58bf0611e13e10348c25d241"
+  },
+  "environment": {
+    "cuda_available": true,
+    "cuda_version": "12.8",
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": true,
+    "deterministic_algorithms": true,
+    "deterministic_warn_only": true,
+    "packages": {
+      "numpy": "2.4.1",
+      "pandas": "3.0.0",
+      "pyarrow": "23.0.0",
+      "torch": "2.10.0",
+      "torch-geometric": "2.7.0"
+    },
+    "platform": "Linux-6.8.12-23-pve-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "extra": {
+    "constraint_representation": "factorized",
+    "dataset_variant": "full_strat1m_minocc100",
+    "encoding": "node_id",
+    "factor_adapter_rank": null,
+    "factor_dispatch_backend": "grouped_mm_bf16",
+    "factor_type_mapping": {
+      "active_factor_type_ids": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        9,
+        12,
+        14,
+        15,
+        16
+      ],
+      "sha256": "844a559434bb3057b354bb6eafea723e352519b88befdf96172d14d9385d3f4d",
+      "stable_address_space": 29
+    },
+    "gold_edit_embedding": {
+      "class_ids_sha256": "e5e2d5ec16d789c0d3af04e371166e0bdf41a323a483cbd868a5cee464a497b2",
+      "mode": "compact",
+      "rows": 4172
+    },
+    "peak_cuda_allocated_bytes": 10148561408,
+    "peak_cuda_reserved_bytes": 18259902464
+  },
+  "graph_manifests": [
+    {
+      "path": "data/processed/full_strat1m_minocc100/train_graph-node_id.pkl.manifest.json",
+      "sha256": "12457afaae5ba45104b0aa6849f77cb73ea6ab945f619d08fed333dd164759c4"
+    },
+    {
+      "path": "data/processed/full_strat1m_minocc100/val_graph-node_id.pkl.manifest.json",
+      "sha256": "9402d62ceaf895eff27218b07892dee46b381b49e6ea7267916b510933d062d7"
+    }
+  ],
+  "parameters": {
+    "by_component": {
+      "_factor_executors": 8024010,
+      "_factor_post_heads": 3208010,
+      "_gold_edit_embeddings": 1668800,
+      "_pressure_mlp": 487600,
+      "_pressure_role_embeddings": 24,
+      "_pressure_role_modules": 1442400,
+      "_pressure_violation_head": 401,
+      "edge_mlp": 320800,
+      "initialization": 218400,
+      "mp_layers": 964800,
+      "node_embeddings": 13104768,
+      "object_add_head": 1475279,
+      "object_branch": 160400,
+      "object_del_head": 1475279,
+      "predicate_add_head": 198896,
+      "predicate_branch": 160400,
+      "predicate_del_head": 198896,
+      "role_embeddings": 128,
+      "shared_projection": 160400,
+      "subject_add_head": 1475279,
+      "subject_branch": 160400,
+      "subject_del_head": 1475279
+    },
+    "total": 36380649,
+    "trainable": 36380649
+  },
+  "schema_version": 1,
+  "seed": 42,
+  "source": {
+    "commit": "7d51560e69770db70f5d09a15ef80b9251c39a37",
+    "dirty": true,
+    "source_diff_sha256": "5d0a15d63a23aa5cf77757186ce2dcd8aeaf6cb7448f8b4fdc03fe81e49753fc",
+    "source_tree_sha256": "be9ff1f9eaf94d5cd1a54204e31494b69a14d841c4be01cbdf20eafe5fb55121",
+    "status_sha256": "b72f0ddf057d525f4489f53b1d9dcde802cd0e4d92539b1214ce4acd20ce5601"
+  }
+}

@@ -13,6 +13,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from modules.provenance import file_sha256
+
 
 def _load_sampler():
     module_path = ROOT / "src" / "02b_stratified_benchmark_sampler.py"
@@ -139,6 +141,12 @@ def test_stratified_sampler_is_deterministic_and_preserves_reports(tmp_path: Pat
     metadata = json.loads((first / "sampling_metadata.json").read_text(encoding="utf-8"))
     assert metadata["row_order"]["method"] == "splitmix64_source_index_v1"
     assert metadata["row_order"]["seed"] == 42
+    assert metadata["row_order"]["external_sort_buckets"] > 0
+    manifest = json.loads((first / "dataset_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sampling"]["row_order"] == metadata["row_order"]
+    assert manifest["outputs"]["sampling_metadata.json"] == file_sha256(
+        first / "sampling_metadata.json"
+    )
 
 
 def test_stratified_sampler_mixes_family_block_order(tmp_path: Path) -> None:

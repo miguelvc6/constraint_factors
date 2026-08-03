@@ -60,7 +60,10 @@ benchmark does not need to fit in memory. The source family-block order is
 intentionally not preserved: streamed graph datasets cannot use DataLoader
 shuffling, and preserving those blocks caused each epoch to train on long runs
 of a single family. `sampling_metadata.json` and `dataset_manifest.json` record
-the row-order method, seed, and bucket count.
+the exact row-order method, seed, and positive bucket count. The dataset
+manifest also lists the full SHA-256 of `sampling_metadata.json`; sampled-data
+integrity validation requires both copies to agree. Unsampled schema-v2 variants
+remain valid without a `sampling.row_order` block.
 
 ## Pipeline Position
 For paper-facing schema-v2 data, run this stage after `05_constraint_labeler.py`

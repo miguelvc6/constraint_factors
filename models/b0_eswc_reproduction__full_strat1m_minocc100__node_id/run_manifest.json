@@ -1,0 +1,88 @@
+{
+  "checkpoint": {
+    "path": "models/b0_eswc_reproduction__full_strat1m_minocc100__node_id/checkpoint.pth",
+    "sha256": "8b8c12ef07fa08ec8a23885a68eca10513a97e4c8d0ba67b1f4f1618b1e8ecdc",
+    "size_bytes": 61263541
+  },
+  "command": [
+    "/home/mvazquez/constraint_factors/.venv/bin/python3",
+    "src/07_train.py",
+    "--experiment-config",
+    "models/b0_eswc_reproduction__full_strat1m_minocc100__node_id/config.json",
+    "--seed",
+    "42"
+  ],
+  "config": {
+    "model_config_sha256": "96f3963500f7091f098df812dc46d54974a39214694a5a7e6ecafd49c34591a9",
+    "path": "models/b0_eswc_reproduction__full_strat1m_minocc100__node_id/config.json",
+    "sha256": "f8e0b1a583afc46d88efadf6051292a85990c1ffe8d499ea5375f48a6125106b",
+    "training_config_sha256": "29e8b8f662a300586d59655bedd19025383a818bd9bb89b2aeb4f8112b2d7fb6"
+  },
+  "created_at_utc": "2026-07-15T21:18:51.143448+00:00",
+  "dataset_manifest": {
+    "path": "data/interim/full_strat1m_minocc100/dataset_manifest.json",
+    "sha256": "9d828c5a909ee9c8e2eaeb38f65d2b87aac1005c58bf0611e13e10348c25d241"
+  },
+  "environment": {
+    "cuda_available": true,
+    "cuda_version": "12.8",
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": true,
+    "deterministic_algorithms": true,
+    "deterministic_warn_only": true,
+    "packages": {
+      "numpy": "2.4.1",
+      "pandas": "3.0.0",
+      "pyarrow": "23.0.0",
+      "torch": "2.10.0",
+      "torch-geometric": "2.7.0"
+    },
+    "platform": "Linux-6.8.12-23-pve-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "extra": {
+    "constraint_representation": "eswc_passive",
+    "dataset_variant": "full_strat1m_minocc100",
+    "encoding": "node_id"
+  },
+  "graph_manifests": [
+    {
+      "path": "data/processed/full_strat1m_minocc100/train_graph_repr-eswc_passive-node_id.pkl.manifest.json",
+      "sha256": "47f8fc270455adcc9d240a3e1b0eaca5dee07b913adc3e6d3e744c5ddf410c27"
+    },
+    {
+      "path": "data/processed/full_strat1m_minocc100/val_graph_repr-eswc_passive-node_id.pkl.manifest.json",
+      "sha256": "0d18ed5775cbd5e7800ea294118cf369645340084d880be45df9cfae34fd6c12"
+    }
+  ],
+  "parameters": {
+    "by_component": {
+      "edge_mlp": 33024,
+      "initialization": 35072,
+      "mp_layers": 33280,
+      "node_embeddings": 13104768,
+      "object_add_head": 474591,
+      "object_branch": 16512,
+      "object_del_head": 474591,
+      "predicate_add_head": 63984,
+      "predicate_branch": 16512,
+      "predicate_del_head": 63984,
+      "role_embeddings": 128,
+      "shared_projection": 16512,
+      "subject_add_head": 474591,
+      "subject_branch": 16512,
+      "subject_del_head": 474591
+    },
+    "total": 15298652,
+    "trainable": 15298652
+  },
+  "schema_version": 1,
+  "seed": 42,
+  "source": {
+    "commit": "836fe357055eeb13d6c62e2e36f2e795f0a70ed2",
+    "dirty": true,
+    "source_diff_sha256": "16c3abf9d1632522e89a0ac9c3cfc61a9b89f26b4ccbbfc1d64926429d5b3f33",
+    "source_tree_sha256": "39dabc8bb2b1313b139618b574970d7f67918bbdc0cd7a072d8628f50eb45408",
+    "status_sha256": "916f2ac4651296895ffb0dafef9cf662b9fa137a91f7840476d4242d9301054b"
+  }
+}

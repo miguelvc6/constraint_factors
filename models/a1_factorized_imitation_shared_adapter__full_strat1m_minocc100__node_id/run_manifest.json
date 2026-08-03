@@ -1,0 +1,120 @@
+{
+  "checkpoint": {
+    "path": "models/a1_factorized_imitation_shared_adapter__full_strat1m_minocc100__node_id/checkpoint.pth",
+    "sha256": "6f58ce6450e69332d248725eeba17e098799e50df012a51a55d52d99c34e4196",
+    "size_bytes": 107125817
+  },
+  "command": [
+    "/home/mvazquez/constraint_factors/.venv/bin/python3",
+    "src/07_train.py",
+    "--experiment-config",
+    "models/a1_factorized_imitation_shared_adapter__full_strat1m_minocc100__node_id/config.json",
+    "--seed",
+    "42"
+  ],
+  "config": {
+    "model_config_sha256": "6551008d901027191e1f3dd5d38a112a8c5f8510059db78a540891aad22a8f89",
+    "path": "models/a1_factorized_imitation_shared_adapter__full_strat1m_minocc100__node_id/config.json",
+    "sha256": "10fdb81b62e21ec6df2c2472e0b94a27af4d5115b349c8849f619caa9a3857b2",
+    "training_config_sha256": "56c54e5c2360e60fe8a3d89819abbaa502b457882f642a2006091c1cb66dcdce"
+  },
+  "created_at_utc": "2026-07-22T02:06:55.814674+00:00",
+  "dataset_manifest": {
+    "path": "data/interim/full_strat1m_minocc100/dataset_manifest.json",
+    "sha256": "9d828c5a909ee9c8e2eaeb38f65d2b87aac1005c58bf0611e13e10348c25d241"
+  },
+  "environment": {
+    "cuda_available": true,
+    "cuda_version": "12.8",
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": true,
+    "deterministic_algorithms": true,
+    "deterministic_warn_only": true,
+    "packages": {
+      "numpy": "2.4.1",
+      "pandas": "3.0.0",
+      "pyarrow": "23.0.0",
+      "torch": "2.10.0",
+      "torch-geometric": "2.7.0"
+    },
+    "platform": "Linux-6.8.12-23-pve-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "extra": {
+    "constraint_representation": "factorized",
+    "dataset_variant": "full_strat1m_minocc100",
+    "encoding": "node_id",
+    "factor_adapter_rank": 16,
+    "factor_dispatch_backend": "grouped_mm_bf16",
+    "factor_type_mapping": {
+      "active_factor_type_ids": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        9,
+        12,
+        14,
+        15,
+        16
+      ],
+      "sha256": "844a559434bb3057b354bb6eafea723e352519b88befdf96172d14d9385d3f4d",
+      "stable_address_space": 29
+    },
+    "gold_edit_embedding": {
+      "class_ids_sha256": "e5e2d5ec16d789c0d3af04e371166e0bdf41a323a483cbd868a5cee464a497b2",
+      "mode": "compact",
+      "rows": 4172
+    },
+    "peak_cuda_allocated_bytes": 10014721024,
+    "peak_cuda_reserved_bytes": 18083741696
+  },
+  "graph_manifests": [
+    {
+      "path": "data/processed/full_strat1m_minocc100/train_graph-node_id.pkl.manifest.json",
+      "sha256": "12457afaae5ba45104b0aa6849f77cb73ea6ab945f619d08fed333dd164759c4"
+    },
+    {
+      "path": "data/processed/full_strat1m_minocc100/val_graph-node_id.pkl.manifest.json",
+      "sha256": "9402d62ceaf895eff27218b07892dee46b381b49e6ea7267916b510933d062d7"
+    }
+  ],
+  "parameters": {
+    "by_component": {
+      "_factor_executors": 938170,
+      "_factor_post_heads": 456570,
+      "_gold_edit_embeddings": 1668800,
+      "_pressure_mlp": 487600,
+      "_pressure_role_embeddings": 24,
+      "_pressure_role_modules": 1442400,
+      "_pressure_violation_head": 401,
+      "edge_mlp": 320800,
+      "initialization": 218400,
+      "mp_layers": 964800,
+      "node_embeddings": 13104768,
+      "object_add_head": 1475279,
+      "object_branch": 160400,
+      "object_del_head": 1475279,
+      "predicate_add_head": 198896,
+      "predicate_branch": 160400,
+      "predicate_del_head": 198896,
+      "role_embeddings": 128,
+      "shared_projection": 160400,
+      "subject_add_head": 1475279,
+      "subject_branch": 160400,
+      "subject_del_head": 1475279
+    },
+    "total": 26543369,
+    "trainable": 26543369
+  },
+  "schema_version": 1,
+  "seed": 42,
+  "source": {
+    "commit": "a3e8fe1b0ff510b740f1ea24e35f9352c1500136",
+    "dirty": true,
+    "source_diff_sha256": "e94b9e38304fe6e427424aa453a06f05a54e5fa3ff692aeb81730ab39d3ad972",
+    "source_tree_sha256": "98474c344df3ccdb475a8468477512d605d7a7892b1c95c7f275b92367805751",
+    "status_sha256": "0d318be45e40bc3d05edde6f799c80cca3d1f275b2451cd093eb6a672e6d992a"
+  }
+}

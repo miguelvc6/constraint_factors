@@ -183,6 +183,14 @@ def load_global_eval_rows(base_path: Path, split: str) -> list:
     if not path.exists():
         raise FileNotFoundError(f"Parquet split not found at {path}")
 
+    transition_columns = [
+        "add_subject",
+        "add_predicate",
+        "add_object",
+        "del_subject",
+        "del_predicate",
+        "del_object",
+    ]
     columns = [
         "constraint_id",
         "constraint_type",
@@ -200,6 +208,7 @@ def load_global_eval_rows(base_path: Path, split: str) -> list:
         "object_objects",
         "other_entity_predicates",
         "other_entity_objects",
+        *transition_columns,
         "local_constraint_ids",
         "local_constraint_ids_focus",
         "eval_factor_constraint_ids",
@@ -211,8 +220,22 @@ def load_global_eval_rows(base_path: Path, split: str) -> list:
         "primary_factor_index",
         "factor_constraint_ids",
         "factor_types",
+        "primary_checkable_pre",
+        "primary_satisfied_pre",
+        "primary_checkable_post_gold",
+        "primary_satisfied_post_gold",
+        "primary_gold_repair_status",
+        "primary_gold_repair_verified",
     ]
     dataframe = pd.read_parquet(path)
+    missing_transition_columns = [
+        column for column in transition_columns if column not in dataframe.columns
+    ]
+    if missing_transition_columns:
+        raise ValueError(
+            f"{path} is missing correction-transition columns required for global metrics: "
+            f"{missing_transition_columns}"
+        )
     existing = [col for col in columns if col in dataframe.columns]
     if existing:
         dataframe = dataframe[existing]
@@ -876,6 +899,10 @@ def evaluate_global_repair_samples(
         raise ValueError(
             f"Mismatch between prediction samples ({len(samples)}) and parquet rows ({len(rows)})."
         )
+    if pre_vectors is not None and len(pre_vectors) != len(rows):
+        raise ValueError(
+            f"Mismatch between PRE-state vectors ({len(pre_vectors)}) and parquet rows ({len(rows)})."
+        )
 
     per_sample_gfr: list[float] = []
     per_sample_srr: list[float] = []
@@ -885,6 +912,8 @@ def evaluate_global_repair_samples(
 
     overall = GlobalMetricsAccumulator()
     per_constraint: dict[str, GlobalMetricsAccumulator] = {}
+    pre_state_checked_rows = 0
+    pre_state_source_counts: dict[str, int] = {}
 
     asserted_length_match = False
 
@@ -906,21 +935,60 @@ def evaluate_global_repair_samples(
         local_constraint_ids = details["local_constraint_ids"]
         primary_index = details["primary_factor_index"]
 
-        pre_checkable = details["pre_checkable"]
-        pre_satisfied = details["pre_satisfied"]
+        pre_checkable = [bool(value) for value in details["pre_checkable"]]
+        pre_satisfied = [int(value) for value in details["pre_satisfied"]]
 
         if pre_vectors is not None and idx < len(pre_vectors):
             override = pre_vectors[idx]
             pre_checkable_override = _coerce_factor_sequence(override.get("pre_checkable"))
             pre_satisfied_override = _coerce_factor_sequence(override.get("pre_satisfied"))
             if pre_checkable_override is not None and pre_satisfied_override is not None:
-                pre_checkable = [bool(v) for v in pre_checkable_override]
-                pre_satisfied = [int(v) for v in pre_satisfied_override]
+                expected_checkable = [bool(v) for v in pre_checkable_override]
+                expected_satisfied = [int(v) for v in pre_satisfied_override]
+                factor_ids_override = _coerce_factor_sequence(
+                    override.get("factor_constraint_ids")
+                )
+                normalized_local_ids = [int(value) for value in local_constraint_ids]
+                if factor_ids_override is not None and [
+                    int(value) for value in factor_ids_override
+                ] != normalized_local_ids:
+                    raise AssertionError(
+                        "Global PRE-state factor order mismatch at row "
+                        f"{idx} ({sample.constraint_type}): evaluator={normalized_local_ids}, "
+                        f"labels={[int(value) for value in factor_ids_override]}."
+                    )
+                if (
+                    pre_checkable != expected_checkable
+                    or pre_satisfied != expected_satisfied
+                ):
+                    raise AssertionError(
+                        "Global PRE-state semantic mismatch at row "
+                        f"{idx} ({sample.constraint_type}): "
+                        f"evaluator_checkable={pre_checkable}, "
+                        f"label_checkable={expected_checkable}, "
+                        f"evaluator_satisfied={pre_satisfied}, "
+                        f"label_satisfied={expected_satisfied}."
+                    )
+                pre_checkable = expected_checkable
+                pre_satisfied = expected_satisfied
+                pre_state_checked_rows += 1
+                source = str(override.get("source", "unknown"))
+                pre_state_source_counts[source] = (
+                    pre_state_source_counts.get(source, 0) + 1
+                )
             if primary_index_override is not None:
                 try:
-                    primary_index = int(primary_index_override)
+                    expected_primary_index = int(primary_index_override)
                 except (TypeError, ValueError):
                     pass
+                else:
+                    if primary_index != expected_primary_index:
+                        raise AssertionError(
+                            "Global PRE-state primary index mismatch at row "
+                            f"{idx} ({sample.constraint_type}): "
+                            f"evaluator={primary_index}, labels={expected_primary_index}."
+                        )
+                    primary_index = expected_primary_index
 
         if primary_index < 0:
             primary_index = _resolve_primary_index_from_row(row, local_constraint_ids)
@@ -1075,6 +1143,11 @@ def evaluate_global_repair_samples(
     return {
         "overall": overall.as_dict(),
         "per_constraint_type": {k: v.as_dict() for k, v in sorted(per_constraint.items())},
+        "pre_state_validation": {
+            "checked_rows": pre_state_checked_rows,
+            "mismatch_count": 0,
+            "source_counts": dict(sorted(pre_state_source_counts.items())),
+        },
         "per_sample": {
             "gfr": per_sample_gfr,
             "srr": per_sample_srr,

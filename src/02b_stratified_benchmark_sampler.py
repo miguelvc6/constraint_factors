@@ -28,13 +28,15 @@ from modules.data_encoders import (
     LEGACY_ENCODER_FILENAME,
     dataset_variant_name,
 )
+from modules.sampling_contract import (
+    ROW_ORDER_BUCKET_BITS,
+    ROW_ORDER_BUCKET_COUNT,
+    ROW_ORDER_KEY_COLUMN,
+    ROW_ORDER_METHOD,
+)
 
 
 SPLITS: tuple[str, ...] = ("train", "val", "test")
-ROW_ORDER_METHOD = "splitmix64_source_index_v1"
-ROW_ORDER_BUCKET_BITS = 6
-ROW_ORDER_BUCKET_COUNT = 1 << ROW_ORDER_BUCKET_BITS
-ROW_ORDER_KEY_COLUMN = "__sample_row_order_key"
 DEFAULT_BINS: tuple[tuple[int, int | None, str], ...] = (
     (1, 32, "1-32"),
     (33, 64, "33-64"),
@@ -570,6 +572,7 @@ def _write_dataset_manifest(
                         CLASS_HIERARCHY_MANIFEST_FILENAME,
                         "sample_primary_validation_audit_by_constraint.csv",
                         "sample_gold_repair_audit_by_constraint.csv",
+                        "sampling_metadata.json",
                     )
                     if (output_root / filename).exists()
                 ]

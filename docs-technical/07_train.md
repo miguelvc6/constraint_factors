@@ -41,6 +41,7 @@
 - Non-finite weighted loss, validation loss, gradient norm, or parameter norm now raises a `FloatingPointError` with epoch/batch context rather than silently producing a corrupt checkpoint.
 - Subset validation changes model selection because scheduler and early stopping use the subset loss. Use full validation for final paper-facing runs.
 - Generated paper configs now default to `learning_rate=1e-4`, `grad_clip=0.5`, `num_epochs=15`, `early_stopping_rounds=2`, `scheduler_patience=0`, `num_workers=2`, `pin_memory=false`, and full validation (`validation_subset_size: null`). `num_epochs` is a ceiling: representative full-validation early stopping may still end a run earlier when loss genuinely stops improving.
+- Candidate inference is total: if heuristics and uniquely resolvable proposal candidates are both empty, the only candidate is the all-`NONE` no-op with source `fallback_noop`. Real candidate sets are never padded with this fallback. Evaluation JSON and reranker epoch histories report fallback count/rate.
 - If CUDA is available but `num_workers` is high, pin-memory can still amplify host-memory pressure on in-memory datasets; tune `pin_memory` in the config if throughput does not justify the footprint.
 - Fix-probability loss requires in-memory datasets (lists) so the script can attach `context_index` and look up contexts; streamed datasets will disable that term automatically.
 - Chooser training supports streamed datasets via per-graph `context_index` assignment; contexts/parquet sidecars must align with graph ordering/counts.
@@ -152,6 +153,19 @@ Generate it with `scripts/make_experiment_configs.py
 --include-executor-comparison`. Its model configuration is identical to
 `a1_factorized_imitation_per_type_compact`; only
 `training_config.factor_loss.enabled=false` differs.
+
+## Reranker Validation Semantics
+
+`08_train_reranker.py` force-includes gold only in optimizer-backed training
+epochs. Validation constructs the same gold-free inference candidate set used
+for final scoring. For `global_fix`, validation loss scores every inference
+candidate for every row and computes expected global satisfaction from that
+set. For the non-paper `main` objective, supervised validation loss is defined
+only on rows whose gold edit occurs naturally in the inference set; inference
+metrics still cover all rows. Epoch metrics include `gold_candidate_count`,
+`gold_candidate_coverage`, `loss_row_count`, and fallback count/rate, and
+validation fails if `main` has zero natural-gold coverage. These changes do not
+alter the 15-epoch ceiling or early-stopping schedule.
 
 ## Dynamic Weighting per constraint type
 

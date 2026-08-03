@@ -25,11 +25,19 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from modules.data_encoders import (  # noqa: E402
     ArtifactWriteResult,
+    GRAPH_SCHEMA_VERSION,
     GlobalIntEncoder,
-    _compute_prefix_sha256,
     _torch_load_trusted,
     dataset_variant_name,
     graph_dataset_filename,
+)
+from modules.graph_manifest import (  # noqa: E402
+    atomic_write_json,
+    file_sha256,
+    graph_incomplete_marker_path,
+    graph_manifest_path,
+    resolve_recorded_path,
+    shard_index,
 )
 
 EDGE_FACTOR_TO_PARAM_PREDICATE = 2
@@ -37,7 +45,7 @@ EDGE_PARAM_PREDICATE_TO_OBJECT = 3
 
 
 def _manifest_path(path: Path) -> Path:
-    return path.with_suffix(path.suffix + ".manifest.json")
+    return graph_manifest_path(path)
 
 
 def _load_objects(path: Path) -> list[Any]:
@@ -72,13 +80,15 @@ def _write_objects(
     return ArtifactWriteResult(
         path=target,
         bytes_written=target.stat().st_size,
-        checksum=_compute_prefix_sha256(target),
+        checksum=file_sha256(target),
+        object_count=len(objects),
     )
 
 
 def _clear_target_artifacts(target_base: Path) -> None:
     target_base.unlink(missing_ok=True)
     _manifest_path(target_base).unlink(missing_ok=True)
+    graph_incomplete_marker_path(target_base).unlink(missing_ok=True)
     for suffix in ("pkl", "pt"):
         for path in target_base.parent.glob(f"{target_base.stem}-shard*.{suffix}"):
             path.unlink(missing_ok=True)
@@ -217,6 +227,18 @@ def _iter_source_shards(source_base: Path, use_torch_save: bool) -> list[Path]:
     return shards
 
 
+def _discover_source_artifacts(source_base: Path) -> set[Path]:
+    artifacts: set[Path] = set()
+    if source_base.exists() or source_base.is_symlink():
+        artifacts.add(source_base.resolve(strict=False))
+    for suffix in ("pkl", "pt"):
+        artifacts.update(
+            path.resolve(strict=False)
+            for path in source_base.parent.glob(f"{source_base.stem}-shard*.{suffix}")
+        )
+    return artifacts
+
+
 def _copy_manifest(
     source_manifest: Path,
     target_manifest: Path,
@@ -224,31 +246,84 @@ def _copy_manifest(
     artifact_writes: list[ArtifactWriteResult],
     graph_count: int,
     target_mode: str,
+    derivation_method: str,
+    artifact_lineage: list[dict[str, object]],
 ) -> None:
-    payload = {}
-    if source_manifest.exists():
-        with source_manifest.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
+    with source_manifest.open("r", encoding="utf-8") as fh:
+        source_payload = json.load(fh)
+    if int(source_payload.get("graph_schema_version", 0)) != GRAPH_SCHEMA_VERSION:
+        raise ValueError(
+            f"Source graph manifest must use schema v{GRAPH_SCHEMA_VERSION}: {source_manifest}"
+        )
+    payload = dict(source_payload)
     payload.update(
         {
+            "graph_schema_version": GRAPH_SCHEMA_VERSION,
             "primary_constraint_mode": target_mode,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "graph_count": int(graph_count),
             "shard_count": len(artifact_writes),
+            "derivation": {
+                "method": derivation_method,
+                "source_manifest": {
+                    "path": str(source_manifest.resolve()),
+                    "sha256": file_sha256(source_manifest),
+                },
+                "source_primary_constraint_mode": source_payload.get(
+                    "primary_constraint_mode"
+                ),
+                "target_primary_constraint_mode": target_mode,
+                "artifacts": artifact_lineage,
+            },
             "artifacts": [
                 {
-                    "path": str(artifact.path),
+                    "path": str(artifact.path.resolve()),
                     "bytes": int(artifact.bytes_written),
-                    "checksum": artifact.checksum,
-                    "checksum_mode": "sha256_prefix_16mb",
+                    "object_count": int(artifact.object_count),
+                    "sha256": artifact.checksum,
                 }
                 for artifact in artifact_writes
             ],
         }
     )
-    target_manifest.parent.mkdir(parents=True, exist_ok=True)
-    with target_manifest.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
+    atomic_write_json(target_manifest, payload)
+
+
+def _load_source_manifest(source_base: Path) -> tuple[Path, dict[str, Any]]:
+    manifest_path = _manifest_path(source_base)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Source graph manifest not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected an object in source graph manifest: {manifest_path}")
+    if int(payload.get("graph_schema_version", 0)) != GRAPH_SCHEMA_VERSION:
+        raise ValueError(
+            f"Source graph manifest must use schema v{GRAPH_SCHEMA_VERSION}: {manifest_path}"
+        )
+    return manifest_path, payload
+
+
+def _source_artifact_records(
+    source_manifest: Path,
+    payload: dict[str, Any],
+) -> dict[Path, dict[str, Any]]:
+    records: dict[Path, dict[str, Any]] = {}
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError(f"Source graph manifest has no artifact list: {source_manifest}")
+    for record in artifacts:
+        if not isinstance(record, dict) or not record.get("path"):
+            raise ValueError(f"Malformed source artifact record in {source_manifest}")
+        path = resolve_recorded_path(record["path"], manifest_path=source_manifest)
+        if not path.exists():
+            raise FileNotFoundError(f"Source graph artifact not found: {path}")
+        if path.stat().st_size != int(record.get("bytes", -1)):
+            raise ValueError(f"Source graph artifact size mismatch: {path}")
+        if file_sha256(path) != record.get("sha256"):
+            raise ValueError(f"Source graph artifact hash mismatch: {path}")
+        records[path] = record
+    return records
 
 
 def convert_split(
@@ -274,51 +349,92 @@ def convert_split(
     )
     use_torch_save = any(source_base.parent.glob(f"{source_base.stem}-shard*.pt"))
     source_shards = _iter_source_shards(source_base, use_torch_save=use_torch_save)
-    if target_base.exists() or list(target_base.parent.glob(f"{target_base.stem}-shard*.pt")):
+    indices = [shard_index(path) for path in source_shards]
+    if indices != list(range(len(source_shards))):
+        raise ValueError(f"Source shards must be contiguous from 000: {source_shards}")
+    source_manifest, source_payload = _load_source_manifest(source_base)
+    if source_payload.get("primary_constraint_mode") != source_mode:
+        raise ValueError(
+            "Source graph manifest primary mode does not match --source-mode: "
+            f"{source_manifest}"
+        )
+    source_records = _source_artifact_records(source_manifest, source_payload)
+    if _discover_source_artifacts(source_base) != set(source_records):
+        raise ValueError("Source graph manifest artifact set does not match source payloads.")
+    if set(path.resolve() for path in source_shards) != set(source_records):
+        raise ValueError("Source graph manifest mixes unsupported payload formats.")
+
+    target_exists = (
+        target_base.exists()
+        or _manifest_path(target_base).exists()
+        or bool(list(target_base.parent.glob(f"{target_base.stem}-shard*.pt")))
+        or bool(list(target_base.parent.glob(f"{target_base.stem}-shard*.pkl")))
+    )
+    if target_exists:
         if not overwrite:
             raise FileExistsError(f"Target artifacts already exist for {target_base}")
         _clear_target_artifacts(target_base)
+    target_manifest = _manifest_path(target_base)
+    target_manifest.unlink(missing_ok=True)
+    incomplete_marker = graph_incomplete_marker_path(target_base)
+    atomic_write_json(
+        incomplete_marker,
+        {
+            "graph_schema_version": GRAPH_SCHEMA_VERSION,
+            "split": split,
+            "encoding": encoding,
+            "source_primary_constraint_mode": source_mode,
+            "target_primary_constraint_mode": target_mode,
+            "status": "incomplete",
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
     if link_identical_structure:
         if target_mode == "passive_node":
             raise ValueError("passive_node changes graph structure and cannot be hard-linked")
         artifact_writes = []
-        graph_count = 0
-        source_manifest = _manifest_path(source_base)
-        source_payload = {}
-        if source_manifest.exists():
-            with source_manifest.open("r", encoding="utf-8") as fh:
-                source_payload = json.load(fh)
-            graph_count = int(source_payload.get("graph_count") or 0)
+        artifact_lineage: list[dict[str, object]] = []
+        graph_count = int(source_payload.get("graph_count") or 0)
         for shard_idx, source_shard in enumerate(source_shards):
             suffix = source_shard.suffix
             target = target_base.with_name(f"{target_base.stem}-shard{shard_idx:03d}{suffix}")
             logging.info("Linking %s -> %s", source_shard, target)
             target.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.link(source_shard, target)
-            except OSError:
-                logging.warning("Hard-link failed for %s; falling back to symlink", target)
-                target.symlink_to(source_shard.name)
+            os.link(source_shard, target)
+            source_record = source_records[source_shard.resolve()]
             artifact_writes.append(
                 ArtifactWriteResult(
                     path=target,
                     bytes_written=target.stat().st_size,
-                    checksum=_compute_prefix_sha256(target),
+                    checksum=file_sha256(target),
+                    object_count=int(source_record["object_count"]),
                 )
+            )
+            artifact_lineage.append(
+                {
+                    "source_path": str(source_shard.resolve()),
+                    "target_path": str(target.resolve()),
+                    "link_type": "hard_link",
+                    "sha256": source_record["sha256"],
+                }
             )
         if graph_count <= 0:
             graph_count = sum(len(_load_objects(path)) for path in source_shards)
         _copy_manifest(
             source_manifest,
-            _manifest_path(target_base),
+            target_manifest,
             artifact_writes=artifact_writes,
             graph_count=graph_count,
             target_mode=target_mode,
+            derivation_method="hard_link",
+            artifact_lineage=artifact_lineage,
         )
+        incomplete_marker.unlink(missing_ok=True)
         return
 
     artifact_writes: list[ArtifactWriteResult] = []
+    artifact_lineage = []
     graph_count = 0
     for shard_idx, source_shard in enumerate(source_shards):
         logging.info("Converting %s -> %s", source_shard, target_base.name)
@@ -341,16 +457,28 @@ def convert_split(
             )
         )
         graph_count += len(converted)
+        artifact_lineage.append(
+            {
+                "source_path": str(source_shard.resolve()),
+                "target_path": str(artifact_writes[-1].path.resolve()),
+                "link_type": "rewritten",
+                "source_sha256": source_records[source_shard.resolve()]["sha256"],
+                "target_sha256": artifact_writes[-1].checksum,
+            }
+        )
         del objects
         del converted
 
     _copy_manifest(
         _manifest_path(source_base),
-        _manifest_path(target_base),
+        target_manifest,
         artifact_writes=artifact_writes,
         graph_count=graph_count,
         target_mode=target_mode,
+        derivation_method="rewrite",
+        artifact_lineage=artifact_lineage,
     )
+    incomplete_marker.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -371,7 +499,7 @@ def parse_args() -> argparse.Namespace:
         "--link-identical-structure",
         action="store_true",
         help=(
-            "Create hard-linked/symlinked target shards for modes with identical graph "
+            "Create hard-linked target shards for modes with identical graph "
             "structure. The graph payload keeps the source mode label; the manifest and "
             "artifact names use the target mode."
         ),

@@ -36,7 +36,7 @@ artifact set without rereading the raw parquet rows.
      - `atomic`: temp file then rename (crash-safe),
      - `unsafe`: direct write (lower peak disk, not crash-safe),
      - `skip`: reuse existing split artifacts.
-   - A manifest is written for each split with graph counts, field profile, artifact sizes, and lightweight prefix checksums.
+   - The old manifest is removed before replacement and an `<graph>.incomplete` marker is published before payload writes begin. After every shard is complete and the serialized sample passes QA, the schema-v3 manifest is written through a temporary file and renamed into place; only then is the incomplete marker removed.
 4. After each split, the script records entity/predicate targets seen in the labels (`add_*` / `del_*`) so training can precompute class vocabularies and shard metadata.
 5. If `--show_graph` is enabled, `display_graph()` reads one of the stored graphs, converts it to NetworkX, and renders `graph_visualization.png` plus a non-flattened view to make edge labels inspectable.
 
@@ -60,13 +60,45 @@ uv run scripts/convert_primary_query_graph_mode.py \
 ```
 
 For `query_definition`, graph structure and query tensors are identical to `query_family`.
-With `--link-identical-structure`, the converter creates linked target shard names and
+With `--link-identical-structure`, the converter creates hard-linked target shard names and
 updates the manifest without rewriting the large payloads; the payload-level
 `primary_constraint_mode` string remains the source mode, while training uses the mode from
 the experiment config. Without that flag, the converter rewrites the shards and updates the
 payload-level mode string too. For `passive_node`, it appends the passive primary constraint
 node and factor-definition parameter edges, sets `passive_primary_node_index`, and keeps the
 passive node out of `factor_node_index`, factor supervision, and pressure edges.
+
+## Schema-v3 Manifest and Integrity Contract
+
+Every split manifest commits to the exact input and output bytes. It records:
+
+- the current dataset-manifest path and full SHA-256;
+- the split parquet path, full SHA-256, and unbounded source row count;
+- the split, dataset variant, encoding, representation, primary mode, and explicit build limit;
+- graph and shard counts;
+- every artifact path, byte size, object count, and full SHA-256;
+- derivation lineage for rewritten or hard-linked primary-query modes.
+
+`scripts/validate_scientific_integrity.py --stage data --verify-hashes` rejects
+schema-v2 manifests, incomplete markers, missing or extra shard names,
+non-contiguous numbering, size/hash/object-count mismatches, source lineage
+mismatches, and graph counts inconsistent with the parquet row count and build
+limit. Full hashing is intentionally I/O-heavy. Run this gate before training
+and again as part of the final pre-pruning acceptance gate.
+
+## Post-Acceptance Pruning
+
+Processed graph payloads are reproducible intermediates and may be reclaimed
+after every dependent run and diagnostic has passed acceptance. Use
+`scripts/prune_graph_artifacts.py`, never `rm` or a wildcard. The pruner accepts
+one or more graph manifests plus the integrity report that validated them. It
+requires `ok: true`, the current manifest hashes, and `hashes_verified: true`;
+it then unlinks only artifact names explicitly listed by those manifests and
+confined to `data/processed/<variant>/`. `--dry-run` previews the plan and
+`--delete` is required for mutation. The receipt retains each path, byte size,
+full hash, report hash, timestamp, and manifest hash. Unlinking a hard-linked
+target removes only that target name, so prune `query_definition` before its
+`query_family` source.
 
 ## Common Pitfalls / Gotchas
 - Selecting `--encoding text_embedding` without having run `04_wikidata_retriever.py` first will raise lookup errors because literal/URI embeddings are missing.
@@ -92,5 +124,5 @@ passive node out of `factor_node_index`, factor supervision, and pressure edges.
 - `edge_type` is emitted alongside `edge_index` to distinguish base statement edges, factor-definition edges, and factor-to-local-statement edges during message passing.
 - Factor metadata is stored on each graph: `factor_constraint_ids` (order preserved), `primary_factor_index` (which entry matches the row’s `constraint_id`), and optional debug fields (`factor_constraint_types`, `factor_wiring_debug`) when using `--persistence-profile full`. Factor wiring uses the registry's canonical `constraint_family`; `symmetric` constraints share the inverse-style mirror-property wiring.
 - `--persistence-profile research_safe` (default) drops debug-only fields (`x_names`, `factor_constraint_types`, `factor_wiring_debug`) while preserving all fields required by training/evaluation objectives.
-- `target_vocabs.json` records feature-space class IDs referenced by training labels. Per-split manifests use graph schema v2 and list the identity audit fields.
+- `target_vocabs.json` records feature-space class IDs referenced by training labels. Per-split manifests use graph schema v3 and list the identity audit fields plus complete input/output lineage.
 - `collect_sample_for_check()` and `check_data_graph()` assist in QA by loading a tiny subset of the serialized graphs and verifying they batch cleanly before committing to long training jobs.

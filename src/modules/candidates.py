@@ -428,7 +428,7 @@ def build_inference_candidates(
     precomputed_add_topk=None,
     precomputed_del_topk=None,
 ) -> list[RepairCandidate]:
-    return _build_candidate_pool(
+    candidates = _build_candidate_pool(
         context=context,
         heuristics=heuristics,
         proposal_logits=proposal_logits,
@@ -443,6 +443,16 @@ def build_inference_candidates(
         gold_feature=None,
         include_gold_train=False,
     )
+    if candidates:
+        return candidates
+    noop = (NONE_CLASS_INDEX,) * NUM_SLOTS
+    return [
+        RepairCandidate(
+            identity_slots=noop,
+            feature_slots=noop,
+            source="fallback_noop",
+        )
+    ]
 
 
 def build_candidates(

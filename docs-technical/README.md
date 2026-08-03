@@ -15,7 +15,7 @@ developer-facing operations.
 - [Wikidata retriever](04_wikidata_retriever.md)
 - [Constraint labeler](05_constraint_labeler.md): semantic labels and primary eligibility.
 - [Data specification](05_data_spec.md)
-- [Graph construction](06_graph.md): identity-keyed schema-v2 PyG artifacts.
+- [Graph construction](06_graph.md): identity-keyed schema-v3 PyG artifacts, complete lineage, validation, and safe pruning.
 - [Training](07_train.md): proposal training and run provenance.
 
 Research rationale and paper claims belong in the

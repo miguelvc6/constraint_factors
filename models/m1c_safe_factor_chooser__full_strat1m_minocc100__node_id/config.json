@@ -58,14 +58,14 @@
     },
     "grad_clip": 0.5,
     "learning_rate": 0.0001,
-    "num_epochs": 10,
+    "num_epochs": 15,
     "num_workers": 2,
     "pin_memory": false,
     "policy_filter_strict": true,
     "scheduler_factor": 0.5,
     "scheduler_patience": 0,
     "validate_factor_labels": true,
-    "validation_subset_size": 25000,
+    "validation_subset_size": null,
     "weight_decay": 0.00011
   }
 }

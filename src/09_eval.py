@@ -138,45 +138,108 @@ class GlobalMetricsSupport:
     rows: list[object]
     evaluator: CandidateConstraintEvaluator
     none_class: int = NONE_CLASS_INDEX
+    require_pre_state_labels: bool = False
+
+    @staticmethod
+    def _extract_pre_state_vector(
+        source: object,
+        *,
+        source_name: str,
+    ) -> dict[str, object] | None:
+        for prefix in ("eval_factor", "factor"):
+            pre_satisfied = getattr(source, f"{prefix}_satisfied_pre", None)
+            pre_checkable = getattr(source, f"{prefix}_checkable_pre", None)
+            if pre_satisfied is None and pre_checkable is None:
+                continue
+            if pre_satisfied is None or pre_checkable is None:
+                raise ValueError(
+                    f"{source_name} has incomplete {prefix} PRE-state labels; "
+                    "both checkability and satisfaction are required."
+                )
+            factor_constraint_ids = getattr(
+                source,
+                f"{prefix}_constraint_ids",
+                None,
+            )
+            if factor_constraint_ids is None and prefix == "eval_factor":
+                factor_constraint_ids = getattr(source, "factor_constraint_ids", None)
+            primary_index_field = (
+                "eval_primary_factor_index"
+                if prefix == "eval_factor"
+                else "primary_factor_index"
+            )
+            primary_index = getattr(source, primary_index_field, None)
+            if factor_constraint_ids is None or primary_index is None:
+                raise ValueError(
+                    f"{source_name} has {prefix} PRE-state labels without matching "
+                    "factor IDs and a primary factor index."
+                )
+            return {
+                "factor_constraint_ids": factor_constraint_ids,
+                "pre_satisfied": pre_satisfied,
+                "pre_checkable": pre_checkable,
+                "primary_factor_index": primary_index,
+                "source": source_name,
+            }
+        return None
+
+    def _build_pre_vectors(
+        self,
+        test_data: Sequence[Data] | GraphStreamDataset | None,
+    ) -> list[dict[str, object]] | None:
+        vectors: list[dict[str, object]] = []
+        missing_indices: list[int] = []
+        any_vectors = False
+
+        if test_data is None:
+            graph_rows: Iterable[object | None] = (None for _ in self.rows)
+        else:
+            graph_rows = test_data
+
+        graph_count = 0
+        for idx, data in enumerate(graph_rows):
+            graph_count += 1
+            if idx >= len(self.rows):
+                raise ValueError(
+                    "Test graph count exceeds the global-evaluation parquet row count."
+                )
+            vector = None
+            if data is not None:
+                vector = self._extract_pre_state_vector(
+                    data,
+                    source_name="graph",
+                )
+            if vector is None:
+                vector = self._extract_pre_state_vector(
+                    self.rows[idx],
+                    source_name="parquet",
+                )
+            if vector is None:
+                vectors.append({})
+                missing_indices.append(idx)
+                continue
+            any_vectors = True
+            vectors.append(vector)
+
+        if graph_count != len(self.rows):
+            raise ValueError(
+                "Mismatch between test graphs "
+                f"({graph_count}) and global-evaluation parquet rows ({len(self.rows)})."
+            )
+        if self.require_pre_state_labels and missing_indices:
+            raise RuntimeError(
+                "Strict global metrics require authoritative PRE-state labels for every row; "
+                f"missing at row {missing_indices[0]} "
+                f"({len(missing_indices)} missing rows total)."
+            )
+        return vectors if any_vectors else None
 
     def build_postprocess(
         self,
         test_data: Sequence[Data] | GraphStreamDataset | None = None,
     ) -> tuple[Callable[[torch.Tensor, torch.Tensor, list[str]], None], dict[str, object]]:
         state: dict[str, object] = {}
-
-        pre_vectors: list[dict[str, object]] | None = None
-        # Streamed datasets intentionally do not implement truthiness via __len__.
-        if test_data is not None:
-            vectors: list[dict[str, object]] = []
-            any_vectors = False
-            for data in test_data:
-                pre_satisfied = getattr(data, "eval_factor_satisfied_pre", None)
-                if pre_satisfied is None:
-                    pre_satisfied = getattr(data, "factor_satisfied_pre", None)
-                pre_checkable = getattr(data, "eval_factor_checkable_pre", None)
-                if pre_checkable is None:
-                    pre_checkable = getattr(data, "factor_checkable_pre", None)
-                primary_index = getattr(data, "eval_primary_factor_index", None)
-                if primary_index is None:
-                    primary_index = getattr(data, "primary_factor_index", None)
-                factor_constraint_ids = getattr(data, "eval_factor_constraint_ids", None)
-                if factor_constraint_ids is None:
-                    factor_constraint_ids = getattr(data, "factor_constraint_ids", None)
-                if pre_satisfied is None and pre_checkable is None:
-                    vectors.append({})
-                    continue
-                any_vectors = True
-                vectors.append(
-                    {
-                        "factor_constraint_ids": factor_constraint_ids,
-                        "pre_satisfied": pre_satisfied,
-                        "pre_checkable": pre_checkable,
-                        "primary_factor_index": primary_index,
-                    }
-                )
-            if any_vectors:
-                pre_vectors = vectors
+        pre_vectors = self._build_pre_vectors(test_data)
 
         def _postprocess(predictions: torch.Tensor, targets: torch.Tensor, kinds: list[str]) -> None:
             samples = _repair_samples_from_predictions(predictions, targets, kinds, self.none_class)
@@ -370,7 +433,7 @@ def _normalize_precomputed_predictions(predictions: torch.Tensor | Iterable, non
     return tensor
 
 
-def _load_reranker_predictions(path: Path) -> torch.Tensor:
+def _load_reranker_predictions(path: Path) -> tuple[torch.Tensor, dict[str, object]]:
     if not path.exists():
         raise FileNotFoundError(f"Reranker predictions not found at {path}")
 
@@ -394,19 +457,23 @@ def _load_reranker_predictions(path: Path) -> torch.Tensor:
     else:
         raise ValueError("Unsupported reranker predictions format; expected .pt/.pth/.json/.jsonl")
 
+    candidate_diagnostics: dict[str, object] = {}
     if isinstance(payload, dict):
+        raw_diagnostics = payload.get("candidate_diagnostics")
+        if isinstance(raw_diagnostics, dict):
+            candidate_diagnostics = dict(raw_diagnostics)
         for key in ("predictions", "candidate_slots", "edits", "chosen_edits"):
             if key in payload:
                 payload = payload[key]
                 break
 
     if isinstance(payload, torch.Tensor):
-        return payload
+        return payload, candidate_diagnostics
     if isinstance(payload, list):
         if not payload:
-            return torch.empty((0, 6), dtype=torch.long)
+            return torch.empty((0, 6), dtype=torch.long), candidate_diagnostics
         if isinstance(payload[0], (list, tuple)):
-            return torch.tensor(payload, dtype=torch.long)
+            return torch.tensor(payload, dtype=torch.long), candidate_diagnostics
         if isinstance(payload[0], dict):
             rows = []
             for entry in payload:
@@ -417,7 +484,7 @@ def _load_reranker_predictions(path: Path) -> torch.Tensor:
                 if delete is None:
                     delete = [NONE_CLASS_INDEX, NONE_CLASS_INDEX, NONE_CLASS_INDEX]
                 rows.append(list(add) + list(delete))
-            return torch.tensor(rows, dtype=torch.long)
+            return torch.tensor(rows, dtype=torch.long), candidate_diagnostics
     raise ValueError("Unsupported reranker predictions payload structure.")
 
 
@@ -512,7 +579,7 @@ def _maybe_prepare_global_support(
 
     try:
         rows = load_global_eval_rows(interim_base, split)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         if strict:
             raise RuntimeError(
                 f"Global eval rows unavailable at {interim_base}: {exc}. "
@@ -547,7 +614,12 @@ def _maybe_prepare_global_support(
         logging.warning("Constraint evaluator unavailable: %s", exc)
         return None
 
-    return GlobalMetricsSupport(rows=rows, evaluator=evaluator, none_class=none_class)
+    return GlobalMetricsSupport(
+        rows=rows,
+        evaluator=evaluator,
+        none_class=none_class,
+        require_pre_state_labels=strict,
+    )
 
 
 def _aggregate_counts(
@@ -651,6 +723,8 @@ def eval(
     representable_masks: list[torch.Tensor] = []
     feature_identity_lookup: torch.Tensor | None = None
     output_logged = False
+    candidate_inference_rows = 0
+    fallback_noop_count = 0
     for data in tqdm(test_loader, desc="Test Batches"):
         batch_graphs = data.to_data_list() if hasattr(data, "to_data_list") else [data]
         kinds.extend((getattr(graph, "constraint_type", None) or "UNKNOWN") for graph in batch_graphs)
@@ -705,6 +779,10 @@ def eval(
                         placeholder_ids=set(policy_support.heuristics.placeholder_ids.values()),
                         num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
                         identity_to_feature=policy_support.identity_to_feature,
+                    )
+                    candidate_inference_rows += 1
+                    fallback_noop_count += int(
+                        any(candidate.source == "fallback_noop" for candidate in candidates)
                     )
                     identity_candidates = candidate_identity_tuples(candidates)
                     candidates_filtered, match_mask = filter_candidates_by_policy(
@@ -761,6 +839,10 @@ def eval(
                         num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
                         identity_to_feature=chooser_support.identity_to_feature,
                     )
+                    candidate_inference_rows += 1
+                    fallback_noop_count += int(
+                        any(candidate.source == "fallback_noop" for candidate in candidates)
+                    )
                     candidate_tensor = torch.tensor(
                         candidate_feature_tuples(candidates), dtype=torch.long, device=logits.device
                     )
@@ -788,6 +870,10 @@ def eval(
                         placeholder_ids=set(direct_safety_support.heuristics.placeholder_ids.values()),
                         num_target_ids=model.num_target_ids if model is not None else logits.size(-1),
                         identity_to_feature=direct_safety_support.identity_to_feature,
+                    )
+                    candidate_inference_rows += 1
+                    fallback_noop_count += int(
+                        any(candidate.source == "fallback_noop" for candidate in candidates)
                     )
                     candidate_tensor = torch.tensor(
                         candidate_feature_tuples(candidates), dtype=torch.long, device=logits.device
@@ -940,6 +1026,9 @@ def eval(
         "evaluation_schema_version": 2,
         "fidelity_space": "strict_identity",
         "candidate_inference_gold_access": False,
+        "candidate_inference_rows": candidate_inference_rows,
+        "fallback_noop_count": fallback_noop_count,
+        "fallback_noop_rate": _safe_div(fallback_noop_count, candidate_inference_rows),
         "metric_definitions": {
             "micro_f1": "Exact add/delete triple match in unfiltered identity-ID space.",
             "feature_space_micro": "Diagnostic match after training-vocabulary compression.",
@@ -1052,6 +1141,7 @@ def _run_and_save(
     selection_weights: dict[str, float] | None = None,
     selection_disruption_field: str = "mean_disruption_total",
     identity_to_feature: Sequence[int] | None = None,
+    candidate_diagnostics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     normalized_predictions = None
     if precomputed_predictions is not None:
@@ -1067,6 +1157,12 @@ def _run_and_save(
         policy_support=policy_support,
         identity_to_feature=identity_to_feature,
     )
+    if candidate_diagnostics:
+        candidate_rows = int(candidate_diagnostics.get("candidate_inference_rows", 0))
+        fallback_count = int(candidate_diagnostics.get("fallback_noop_count", 0))
+        metrics["candidate_inference_rows"] = candidate_rows
+        metrics["fallback_noop_count"] = fallback_count
+        metrics["fallback_noop_rate"] = _safe_div(fallback_count, candidate_rows)
     metrics["global_metrics_computed"] = bool(
         postprocess_state and isinstance(postprocess_state, dict) and "global_metrics" in postprocess_state
     )
@@ -1775,6 +1871,7 @@ def evaluate_trained_model(
     selection_weights: dict[str, float] | None = None,
     selection_disruption_field: str = "mean_disruption_total",
     identity_to_feature: Sequence[int] | None = None,
+    candidate_diagnostics: dict[str, object] | None = None,
 ) -> None:
     checkpoint_path = get_checkpoint_path(run_directory)
 
@@ -1805,6 +1902,7 @@ def evaluate_trained_model(
         selection_weights=selection_weights,
         selection_disruption_field=selection_disruption_field,
         identity_to_feature=identity_to_feature,
+        candidate_diagnostics=candidate_diagnostics,
     )
 
 
@@ -2177,6 +2275,15 @@ def main():
                 registry_dataset=args.registry_dataset,
             )
         if global_support:
+            if (
+                test_graph_count is not None
+                and len(global_support.rows) != test_graph_count
+            ):
+                raise RuntimeError(
+                    "Model evaluation source mismatch before inference: "
+                    f"loaded {test_graph_count} test graphs but "
+                    f"{len(global_support.rows)} global-metric rows."
+                )
             global_postprocess, global_state = global_support.build_postprocess(test_data)
             postprocess_fns.append(global_postprocess)
             postprocess_states.append(global_state)
@@ -2252,8 +2359,11 @@ def main():
             postprocess_state = combined_state
 
         precomputed_predictions = None
+        precomputed_candidate_diagnostics: dict[str, object] | None = None
         if args.reranker_predictions:
-            precomputed_predictions = _load_reranker_predictions(Path(args.reranker_predictions))
+            precomputed_predictions, precomputed_candidate_diagnostics = _load_reranker_predictions(
+                Path(args.reranker_predictions)
+            )
             logging.info("Loaded reranker predictions from %s", args.reranker_predictions)
 
         evaluate_trained_model(
@@ -2271,6 +2381,7 @@ def main():
             selection_weights=selection_weights,
             selection_disruption_field=args.score_disruption_field,
             identity_to_feature=identity_to_feature,
+            candidate_diagnostics=precomputed_candidate_diagnostics,
         )
 
     else:  # Evaluate baselines

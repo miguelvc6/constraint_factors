@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import pickle
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +14,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch_geometric.loader import DataLoader
 
@@ -38,6 +41,13 @@ from modules.data_encoders import (
     discover_graph_artifacts,
     graph_dataset_filename,
 )
+from modules.graph_manifest import (
+    file_sha256 as graph_file_sha256,
+    graph_incomplete_marker_path,
+    graph_manifest_path,
+    resolve_recorded_path,
+    shard_index,
+)
 from modules.provenance import (
     RUN_MANIFEST_FILENAME,
     canonical_json_hash,
@@ -46,6 +56,7 @@ from modules.provenance import (
     json_file_hash,
 )
 from modules.training_utils import load_graph_dataset
+from modules.sampling_contract import ROW_ORDER_BUCKET_COUNT, ROW_ORDER_METHOD
 
 
 @dataclass
@@ -53,6 +64,7 @@ class ValidationReport:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     checks: list[str] = field(default_factory=list)
+    validated_graph_manifests: list[dict[str, object]] = field(default_factory=list)
 
     def require(self, condition: bool, message: str) -> None:
         if condition:
@@ -70,6 +82,7 @@ class ValidationReport:
             "checks_passed": len(self.checks),
             "errors": self.errors,
             "warnings": self.warnings,
+            "validated_graph_manifests": self.validated_graph_manifests,
         }
 
 
@@ -82,7 +95,77 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _manifest_path(graph_path: Path) -> Path:
-    return graph_path.with_suffix(graph_path.suffix + ".manifest.json")
+    return graph_manifest_path(graph_path)
+
+
+def _validate_sampled_row_order(
+    *,
+    interim: Path,
+    manifest: dict[str, Any],
+    report: ValidationReport,
+) -> None:
+    sampling = manifest.get("sampling")
+    if not isinstance(sampling, dict):
+        return
+    is_sampled = sampling.get("target_rows") is not None or sampling.get("sample_fraction") is not None
+    if not is_sampled:
+        return
+
+    row_order = sampling.get("row_order")
+    report.require(
+        isinstance(row_order, dict),
+        "sampled dataset records sampling.row_order provenance",
+    )
+    metadata_path = interim / "sampling_metadata.json"
+    report.require(metadata_path.exists(), "sampled dataset has sampling_metadata.json")
+    metadata = _read_json(metadata_path) if metadata_path.exists() else {}
+    metadata_row_order = metadata.get("row_order")
+    report.require(
+        isinstance(metadata_row_order, dict),
+        "sampling metadata records row_order provenance",
+    )
+
+    manifest_method = row_order.get("method") if isinstance(row_order, dict) else None
+    metadata_method = (
+        metadata_row_order.get("method") if isinstance(metadata_row_order, dict) else None
+    )
+    report.require(
+        manifest_method == ROW_ORDER_METHOD and metadata_method == ROW_ORDER_METHOD,
+        f"sample row order method is exactly {ROW_ORDER_METHOD}",
+    )
+    sampling_seed = sampling.get("seed")
+    manifest_seed = row_order.get("seed") if isinstance(row_order, dict) else None
+    metadata_seed = metadata_row_order.get("seed") if isinstance(metadata_row_order, dict) else None
+    report.require(
+        sampling_seed is not None
+        and manifest_seed == sampling_seed
+        and metadata_seed == sampling_seed
+        and metadata.get("seed") == sampling_seed,
+        "sample row order seeds match sampling provenance",
+    )
+    manifest_buckets = (
+        row_order.get("external_sort_buckets") if isinstance(row_order, dict) else None
+    )
+    metadata_buckets = (
+        metadata_row_order.get("external_sort_buckets")
+        if isinstance(metadata_row_order, dict)
+        else None
+    )
+    report.require(
+        isinstance(manifest_buckets, int)
+        and manifest_buckets > 0
+        and manifest_buckets == ROW_ORDER_BUCKET_COUNT
+        and metadata_buckets == manifest_buckets,
+        "sample row order bucket count is positive and matches metadata",
+    )
+    metadata_hash = manifest.get("outputs", {}).get("sampling_metadata.json")
+    report.require(
+        metadata_path.exists()
+        and isinstance(metadata_hash, str)
+        and len(metadata_hash) == 64
+        and file_sha256(metadata_path) == metadata_hash,
+        "sampling metadata is a hashed dataset-manifest output",
+    )
 
 
 def _iter_prefix(dataset: Iterable[Any], limit: int) -> list[Any]:
@@ -181,6 +264,359 @@ def _validate_parquet_contract(interim: Path, report: ValidationReport) -> None:
             report.errors.append(f"{split} is missing primary-validation columns: {sorted(primary_columns - columns)}")
 
 
+def _graph_artifact_candidates(graph_path: Path) -> set[Path]:
+    candidates: set[Path] = set()
+    if graph_path.exists() or graph_path.is_symlink():
+        candidates.add(graph_path.resolve(strict=False))
+    for suffix in ("pkl", "pt"):
+        for path in graph_path.parent.glob(f"{graph_path.stem}-shard*.{suffix}"):
+            candidates.add(path.resolve(strict=False))
+    return candidates
+
+
+def _count_graph_objects(path: Path, *, sharded: bool) -> int:
+    if path.suffix == ".pt":
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, list):
+            raise TypeError(f"Expected a list payload in graph shard {path}")
+        return len(payload)
+
+    with path.open("rb") as handle:
+        try:
+            first = pickle.load(handle)
+        except EOFError:
+            return 0
+        if isinstance(first, list):
+            return len(first)
+        if sharded:
+            raise TypeError(f"Expected a list payload in graph shard {path}")
+        count = 1
+        while True:
+            try:
+                pickle.load(handle)
+            except EOFError:
+                return count
+            count += 1
+
+
+def _validate_graph_derivation(
+    *,
+    graph_manifest_path: Path,
+    graph_manifest: dict[str, Any],
+    artifact_paths: list[Path],
+    verify_hashes: bool,
+    report: ValidationReport,
+    label: str,
+) -> None:
+    derivation = graph_manifest.get("derivation")
+    if derivation is None:
+        report.checks.append(f"{label} graph is a canonical parquet-derived build")
+        return
+    if not isinstance(derivation, dict):
+        report.errors.append(f"{label} graph derivation is malformed")
+        return
+
+    method = derivation.get("method")
+    report.require(method in {"hard_link", "rewrite"}, f"{label} graph derivation method is supported")
+    source_record = derivation.get("source_manifest")
+    source_path: Path | None = None
+    source_payload: dict[str, Any] = {}
+    if isinstance(source_record, dict) and source_record.get("path"):
+        source_path = resolve_recorded_path(
+            source_record["path"],
+            manifest_path=graph_manifest_path,
+            repository_root=ROOT,
+        )
+    report.require(
+        source_path is not None and source_path.exists(),
+        f"{label} derivation source graph manifest exists",
+    )
+    if source_path is not None and source_path.exists():
+        report.require(
+            source_record.get("sha256") == graph_file_sha256(source_path),
+            f"{label} derivation source graph manifest hash matches",
+        )
+        source_payload = _read_json(source_path)
+        report.require(
+            int(source_payload.get("graph_schema_version", 0)) == GRAPH_SCHEMA_VERSION,
+            f"{label} derivation source graph manifest is schema v{GRAPH_SCHEMA_VERSION}",
+        )
+        report.require(
+            source_payload.get("dataset_manifest") == graph_manifest.get("dataset_manifest")
+            and source_payload.get("source_parquet") == graph_manifest.get("source_parquet")
+            and source_payload.get("build_limit") == graph_manifest.get("build_limit")
+            and source_payload.get("graph_count") == graph_manifest.get("graph_count"),
+            f"{label} derivation preserves dataset and parquet lineage",
+        )
+        report.require(
+            derivation.get("source_primary_constraint_mode")
+            == source_payload.get("primary_constraint_mode")
+            and derivation.get("target_primary_constraint_mode")
+            == graph_manifest.get("primary_constraint_mode"),
+            f"{label} derivation records source and target primary modes",
+        )
+
+    lineage = derivation.get("artifacts")
+    report.require(
+        isinstance(lineage, list) and len(lineage) == len(artifact_paths),
+        f"{label} derivation records every artifact",
+    )
+    if not verify_hashes or not isinstance(lineage, list):
+        return
+    for index, record in enumerate(lineage):
+        if not isinstance(record, dict):
+            report.errors.append(f"{label} derivation artifact {index} is malformed")
+            continue
+        source_raw = record.get("source_path")
+        target_raw = record.get("target_path")
+        source_artifact = (
+            resolve_recorded_path(
+                source_raw,
+                manifest_path=graph_manifest_path,
+                repository_root=ROOT,
+            )
+            if source_raw
+            else None
+        )
+        target_artifact = (
+            resolve_recorded_path(
+                target_raw,
+                manifest_path=graph_manifest_path,
+                repository_root=ROOT,
+            )
+            if target_raw
+            else None
+        )
+        report.require(
+            source_artifact is not None and source_artifact.exists(),
+            f"{label} derivation source artifact {index:03d} exists",
+        )
+        report.require(
+            target_artifact is not None
+            and target_artifact in artifact_paths
+            and target_artifact.exists(),
+            f"{label} derivation target artifact {index:03d} matches the manifest",
+        )
+        if (
+            method == "hard_link"
+            and source_artifact is not None
+            and target_artifact is not None
+            and source_artifact.exists()
+            and target_artifact.exists()
+        ):
+            report.require(
+                os.path.samefile(source_artifact, target_artifact),
+                f"{label} derivation artifact {index:03d} remains hard-linked",
+            )
+
+
+def _validate_graph_manifest(
+    *,
+    graph_path: Path,
+    graph_manifest_path: Path,
+    dataset_manifest_path: Path,
+    parquet_path: Path,
+    processed: Path,
+    dataset_variant: str,
+    split: str,
+    encoding: str,
+    constraint_representation: str,
+    primary_constraint_mode: str,
+    verify_hashes: bool,
+    report: ValidationReport,
+) -> None:
+    label = split
+    starting_error_count = len(report.errors)
+    marker_path = graph_incomplete_marker_path(graph_path)
+    report.require(not marker_path.exists(), f"{label} has no incomplete graph-build marker")
+    report.require(graph_manifest_path.exists(), f"{label} graph manifest exists")
+    if not graph_manifest_path.exists():
+        return
+    graph_manifest = _read_json(graph_manifest_path)
+    report.require(
+        int(graph_manifest.get("graph_schema_version", 0)) == GRAPH_SCHEMA_VERSION,
+        f"{label} graph schema is exactly v{GRAPH_SCHEMA_VERSION}",
+    )
+    expected_fields = {
+        "dataset_variant": dataset_variant,
+        "split": split,
+        "encoding": encoding,
+        "constraint_representation": constraint_representation,
+        "primary_constraint_mode": primary_constraint_mode,
+    }
+    for key, expected in expected_fields.items():
+        report.require(
+            graph_manifest.get(key) == expected,
+            f"{label} graph manifest {key} matches the requested graph",
+        )
+
+    dataset_record = graph_manifest.get("dataset_manifest")
+    recorded_dataset_path = None
+    if isinstance(dataset_record, dict) and dataset_record.get("path"):
+        recorded_dataset_path = resolve_recorded_path(
+            dataset_record["path"],
+            manifest_path=graph_manifest_path,
+            repository_root=ROOT,
+        )
+    report.require(
+        recorded_dataset_path == dataset_manifest_path.resolve()
+        and isinstance(dataset_record, dict)
+        and dataset_record.get("sha256") == graph_file_sha256(dataset_manifest_path),
+        f"{label} graph commits to the current dataset manifest",
+    )
+
+    source_record = graph_manifest.get("source_parquet")
+    recorded_parquet_path = None
+    if isinstance(source_record, dict) and source_record.get("path"):
+        recorded_parquet_path = resolve_recorded_path(
+            source_record["path"],
+            manifest_path=graph_manifest_path,
+            repository_root=ROOT,
+        )
+    source_row_count = int(pq.ParquetFile(parquet_path).metadata.num_rows)
+    report.require(
+        recorded_parquet_path == parquet_path.resolve()
+        and isinstance(source_record, dict)
+        and source_record.get("sha256") == graph_file_sha256(parquet_path)
+        and source_record.get("row_count") == source_row_count,
+        f"{label} graph commits to the current split parquet and row count",
+    )
+
+    build_limit = graph_manifest.get("build_limit")
+    valid_build_limit = build_limit is None or (
+        isinstance(build_limit, int) and not isinstance(build_limit, bool) and build_limit > 0
+    )
+    report.require(valid_build_limit, f"{label} graph records a valid explicit build limit")
+    expected_graph_count = (
+        source_row_count if build_limit is None else min(source_row_count, int(build_limit))
+    ) if valid_build_limit else source_row_count
+    report.require(
+        graph_manifest.get("graph_count") == expected_graph_count,
+        f"{label} graph count is consistent with source rows and build limit",
+    )
+
+    kept = set(graph_manifest.get("kept_fields", []))
+    report.require(
+        {"y_identity", "target_representable_mask", "node_identity_id"} <= kept,
+        f"{label} graph manifest includes identity audit fields",
+    )
+
+    artifact_records = graph_manifest.get("artifacts")
+    report.require(isinstance(artifact_records, list), f"{label} graph manifest has an artifact list")
+    if not isinstance(artifact_records, list):
+        return
+    report.require(
+        graph_manifest.get("shard_count") == len(artifact_records),
+        f"{label} graph shard count matches its artifact records",
+    )
+    recorded_paths: list[Path] = []
+    resolved_artifacts: list[tuple[int, dict[str, Any], Path]] = []
+    object_count_sum = 0
+    processed_root = processed.resolve()
+    for index, record in enumerate(artifact_records):
+        if not isinstance(record, dict) or not record.get("path"):
+            report.errors.append(f"{label} graph artifact {index:03d} is malformed")
+            continue
+        path = resolve_recorded_path(
+            record["path"],
+            manifest_path=graph_manifest_path,
+            repository_root=ROOT,
+        )
+        recorded_paths.append(path)
+        resolved_artifacts.append((index, record, path))
+        try:
+            confined = path.is_relative_to(processed_root)
+        except ValueError:
+            confined = False
+        report.require(confined, f"{label} graph artifact {index:03d} is confined to its variant")
+        object_count = record.get("object_count")
+        report.require(
+            isinstance(object_count, int) and not isinstance(object_count, bool) and object_count >= 0,
+            f"{label} graph artifact {index:03d} records an object count",
+        )
+        if isinstance(object_count, int) and not isinstance(object_count, bool):
+            object_count_sum += object_count
+        report.require(
+            isinstance(record.get("bytes"), int)
+            and record.get("bytes", -1) >= 0
+            and isinstance(record.get("sha256"), str)
+            and len(record.get("sha256", "")) == 64,
+            f"{label} graph artifact {index:03d} records size and full SHA-256",
+        )
+
+    report.require(
+        len(recorded_paths) == len(set(recorded_paths)),
+        f"{label} graph artifact paths are unique",
+    )
+    report.require(
+        object_count_sum == graph_manifest.get("graph_count"),
+        f"{label} graph artifact object counts sum to graph_count",
+    )
+
+    is_sharded = bool(graph_manifest.get("sharded"))
+    indices = [shard_index(path) for path in recorded_paths]
+    if is_sharded:
+        report.require(
+            indices == list(range(len(recorded_paths))),
+            f"{label} graph shard numbering is contiguous from 000",
+        )
+    else:
+        report.require(
+            len(recorded_paths) == 1
+            and recorded_paths[0] == graph_path.resolve(strict=False)
+            and indices == [None],
+            f"{label} monolithic graph artifact matches its base path",
+        )
+
+    if verify_hashes:
+        actual_paths = _graph_artifact_candidates(graph_path)
+        report.require(
+            actual_paths == set(recorded_paths),
+            f"{label} graph artifact set has no missing or extra payloads",
+        )
+        for index, record, path in resolved_artifacts:
+            exists = path.exists()
+            report.require(exists, f"{label} graph artifact {index:03d} exists")
+            if not exists:
+                continue
+            report.require(
+                path.stat().st_size == record.get("bytes"),
+                f"{label} graph artifact {index:03d} size matches",
+            )
+            report.require(
+                graph_file_sha256(path) == record.get("sha256"),
+                f"{label} graph artifact {index:03d} full hash matches",
+            )
+            try:
+                actual_count = _count_graph_objects(path, sharded=is_sharded)
+            except Exception as exc:
+                report.errors.append(
+                    f"{label} graph artifact {index:03d} cannot be counted: {exc}"
+                )
+            else:
+                report.require(
+                    actual_count == record.get("object_count"),
+                    f"{label} graph artifact {index:03d} object count matches",
+                )
+
+    _validate_graph_derivation(
+        graph_manifest_path=graph_manifest_path,
+        graph_manifest=graph_manifest,
+        artifact_paths=recorded_paths,
+        verify_hashes=verify_hashes,
+        report=report,
+        label=label,
+    )
+    if len(report.errors) == starting_error_count:
+        report.validated_graph_manifests.append(
+            {
+                "path": str(graph_manifest_path.resolve()),
+                "sha256": graph_file_sha256(graph_manifest_path),
+                "hashes_verified": bool(verify_hashes),
+            }
+        )
+
+
 def validate_dataset(
     *,
     dataset_variant: str,
@@ -266,6 +702,7 @@ def validate_dataset(
             and sum(int(value) for value in sampled_gold.values()) == int(target_rows),
             "sampled observed-edit audit covers every row",
         )
+    _validate_sampled_row_order(interim=interim, manifest=manifest, report=report)
     for filename in (
         IDENTITY_ENCODER_FILENAME,
         FEATURE_ENCODER_FILENAME,
@@ -337,6 +774,7 @@ def validate_dataset(
         return
 
     for split in ("train", "val", "test"):
+        parquet_path = interim / f"df_{split}.parquet"
         graph_path = processed / graph_dataset_filename(
             split,
             encoding,
@@ -344,19 +782,29 @@ def validate_dataset(
             primary_constraint_mode=primary_constraint_mode,
         )
         graph_manifest_path = _manifest_path(graph_path)
-        report.require(graph_manifest_path.exists(), f"{split} graph manifest exists")
-        if graph_manifest_path.exists():
-            graph_manifest = _read_json(graph_manifest_path)
-            report.require(
-                int(graph_manifest.get("graph_schema_version", 0)) >= GRAPH_SCHEMA_VERSION,
-                f"{split} graph schema is at least v{GRAPH_SCHEMA_VERSION}",
+        graph_errors_before = len(report.errors)
+        if parquet_path.exists():
+            _validate_graph_manifest(
+                graph_path=graph_path,
+                graph_manifest_path=graph_manifest_path,
+                dataset_manifest_path=manifest_path,
+                parquet_path=parquet_path,
+                processed=processed,
+                dataset_variant=dataset_variant,
+                split=split,
+                encoding=encoding,
+                constraint_representation=constraint_representation,
+                primary_constraint_mode=primary_constraint_mode,
+                verify_hashes=verify_hashes,
+                report=report,
             )
-            kept = set(graph_manifest.get("kept_fields", []))
-            report.require(
-                {"y_identity", "target_representable_mask", "node_identity_id"} <= kept,
-                f"{split} graph manifest includes identity audit fields",
-            )
-        if split == "train" and discover_graph_artifacts(graph_path):
+        else:
+            report.errors.append(f"{split} parquet is unavailable for graph lineage validation")
+        if (
+            split == "train"
+            and len(report.errors) == graph_errors_before
+            and discover_graph_artifacts(graph_path)
+        ):
             sample = _iter_prefix(load_graph_dataset(graph_path), 2)
             report.require(bool(sample), "training graph sample is readable")
             if sample:
@@ -493,6 +941,98 @@ def validate_run(run_directory: Path, report: ValidationReport) -> None:
             )
 
 
+def _validate_global_results_contract(
+    metrics: dict[str, Any],
+    *,
+    label: str,
+    report: ValidationReport,
+) -> None:
+    global_metrics = metrics.get("global_metrics", {})
+    overall = global_metrics.get("overall", {}) if isinstance(global_metrics, dict) else {}
+    per_sample = (
+        global_metrics.get("per_sample", {})
+        if isinstance(global_metrics, dict)
+        else {}
+    )
+    per_sample_gfr = per_sample.get("gfr") if isinstance(per_sample, dict) else None
+    evaluated_rows = len(per_sample_gfr) if isinstance(per_sample_gfr, list) else 0
+    report.require(
+        evaluated_rows > 0,
+        f"{label}: global metrics cover evaluation rows",
+    )
+    report.require(
+        "primary_fix_rate" in overall,
+        f"{label}: transition-based primary fix is present",
+    )
+    report.require(
+        int(overall.get("primary_fix_denom_total", -1)) == evaluated_rows,
+        f"{label}: primary-fix denominator covers every retained evaluation row",
+    )
+
+    pre_state_validation = (
+        global_metrics.get("pre_state_validation", {})
+        if isinstance(global_metrics, dict)
+        else {}
+    )
+    checked_rows = (
+        int(pre_state_validation.get("checked_rows", -1))
+        if isinstance(pre_state_validation, dict)
+        else -1
+    )
+    mismatch_count = (
+        int(pre_state_validation.get("mismatch_count", -1))
+        if isinstance(pre_state_validation, dict)
+        else -1
+    )
+    source_counts = (
+        pre_state_validation.get("source_counts", {})
+        if isinstance(pre_state_validation, dict)
+        else {}
+    )
+    report.require(
+        checked_rows == evaluated_rows and mismatch_count == 0,
+        f"{label}: every global PRE state matches authoritative labels",
+    )
+    valid_source_counts = isinstance(source_counts, dict) and all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in source_counts.values()
+    )
+    report.require(
+        valid_source_counts
+        and sum(source_counts.values()) == checked_rows,
+        f"{label}: PRE-state validation source counts cover checked rows",
+    )
+
+    per_constraint = (
+        global_metrics.get("per_constraint_type", {})
+        if isinstance(global_metrics, dict)
+        else {}
+    )
+    per_constraint_denom = (
+        sum(
+            int(values.get("primary_fix_denom_total", 0))
+            for values in per_constraint.values()
+            if isinstance(values, dict)
+        )
+        if isinstance(per_constraint, dict)
+        else -1
+    )
+    report.require(
+        per_constraint_denom == evaluated_rows,
+        f"{label}: per-family primary-fix support sums to all evaluation rows",
+    )
+
+    for metric in ("srr", "sir"):
+        numerator = int(overall.get(f"{metric}_total", 0))
+        denominator = int(overall.get(f"{metric}_denom_total", 0))
+        expected = numerator / denominator if denominator else 0.0
+        observed = float(overall.get(metric, float("nan")))
+        report.require(
+            abs(observed - expected) < 1e-12,
+            f"{label}: {metric.upper()} is the pooled ratio",
+        )
+
+
 def validate_results(run_directory: Path, report: ValidationReport) -> None:
     result_path = run_directory / "evaluations" / "model.json"
     report.require(result_path.exists(), f"{run_directory.name}: evaluation result exists")
@@ -510,6 +1050,11 @@ def validate_results(run_directory: Path, report: ValidationReport) -> None:
     report.require(
         metrics.get("candidate_inference_gold_access") is False,
         f"{run_directory.name}: inference declares no gold candidate access",
+    )
+    report.require(
+        isinstance(metrics.get("fallback_noop_count"), int)
+        and int(metrics.get("fallback_noop_count", -1)) >= 0,
+        f"{run_directory.name}: fallback no-op use is reported",
     )
     evaluation_provenance = metrics.get("evaluation_provenance", {})
     run_manifest_path = run_directory / RUN_MANIFEST_FILENAME
@@ -545,18 +1090,11 @@ def validate_results(run_directory: Path, report: ValidationReport) -> None:
                 and record.get("sha256") == json_file_hash(path),
                 f"{run_directory.name}: evaluation identifies the current {label}",
             )
-    global_metrics = metrics.get("global_metrics", {})
-    overall = global_metrics.get("overall", {}) if isinstance(global_metrics, dict) else {}
-    report.require("primary_fix_rate" in overall, f"{run_directory.name}: transition-based primary fix is present")
-    for metric in ("srr", "sir"):
-        numerator = int(overall.get(f"{metric}_total", 0))
-        denominator = int(overall.get(f"{metric}_denom_total", 0))
-        expected = numerator / denominator if denominator else 0.0
-        observed = float(overall.get(metric, float("nan")))
-        report.require(
-            abs(observed - expected) < 1e-12,
-            f"{run_directory.name}: {metric.upper()} is the pooled ratio",
-        )
+    _validate_global_results_contract(
+        metrics,
+        label=run_directory.name,
+        report=report,
+    )
 
 
 def validate_baseline_directory(directory: Path, report: ValidationReport) -> None:
@@ -576,6 +1114,11 @@ def validate_baseline_directory(directory: Path, report: ValidationReport) -> No
         report.require(
             metrics.get("candidate_inference_gold_access") is False,
             f"{label}: inference declares no gold candidate access",
+        )
+        report.require(
+            isinstance(metrics.get("fallback_noop_count"), int)
+            and int(metrics.get("fallback_noop_count", -1)) >= 0,
+            f"{label}: fallback no-op use is reported",
         )
         provenance = metrics.get("evaluation_provenance", {})
         report.require(
@@ -597,17 +1140,7 @@ def validate_baseline_directory(directory: Path, report: ValidationReport) -> No
                     and record.get("sha256") == hash_fn(record_path),
                     f"{label}: {key} hash matches",
                 )
-        global_metrics = metrics.get("global_metrics", {})
-        overall = global_metrics.get("overall", {}) if isinstance(global_metrics, dict) else {}
-        report.require("primary_fix_rate" in overall, f"{label}: transition-based primary fix is present")
-        for metric in ("srr", "sir"):
-            numerator = int(overall.get(f"{metric}_total", 0))
-            denominator = int(overall.get(f"{metric}_denom_total", 0))
-            expected = numerator / denominator if denominator else 0.0
-            report.require(
-                abs(float(overall.get(metric, float("nan"))) - expected) < 1e-12,
-                f"{label}: {metric.upper()} is the pooled ratio",
-            )
+        _validate_global_results_contract(metrics, label=label, report=report)
 
 
 def parse_args() -> argparse.Namespace:

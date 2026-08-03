@@ -515,7 +515,19 @@ def _aggregate_epoch_metrics(records: list[dict[str, float]]) -> dict[str, float
     for record in records:
         for key, value in record.items():
             totals[key] = totals.get(key, 0.0) + float(value)
-    return {key: total / len(records) for key, total in totals.items()}
+    metrics = {key: total / len(records) for key, total in totals.items()}
+    metrics["row_count"] = float(len(records))
+    fallback_count = totals.get("fallback_noop", 0.0)
+    metrics["fallback_noop_count"] = fallback_count
+    metrics["fallback_noop_rate"] = fallback_count / len(records)
+    if "gold_candidate_available" in totals:
+        coverage_count = totals["gold_candidate_available"]
+        metrics["gold_candidate_count"] = coverage_count
+        metrics["gold_candidate_coverage"] = coverage_count / len(records)
+    if "loss_included" in totals:
+        metrics["loss_row_count"] = totals["loss_included"]
+        metrics["loss_row_coverage"] = totals["loss_included"] / len(records)
+    return metrics
 
 
 def _manifest_graph_count(graph_path: Path) -> int | None:
@@ -583,10 +595,11 @@ def _predict_reranker_edits(
     device: torch.device,
     cfg: RerankerTrainingConfig,
     identity_to_feature: Sequence[int] | None,
-) -> list[dict[str, list[int]]]:
+) -> tuple[list[dict[str, list[int]]], dict[str, float | int]]:
     model.eval()
     proposal_model.eval()
     predictions: list[dict[str, list[int]]] = []
+    fallback_noop_count = 0
 
     loader = DataLoader(
         data,
@@ -625,9 +638,15 @@ def _predict_reranker_edits(
             best_idx = int(torch.argmax(scores).item())
             best_candidate = _candidate_to_slots(candidates[best_idx].identity_slots)
             predictions.append(_candidate_slots_to_actions(best_candidate))
+            fallback_noop_count += int(candidates[best_idx].source == "fallback_noop")
             _ = evaluator  # keep evaluator in signature for future diagnostics
 
-    return predictions
+    candidate_rows = len(predictions)
+    return predictions, {
+        "candidate_inference_rows": candidate_rows,
+        "fallback_noop_count": fallback_noop_count,
+        "fallback_noop_rate": fallback_noop_count / candidate_rows if candidate_rows else 0.0,
+    }
 
 
 def _run_epoch(
@@ -668,7 +687,7 @@ def _run_epoch(
             context = contexts[context_index]
             row = rows[context_index]
             candidates, gold_index = _build_candidates(
-                graph=graph,
+                graph=graph if is_train else None,
                 context=context,
                 heuristics=heuristics,
                 proposal_logits=proposal_logits[idx],
@@ -676,8 +695,23 @@ def _run_epoch(
                 placeholder_ids=set(heuristics.placeholder_ids.values()),
                 num_target_ids=model.num_target_ids,
                 identity_to_feature=identity_to_feature,
-                training=True,
+                training=is_train,
             )
+            if not is_train and cfg.objective == "main":
+                gold_value = getattr(graph, "y_identity", getattr(graph, "y", None))
+                if gold_value is None:
+                    raise ValueError("Validation graph is missing an identity target.")
+                if gold_value.dim() == 2:
+                    gold_value = gold_value[0]
+                gold_identity = tuple(int(value) for value in gold_value.tolist())
+                gold_index = next(
+                    (
+                        candidate_index
+                        for candidate_index, candidate in enumerate(candidates)
+                        if candidate.identity_slots == gold_identity
+                    ),
+                    -1,
+                )
             candidate_tensor = torch.tensor(
                 candidate_feature_tuples(candidates), dtype=torch.long, device=device
             )
@@ -706,7 +740,15 @@ def _run_epoch(
                 "global_chosen": global_best,
                 "regressions_chosen": regress_best,
                 "candidate_count": float(len(candidates)),
+                "fallback_noop": float(
+                    any(candidate.source == "fallback_noop" for candidate in candidates)
+                ),
             }
+            if not is_train and cfg.objective == "main":
+                record["gold_candidate_available"] = float(gold_index >= 0)
+            record["loss_included"] = float(
+                cfg.objective == "global_fix" or gold_index >= 0
+            )
             epoch_records.append(record)
 
             if cfg.objective == "global_fix":
@@ -718,6 +760,10 @@ def _run_epoch(
                 expected_satisfaction = torch.sum(probs * satisfaction)
                 loss = -expected_satisfaction
             else:
+                if gold_index < 0:
+                    # Validation still records inference metrics for this row, but
+                    # supervised loss is defined only when inference produced gold.
+                    continue
                 ce_loss = -log_probs[gold_index]
                 regression_tensor = torch.tensor(
                     [m.srr for m in metrics_summary], dtype=torch.float32, device=device
@@ -747,6 +793,14 @@ def _run_epoch(
 
     avg_loss = epoch_loss / max(batch_steps, 1)
     metrics = _aggregate_epoch_metrics(epoch_records)
+    if (
+        not is_train
+        and cfg.objective == "main"
+        and metrics.get("gold_candidate_count", 0.0) <= 0.0
+    ):
+        raise RuntimeError(
+            "No validation row had a naturally available gold candidate in the inference set."
+        )
     return avg_loss, metrics
 
 
@@ -1112,7 +1166,7 @@ def main() -> None:
                         else:
                             raise
                     model.to(device)
-                predictions = _predict_reranker_edits(
+                predictions, candidate_diagnostics = _predict_reranker_edits(
                     model=model,
                     proposal_model=proposal_model,
                     data=test_data,
@@ -1126,7 +1180,14 @@ def main() -> None:
                 )
                 pred_path = run_dir / "reranker_predictions.json"
                 with pred_path.open("w", encoding="utf-8") as fh:
-                    json.dump(predictions, fh, indent=2)
+                    json.dump(
+                        {
+                            "predictions": predictions,
+                            "candidate_diagnostics": candidate_diagnostics,
+                        },
+                        fh,
+                        indent=2,
+                    )
                 logger.info("Saved reranker predictions to %s", pred_path)
             else:
                 logger.warning("Skipping reranker predictions: test rows mismatch.")

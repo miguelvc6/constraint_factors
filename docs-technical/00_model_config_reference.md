@@ -192,6 +192,11 @@ Paper use:
 
 - `G0`: `objective="global_fix"`
 
+Gold inclusion applies only to optimizer-backed training epochs. Reranker
+validation always uses inference candidates. `global_fix` scores every
+validation row; `main` reports natural `gold_candidate_coverage` and omits
+supervised loss only for uncovered rows, failing when coverage is zero.
+
 ## Validation notes
 
 - Config loading is strict: unknown keys raise an error.

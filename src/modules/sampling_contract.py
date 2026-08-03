@@ -1,0 +1,4 @@
+ROW_ORDER_METHOD = "splitmix64_source_index_v1"
+ROW_ORDER_BUCKET_BITS = 6
+ROW_ORDER_BUCKET_COUNT = 1 << ROW_ORDER_BUCKET_BITS
+ROW_ORDER_KEY_COLUMN = "__sample_row_order_key"
